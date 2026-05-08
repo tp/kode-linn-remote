@@ -265,15 +265,15 @@ where
 }
 
 const fn body_font() -> FontRenderer {
-    FontRenderer::new::<fonts::u8g2_font_helvR12_tr>()
+    FontRenderer::new::<fonts::u8g2_font_helvR24_tr>()
 }
 
 const fn title_font() -> FontRenderer {
-    FontRenderer::new::<fonts::u8g2_font_helvB12_tr>()
+    FontRenderer::new::<fonts::u8g2_font_helvB24_tr>()
 }
 
 const fn button_font() -> FontRenderer {
-    FontRenderer::new::<fonts::u8g2_font_helvB12_tr>()
+    FontRenderer::new::<fonts::u8g2_font_helvB24_tr>()
 }
 
 #[cfg(test)]
