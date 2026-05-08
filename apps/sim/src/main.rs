@@ -158,6 +158,7 @@ impl NativeSimulator {
         self.update(Event::Tick {
             uptime_ms: self.uptime_ms(),
         });
+        self.render_stats.update_sample();
     }
 
     fn advance_by(&mut self, delta_ms: u64) {
@@ -180,7 +181,11 @@ impl NativeSimulator {
         real_elapsed_ms.saturating_add(self.manual_time_offset_ms)
     }
 
-    fn redraw_png(&mut self) -> Vec<u8> {
+    fn redraw_png_if_needed(&mut self) -> Option<Vec<u8>> {
+        if !self.app_frame_dirty && self.tap_highlight.is_none() {
+            return None;
+        }
+
         if self.app_frame_dirty {
             self.app
                 .render(&mut self.app_framebuffer)
@@ -193,7 +198,7 @@ impl NativeSimulator {
         self.render_tap_highlight();
         self.render_stats.record_simulator_redraw();
         self.render_stats.update_sample();
-        self.output_framebuffer.to_png()
+        Some(self.output_framebuffer.to_png())
     }
 
     fn render_tap_highlight(&mut self) {
@@ -363,11 +368,12 @@ define_class!(
             window.setTitle(ns_string!("ESP32-C6 Home Tools Simulator"));
             window.setDelegate(Some(ProtocolObject::from_ref(self)));
 
-            let content_view = window.contentView().expect("window should have a content view");
             let layout = layout_for_window(&window, false);
             window.setContentMinSize(layout.content_size);
+            window.setContentSize(layout.content_size);
             window.center();
 
+            let content_view = window.contentView().expect("window should have a content view");
             let image = self.render_image();
             let image_view = NSImageView::imageViewWithImage(&image, mtm);
             image_view.setFrame(layout.display_frame);
@@ -598,20 +604,30 @@ impl Delegate {
     }
 
     fn refresh_image(&self) {
-        let image = self.render_image();
-        let image_view = self
-            .ivars()
-            .image_view
-            .get()
-            .expect("image view should exist after launch");
-        image_view.setImage(Some(&image));
+        if let Some(image) = self.render_image_if_needed() {
+            let image_view = self
+                .ivars()
+                .image_view
+                .get()
+                .expect("image view should exist after launch");
+            image_view.setImage(Some(&image));
+        }
         self.refresh_debug_label();
     }
 
     fn render_image(&self) -> Retained<NSImage> {
-        let png = self.ivars().simulator.borrow_mut().redraw_png();
-        let data = NSData::with_bytes(&png);
-        NSImage::initWithData(NSImage::alloc(), &data).expect("AppKit should decode simulator PNG")
+        let png = self
+            .ivars()
+            .simulator
+            .borrow_mut()
+            .redraw_png_if_needed()
+            .expect("initial simulator render should produce an image");
+        image_from_png(&png)
+    }
+
+    fn render_image_if_needed(&self) -> Option<Retained<NSImage>> {
+        let png = self.ivars().simulator.borrow_mut().redraw_png_if_needed()?;
+        Some(image_from_png(&png))
     }
 
     fn refresh_debug_label(&self) {
@@ -661,6 +677,11 @@ impl Delegate {
             zoom_button.setTitle(&NSString::from_str("Zoom 2x"));
         }
     }
+}
+
+fn image_from_png(png: &[u8]) -> Retained<NSImage> {
+    let data = NSData::with_bytes(png);
+    NSImage::initWithData(NSImage::alloc(), &data).expect("AppKit should decode simulator PNG")
 }
 
 fn add_button(

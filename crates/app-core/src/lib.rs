@@ -74,6 +74,7 @@ impl App {
                 self.update_stopwatch()
             }
             Event::TouchDown(point) => {
+                // The interaction counter is visible UI state, so every tap changes the frame.
                 self.interaction_count = self.interaction_count.saturating_add(1);
                 self.handle_touch(point);
                 true
