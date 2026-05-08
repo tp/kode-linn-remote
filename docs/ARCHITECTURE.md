@@ -11,7 +11,11 @@ The workspace separates app behavior from hardware access.
 
 ## Event Flow
 
-Inputs become `app_core::Event` values. The app updates its state and requests a redraw. Both simulator and firmware are responsible for delivering events and calling `App::render`.
+Inputs become `app_core::Event` values. Touch coordinates are interpreted by the shared app core, including Start and Stop hit-testing. The app updates its state and requests a redraw. Both simulator and firmware are responsible for delivering events and calling `App::render`.
+
+The simulator runs a short AppKit timer only as a refresh cadence. Each refresh derives internal uptime from a monotonic host clock, then sends `Event::Tick` so the shared core can drive the stopwatch.
+
+The tap highlight is a simulator-only overlay. The shared app core receives the tap coordinate for control hit-testing, but it does not render pointer feedback.
 
 ## Hardware Direction
 

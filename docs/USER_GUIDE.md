@@ -13,18 +13,21 @@ The simulator no longer uses SDL2. It uses a native macOS AppKit window through 
 ## Use The Demo
 
 - The window represents the 466 x 466 AMOLED display on the Waveshare board.
-- Use the touch buttons to simulate fixed touch points.
+- Click anywhere inside the display area to simulate a tap.
+- Use the on-screen Start and Stop controls to run or pause the stopwatch.
+- The simulator-only tap highlight stays bright for one second and then fades.
 - Use the Boot and User buttons to mimic hardware button inputs.
 - Use the network buttons to cycle the mocked network status.
-- Use `Tick +1s` to advance mocked uptime.
+- Time advances automatically; use `Advance +1s` when you want an extra manual tick.
 - Close the window to exit.
 
 ## What The Demo Shows
 
-- Device uptime.
+- Start and stop controls.
+- Stopwatch seconds, which only tick while running.
 - Mocked network status.
 - Interaction count.
-- Current touch state.
+- Recent tap location.
 
 The simulator and firmware use the same `app-core` crate, so application behavior should stay consistent between the Mac and the ESP32-C6.
 

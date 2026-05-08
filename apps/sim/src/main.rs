@@ -3,6 +3,7 @@
 use std::{
     cell::{OnceCell, RefCell},
     convert::Infallible,
+    time::Instant,
 };
 
 use app_core::{App, DISPLAY_SIZE, Event, NetworkStatus, TouchPoint};
@@ -12,6 +13,7 @@ use embedded_graphics::{
     geometry::OriginDimensions,
     pixelcolor::{Rgb565, RgbColor},
     prelude::*,
+    primitives::{Circle, PrimitiveStyle},
 };
 use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
 use objc2::rc::Retained;
@@ -19,13 +21,17 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSButton, NSImage, NSImageScaling, NSImageView, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSClickGestureRecognizer, NSImage, NSImageScaling, NSImageView,
+    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSData, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
-    NSString, ns_string,
+    NSString, NSTimer, ns_string,
 };
+
+const REFRESH_INTERVAL_SECONDS: f64 = 0.1;
+const TAP_FULL_MS: u64 = 1_000;
+const TAP_FADE_MS: u64 = 700;
 
 #[derive(Debug)]
 struct Framebuffer {
@@ -107,7 +113,9 @@ impl OriginDimensions for Framebuffer {
 struct NativeSimulator {
     app: App,
     framebuffer: Framebuffer,
-    uptime_ms: u64,
+    started_at: Instant,
+    manual_time_offset_ms: u64,
+    tap_highlight: Option<TapHighlight>,
 }
 
 impl NativeSimulator {
@@ -115,7 +123,9 @@ impl NativeSimulator {
         Self {
             app: App::new(),
             framebuffer: Framebuffer::new(DISPLAY_SIZE),
-            uptime_ms: 0,
+            started_at: Instant::now(),
+            manual_time_offset_ms: 0,
+            tap_highlight: None,
         }
     }
 
@@ -124,24 +134,71 @@ impl NativeSimulator {
     }
 
     fn tick(&mut self) {
-        self.uptime_ms = self.uptime_ms.saturating_add(1_000);
         self.update(Event::Tick {
-            uptime_ms: self.uptime_ms,
+            uptime_ms: self.uptime_ms(),
         });
+    }
+
+    fn advance_by(&mut self, delta_ms: u64) {
+        self.manual_time_offset_ms = self.manual_time_offset_ms.saturating_add(delta_ms);
+        self.tick();
+    }
+
+    fn tap(&mut self, point: TouchPoint) {
+        let uptime_ms = self.uptime_ms();
+        self.tap_highlight = Some(TapHighlight {
+            point,
+            started_at_ms: uptime_ms,
+        });
+        self.update(Event::Tick { uptime_ms });
+        self.update(Event::TouchDown(point));
+    }
+
+    fn uptime_ms(&self) -> u64 {
+        let real_elapsed_ms = self.started_at.elapsed().as_millis() as u64;
+        real_elapsed_ms.saturating_add(self.manual_time_offset_ms)
     }
 
     fn redraw_png(&mut self) -> Vec<u8> {
         self.app
             .render(&mut self.framebuffer)
             .expect("app rendering should succeed");
+        self.render_tap_highlight();
         self.framebuffer.to_png()
     }
+
+    fn render_tap_highlight(&mut self) {
+        let Some(tap) = self.tap_highlight else {
+            return;
+        };
+
+        let Some(alpha) = tap_alpha(self.uptime_ms().saturating_sub(tap.started_at_ms)) else {
+            self.tap_highlight = None;
+            return;
+        };
+
+        let r = 8 + ((23_u16 * alpha as u16) / 255) as u8;
+        let g = 14 + ((28_u16 * alpha as u16) / 255) as u8;
+        let b = 4 + ((10_u16 * alpha as u16) / 255) as u8;
+        Circle::with_center(Point::new(tap.point.x, tap.point.y), 18)
+            .into_styled(PrimitiveStyle::with_fill(Rgb565::new(r, g, b)))
+            .draw(&mut self.framebuffer)
+            .expect("simulator overlay rendering should succeed");
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TapHighlight {
+    point: TouchPoint,
+    started_at_ms: u64,
 }
 
 #[derive(Debug)]
 struct AppDelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
     image_view: OnceCell<Retained<NSImageView>>,
+    tap_recognizer: OnceCell<Retained<NSClickGestureRecognizer>>,
+    timer: OnceCell<Retained<NSTimer>>,
     simulator: RefCell<NativeSimulator>,
 }
 
@@ -150,6 +207,8 @@ impl Default for AppDelegateIvars {
         Self {
             window: OnceCell::new(),
             image_view: OnceCell::new(),
+            tap_recognizer: OnceCell::new(),
+            timer: OnceCell::new(),
             simulator: RefCell::new(NativeSimulator::new()),
         }
     }
@@ -199,9 +258,26 @@ define_class!(
                 NSSize::new(466.0, 466.0),
             ));
             image_view.setImageScaling(NSImageScaling::ScaleAxesIndependently);
+            let tap_recognizer = unsafe {
+                NSClickGestureRecognizer::initWithTarget_action(
+                    NSClickGestureRecognizer::alloc(mtm),
+                    Some(self.as_ref()),
+                    Some(sel!(displayTapped:)),
+                )
+            };
+            tap_recognizer.setNumberOfClicksRequired(1);
+            image_view.addGestureRecognizer(&tap_recognizer);
             content_view.addSubview(&image_view);
 
-            add_button(&content_view, "Tick +1s", 524.0, 496.0, sel!(tick:), self, mtm);
+            add_button(
+                &content_view,
+                "Advance +1s",
+                524.0,
+                496.0,
+                sel!(advanceSecond:),
+                self,
+                mtm,
+            );
             add_button(
                 &content_view,
                 "Boot button",
@@ -222,45 +298,9 @@ define_class!(
             );
             add_button(
                 &content_view,
-                "Touch center",
-                524.0,
-                344.0,
-                sel!(touchCenter:),
-                self,
-                mtm,
-            );
-            add_button(
-                &content_view,
-                "Touch top-left",
-                524.0,
-                300.0,
-                sel!(touchTopLeft:),
-                self,
-                mtm,
-            );
-            add_button(
-                &content_view,
-                "Touch bottom-right",
-                524.0,
-                256.0,
-                sel!(touchBottomRight:),
-                self,
-                mtm,
-            );
-            add_button(
-                &content_view,
-                "Release touch",
-                524.0,
-                212.0,
-                sel!(releaseTouch:),
-                self,
-                mtm,
-            );
-            add_button(
-                &content_view,
                 "Network offline",
                 524.0,
-                148.0,
+                344.0,
                 sel!(networkOffline:),
                 self,
                 mtm,
@@ -269,7 +309,7 @@ define_class!(
                 &content_view,
                 "Network connecting",
                 524.0,
-                104.0,
+                300.0,
                 sel!(networkConnecting:),
                 self,
                 mtm,
@@ -278,11 +318,21 @@ define_class!(
                 &content_view,
                 "Network online",
                 524.0,
-                60.0,
+                256.0,
                 sel!(networkOnline:),
                 self,
                 mtm,
             );
+
+            let timer = unsafe {
+                NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                    REFRESH_INTERVAL_SECONDS,
+                    self.as_ref(),
+                    sel!(timerTick:),
+                    None,
+                    true,
+                )
+            };
 
             window.makeKeyAndOrderFront(None);
 
@@ -290,6 +340,14 @@ define_class!(
                 .image_view
                 .set(image_view)
                 .expect("image view should be stored once");
+            self.ivars()
+                .tap_recognizer
+                .set(tap_recognizer)
+                .expect("tap recognizer should be stored once");
+            self.ivars()
+                .timer
+                .set(timer)
+                .expect("timer should be stored once");
             self.ivars()
                 .window
                 .set(window)
@@ -304,14 +362,23 @@ define_class!(
     unsafe impl NSWindowDelegate for Delegate {
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
+            if let Some(timer) = self.ivars().timer.get() {
+                timer.invalidate();
+            }
             NSApplication::sharedApplication(self.mtm()).terminate(None);
         }
     }
 
     impl Delegate {
-        #[unsafe(method(tick:))]
-        fn tick(&self, _sender: &AnyObject) {
+        #[unsafe(method(timerTick:))]
+        fn timer_tick(&self, _sender: &NSTimer) {
             self.ivars().simulator.borrow_mut().tick();
+            self.refresh_image();
+        }
+
+        #[unsafe(method(advanceSecond:))]
+        fn advance_second(&self, _sender: &AnyObject) {
+            self.ivars().simulator.borrow_mut().advance_by(1_000);
             self.refresh_image();
         }
 
@@ -325,24 +392,25 @@ define_class!(
             self.send_event(Event::ButtonPressed(app_core::Button::User));
         }
 
-        #[unsafe(method(touchCenter:))]
-        fn touch_center(&self, _sender: &AnyObject) {
-            self.send_event(Event::TouchDown(TouchPoint { x: 233, y: 233 }));
-        }
+        #[unsafe(method(displayTapped:))]
+        fn display_tapped(&self, sender: &NSClickGestureRecognizer) {
+            let Some(view) = sender.view() else {
+                return;
+            };
 
-        #[unsafe(method(touchTopLeft:))]
-        fn touch_top_left(&self, _sender: &AnyObject) {
-            self.send_event(Event::TouchDown(TouchPoint { x: 72, y: 72 }));
-        }
+            let point = sender.locationInView(Some(&view));
+            let x = point.x.round() as i32;
+            let y = (DISPLAY_SIZE.height as f64 - point.y).round() as i32;
 
-        #[unsafe(method(touchBottomRight:))]
-        fn touch_bottom_right(&self, _sender: &AnyObject) {
-            self.send_event(Event::TouchDown(TouchPoint { x: 394, y: 394 }));
-        }
+            if x < 0 || y < 0 || x >= DISPLAY_SIZE.width as i32 || y >= DISPLAY_SIZE.height as i32 {
+                return;
+            }
 
-        #[unsafe(method(releaseTouch:))]
-        fn release_touch(&self, _sender: &AnyObject) {
-            self.send_event(Event::TouchUp);
+            self.ivars()
+                .simulator
+                .borrow_mut()
+                .tap(TouchPoint { x, y });
+            self.refresh_image();
         }
 
         #[unsafe(method(networkOffline:))]
@@ -414,6 +482,18 @@ fn add_button(
 
 fn scale_channel(value: u8, max: u8) -> u8 {
     ((value as u16 * 255) / max as u16) as u8
+}
+
+fn tap_alpha(age_ms: u64) -> Option<u8> {
+    if age_ms <= TAP_FULL_MS {
+        Some(255)
+    } else if age_ms >= TAP_FULL_MS + TAP_FADE_MS {
+        None
+    } else {
+        let fade_age = age_ms - TAP_FULL_MS;
+        let remaining = TAP_FADE_MS - fade_age;
+        Some(((remaining * 255) / TAP_FADE_MS) as u8)
+    }
 }
 
 fn main() {

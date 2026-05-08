@@ -6,12 +6,14 @@ use embedded_graphics::{
     mono_font::{MonoTextStyle, ascii::FONT_10X20},
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{Circle, PrimitiveStyle, Rectangle},
+    primitives::{PrimitiveStyle, Rectangle},
     text::{Baseline, Text},
 };
 use heapless::String;
 
 pub const DISPLAY_SIZE: Size = Size::new(466, 466);
+const START_BUTTON: Rectangle = Rectangle::new(Point::new(44, 140), Size::new(170, 72));
+const STOP_BUTTON: Rectangle = Rectangle::new(Point::new(252, 140), Size::new(170, 72));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -49,18 +51,22 @@ pub struct UpdateOutcome {
 #[derive(Debug)]
 pub struct App {
     uptime_ms: u64,
-    touch: Option<TouchPoint>,
     network_status: NetworkStatus,
     interaction_count: u32,
+    stopwatch_running: bool,
+    stopwatch_seconds: u64,
+    last_stopwatch_second: u64,
 }
 
 impl App {
     pub const fn new() -> Self {
         Self {
             uptime_ms: 0,
-            touch: None,
             network_status: NetworkStatus::Offline,
             interaction_count: 0,
+            stopwatch_running: false,
+            stopwatch_seconds: 0,
+            last_stopwatch_second: 0,
         }
     }
 
@@ -68,14 +74,13 @@ impl App {
         match event {
             Event::Tick { uptime_ms } => {
                 self.uptime_ms = uptime_ms;
+                self.update_stopwatch();
             }
             Event::TouchDown(point) => {
-                self.touch = Some(point);
                 self.interaction_count = self.interaction_count.saturating_add(1);
+                self.handle_touch(point);
             }
-            Event::TouchUp => {
-                self.touch = None;
-            }
+            Event::TouchUp => {}
             Event::ButtonPressed(_) => {
                 self.interaction_count = self.interaction_count.saturating_add(1);
             }
@@ -114,9 +119,12 @@ impl App {
 
         let body_style = MonoTextStyle::new(&FONT_10X20, Rgb565::new(23, 55, 47));
 
-        let mut uptime: String<32> = String::new();
-        let _ = write!(uptime, "uptime: {}s", self.uptime_ms / 1000);
-        Text::with_baseline(&uptime, Point::new(44, 148), body_style, Baseline::Top)
+        draw_button(display, START_BUTTON, "START", !self.stopwatch_running)?;
+        draw_button(display, STOP_BUTTON, "STOP", self.stopwatch_running)?;
+
+        let mut stopwatch: String<32> = String::new();
+        let _ = write!(stopwatch, "stopwatch: {}s", self.stopwatch_seconds);
+        Text::with_baseline(&stopwatch, Point::new(44, 244), body_style, Baseline::Top)
             .draw(display)?;
 
         let network = match self.network_status {
@@ -124,32 +132,18 @@ impl App {
             NetworkStatus::Connecting => "network: connecting",
             NetworkStatus::Online => "network: online",
         };
-        Text::with_baseline(network, Point::new(44, 188), body_style, Baseline::Top)
+        Text::with_baseline(network, Point::new(44, 312), body_style, Baseline::Top)
             .draw(display)?;
 
         let mut interactions: String<32> = String::new();
         let _ = write!(interactions, "interactions: {}", self.interaction_count);
         Text::with_baseline(
             &interactions,
-            Point::new(44, 228),
+            Point::new(44, 352),
             body_style,
             Baseline::Top,
         )
         .draw(display)?;
-
-        let touch_label = if self.touch.is_some() {
-            "touch: active"
-        } else {
-            "touch: idle"
-        };
-        Text::with_baseline(touch_label, Point::new(44, 268), body_style, Baseline::Top)
-            .draw(display)?;
-
-        if let Some(point) = self.touch {
-            Circle::with_center(Point::new(point.x, point.y), 18)
-                .into_styled(PrimitiveStyle::with_fill(Rgb565::new(31, 42, 10)))
-                .draw(display)?;
-        }
 
         Ok(())
     }
@@ -161,12 +155,80 @@ impl App {
     pub const fn interaction_count(&self) -> u32 {
         self.interaction_count
     }
+
+    pub const fn running(&self) -> bool {
+        self.stopwatch_running
+    }
+
+    pub const fn stopwatch_seconds(&self) -> u64 {
+        self.stopwatch_seconds
+    }
+
+    fn handle_touch(&mut self, point: TouchPoint) {
+        let point = Point::new(point.x, point.y);
+
+        if START_BUTTON.contains(point) && !self.stopwatch_running {
+            self.stopwatch_running = true;
+            self.last_stopwatch_second = self.uptime_ms / 1000;
+        } else if STOP_BUTTON.contains(point) && self.stopwatch_running {
+            self.update_stopwatch();
+            self.stopwatch_running = false;
+        }
+    }
+
+    fn update_stopwatch(&mut self) {
+        if !self.stopwatch_running {
+            return;
+        }
+
+        let current_second = self.uptime_ms / 1000;
+        let elapsed = current_second.saturating_sub(self.last_stopwatch_second);
+        if elapsed > 0 {
+            self.stopwatch_seconds = self.stopwatch_seconds.saturating_add(elapsed);
+            self.last_stopwatch_second = current_second;
+        }
+    }
 }
 
 impl Default for App {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn draw_button<D>(
+    display: &mut D,
+    rect: Rectangle,
+    label: &str,
+    active: bool,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let fill = if active {
+        Rgb565::new(4, 28, 16)
+    } else {
+        Rgb565::new(3, 8, 10)
+    };
+    let text = if active {
+        Rgb565::WHITE
+    } else {
+        Rgb565::new(12, 24, 22)
+    };
+
+    rect.into_styled(PrimitiveStyle::with_fill(fill))
+        .draw(display)?;
+
+    let style = MonoTextStyle::new(&FONT_10X20, text);
+    Text::with_baseline(
+        label,
+        Point::new(rect.top_left.x + 32, rect.top_left.y + 24),
+        style,
+        Baseline::Top,
+    )
+    .draw(display)?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -195,6 +257,37 @@ mod tests {
         app.update(Event::TouchUp);
 
         assert_eq!(app.interaction_count(), 1);
+    }
+
+    #[test]
+    fn start_and_stop_control_stopwatch() {
+        let mut app = App::new();
+
+        app.update(Event::TouchDown(TouchPoint { x: 80, y: 170 }));
+        app.update(Event::Tick { uptime_ms: 1_000 });
+        app.update(Event::Tick { uptime_ms: 2_000 });
+
+        assert!(app.running());
+        assert_eq!(app.stopwatch_seconds(), 2);
+
+        app.update(Event::TouchDown(TouchPoint { x: 300, y: 170 }));
+        app.update(Event::Tick { uptime_ms: 5_000 });
+
+        assert!(!app.running());
+        assert_eq!(app.stopwatch_seconds(), 2);
+    }
+
+    #[test]
+    fn stopped_stopwatch_does_not_advance_with_uptime() {
+        let mut app = App::new();
+
+        app.update(Event::TouchDown(TouchPoint { x: 80, y: 170 }));
+        app.update(Event::Tick { uptime_ms: 3_000 });
+        app.update(Event::TouchDown(TouchPoint { x: 300, y: 170 }));
+        app.update(Event::Tick { uptime_ms: 20_000 });
+
+        assert_eq!(app.uptime_ms(), 20_000);
+        assert_eq!(app.stopwatch_seconds(), 3);
     }
 
     #[test]
