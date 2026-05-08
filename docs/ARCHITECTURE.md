@@ -4,7 +4,7 @@ The workspace separates app behavior from hardware access.
 
 ## Layers
 
-- `app-core` owns state, events, update logic, and drawing. It is `no_std` and can run in firmware or on the Mac simulator.
+- `app-core` owns state, events, update logic, and drawing. It is `no_std` and can run in firmware or on the Mac simulator. State transitions live in the crate root; presentation details live in `app-core::ui`.
 - `board-waveshare-c6` records hardware facts and will grow into the board support layer for display, touch, GPIO expansion, IMU, RTC, and storage.
 - `sim` adapts native macOS button actions into app events and renders the app into an AppKit window.
 - `firmware` initializes ESP32-C6 hardware and will adapt physical peripherals into the same app events.
@@ -19,9 +19,9 @@ The tap highlight is a simulator-only overlay. The shared app core receives the 
 
 The Mac simulator shows render debug counters outside the device display. `core requests` count times `app-core` reported that visible app state changed, `core frames` count actual shared-core renders, and `sim redraws` count AppKit refreshes including simulator-only overlays.
 
-Text rendering is part of `app-core::App::render`, using generated `mplusfonts` bitmap fonts. The generated font data is subset to printable ASCII for now and uses compile-time rasterization, antialiasing, and kerning while keeping firmware rendering deterministic.
+Text rendering uses generated `mplusfonts` bitmap fonts. The generated font data is subset to printable ASCII for now and uses compile-time rasterization, antialiasing, and kerning while keeping firmware rendering deterministic.
 
-The UI is OLED-first: the screen background is true black, with small near-black surfaces and restrained action colors to keep power use low while preserving contrast. App colors live as named constants in `app-core`; the current palette uses muted green for Start, red for Stop, soft off-white secondary text, and subdued inactive controls. Buttons and panels render as rounded rectangles with subtle 1px borders.
+The UI is OLED-first: the screen background is true black, with small near-black surfaces and restrained action colors to keep power use low while preserving contrast. Palette and layout values are named constants in `app-core::ui`; keep those constants as the source of truth instead of repeating detailed color choices here.
 
 Touch hit-testing intentionally uses each control's rectangular bounds, even when the visual shape is rounded. This keeps touch handling simple, forgiving, and consistent between simulator and firmware; taps in the small rounded-off corner areas still activate the control. Only switch to shape-accurate hit-testing if a future layout has overlapping controls or visible affordances that make rectangular targets misleading.
 
