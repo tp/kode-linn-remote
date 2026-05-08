@@ -21,6 +21,8 @@ The Mac simulator shows render debug counters outside the device display. `core 
 
 Text rendering is part of `app-core::App::render`, using `u8g2-fonts` Helvetica variants.
 
+Simulator zoom changes the AppKit image view size only. The embedded framebuffer remains 466 x 466 pixels at both native scale and 2x zoom. The window layout always reserves the 2x display area so controls and window size stay stable.
+
 ## Hardware Direction
 
 The firmware is set up for the no_std Espressif stack:

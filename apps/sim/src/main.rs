@@ -1,7 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::{
-    cell::{OnceCell, RefCell},
+    cell::{Cell, OnceCell, RefCell},
     convert::Infallible,
     time::Instant,
 };
@@ -32,6 +32,12 @@ use objc2_foundation::{
 const REFRESH_INTERVAL_SECONDS: f64 = 0.1;
 const TAP_FULL_MS: u64 = 1_000;
 const TAP_FADE_MS: u64 = 700;
+const WINDOW_MARGIN: f64 = 24.0;
+const SIDE_GAP: f64 = 24.0;
+const SIDE_WIDTH: f64 = 210.0;
+const BUTTON_WIDTH: f64 = 178.0;
+const BUTTON_HEIGHT: f64 = 32.0;
+const BUTTON_SPACING: f64 = 44.0;
 
 #[derive(Clone, Debug)]
 struct Framebuffer {
@@ -299,10 +305,13 @@ impl RenderStats {
 struct AppDelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
     image_view: OnceCell<Retained<NSImageView>>,
+    side_panel: OnceCell<Retained<NSView>>,
+    zoom_button: OnceCell<Retained<NSButton>>,
     debug_label: OnceCell<Retained<NSTextField>>,
     tap_recognizer: OnceCell<Retained<NSClickGestureRecognizer>>,
     timer: OnceCell<Retained<NSTimer>>,
     simulator: RefCell<NativeSimulator>,
+    zoomed: Cell<bool>,
 }
 
 impl Default for AppDelegateIvars {
@@ -310,10 +319,13 @@ impl Default for AppDelegateIvars {
         Self {
             window: OnceCell::new(),
             image_view: OnceCell::new(),
+            side_panel: OnceCell::new(),
+            zoom_button: OnceCell::new(),
             debug_label: OnceCell::new(),
             tap_recognizer: OnceCell::new(),
             timer: OnceCell::new(),
             simulator: RefCell::new(NativeSimulator::new()),
+            zoomed: Cell::new(false),
         }
     }
 }
@@ -328,39 +340,37 @@ define_class!(
 
     unsafe impl NSApplicationDelegate for Delegate {
         #[unsafe(method(applicationDidFinishLaunching:))]
-        fn did_finish_launching(&self, notification: &NSNotification) {
+        fn did_finish_launching(&self, _notification: &NSNotification) {
             let mtm = self.mtm();
-            let app = notification
-                .object()
-                .expect("launch notification should have an app object")
-                .downcast::<NSApplication>()
-                .expect("launch notification object should be NSApplication");
+            let app = NSApplication::sharedApplication(mtm);
+            app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+
+            let style_mask = NSWindowStyleMask::Titled
+                | NSWindowStyleMask::Closable
+                | NSWindowStyleMask::Miniaturizable;
+            let initial_layout = layout_for_backing_scale(2.0, false);
 
             let window = unsafe {
                 NSWindow::initWithContentRect_styleMask_backing_defer(
                     NSWindow::alloc(mtm),
-                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(760.0, 580.0)),
-                    NSWindowStyleMask::Titled
-                        | NSWindowStyleMask::Closable
-                        | NSWindowStyleMask::Miniaturizable
-                        | NSWindowStyleMask::Resizable,
+                    NSRect::new(NSPoint::new(0.0, 0.0), initial_layout.content_size),
+                    style_mask,
                     NSBackingStoreType::Buffered,
                     false,
                 )
             };
             unsafe { window.setReleasedWhenClosed(false) };
             window.setTitle(ns_string!("ESP32-C6 Home Tools Simulator"));
-            window.center();
-            window.setContentMinSize(NSSize::new(720.0, 560.0));
             window.setDelegate(Some(ProtocolObject::from_ref(self)));
 
             let content_view = window.contentView().expect("window should have a content view");
+            let layout = layout_for_window(&window, false);
+            window.setContentMinSize(layout.content_size);
+            window.center();
+
             let image = self.render_image();
             let image_view = NSImageView::imageViewWithImage(&image, mtm);
-            image_view.setFrame(NSRect::new(
-                NSPoint::new(24.0, 74.0),
-                NSSize::new(466.0, 466.0),
-            ));
+            image_view.setFrame(layout.display_frame);
             image_view.setImageScaling(NSImageScaling::ScaleAxesIndependently);
             let tap_recognizer = unsafe {
                 NSClickGestureRecognizer::initWithTarget_action(
@@ -373,56 +383,68 @@ define_class!(
             image_view.addGestureRecognizer(&tap_recognizer);
             content_view.addSubview(&image_view);
 
+            let side_panel = NSView::initWithFrame(NSView::alloc(mtm), layout.side_frame);
+            content_view.addSubview(&side_panel);
+
+            let zoom_button = add_button(
+                &side_panel,
+                "Zoom 2x",
+                0.0,
+                layout.side_inner_height - BUTTON_HEIGHT,
+                sel!(toggleZoom:),
+                self,
+                mtm,
+            );
             add_button(
-                &content_view,
+                &side_panel,
                 "Advance +1s",
-                524.0,
-                496.0,
+                0.0,
+                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING,
                 sel!(advanceSecond:),
                 self,
                 mtm,
             );
             add_button(
-                &content_view,
+                &side_panel,
                 "Boot button",
-                524.0,
-                452.0,
+                0.0,
+                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 2.0,
                 sel!(bootButton:),
                 self,
                 mtm,
             );
             add_button(
-                &content_view,
+                &side_panel,
                 "User button",
-                524.0,
-                408.0,
+                0.0,
+                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 3.0,
                 sel!(userButton:),
                 self,
                 mtm,
             );
             add_button(
-                &content_view,
+                &side_panel,
                 "Network offline",
-                524.0,
-                344.0,
+                0.0,
+                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 4.4,
                 sel!(networkOffline:),
                 self,
                 mtm,
             );
             add_button(
-                &content_view,
+                &side_panel,
                 "Network connecting",
-                524.0,
-                300.0,
+                0.0,
+                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 5.4,
                 sel!(networkConnecting:),
                 self,
                 mtm,
             );
             add_button(
-                &content_view,
+                &side_panel,
                 "Network online",
-                524.0,
-                256.0,
+                0.0,
+                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 6.4,
                 sel!(networkOnline:),
                 self,
                 mtm,
@@ -433,11 +455,10 @@ define_class!(
                 mtm,
             );
             debug_label.setFrame(NSRect::new(
-                NSPoint::new(524.0, 64.0),
-                NSSize::new(210.0, 148.0),
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(SIDE_WIDTH, 148.0),
             ));
-            debug_label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
-            content_view.addSubview(&debug_label);
+            side_panel.addSubview(&debug_label);
 
             let timer = unsafe {
                 NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
@@ -450,11 +471,21 @@ define_class!(
             };
 
             window.makeKeyAndOrderFront(None);
+            #[allow(deprecated)]
+            app.activateIgnoringOtherApps(true);
 
             self.ivars()
                 .image_view
                 .set(image_view)
                 .expect("image view should be stored once");
+            self.ivars()
+                .side_panel
+                .set(side_panel)
+                .expect("side panel should be stored once");
+            self.ivars()
+                .zoom_button
+                .set(zoom_button)
+                .expect("zoom button should be stored once");
             self.ivars()
                 .debug_label
                 .set(debug_label)
@@ -472,9 +503,6 @@ define_class!(
                 .set(window)
                 .expect("window should be stored once");
 
-            app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-            #[allow(deprecated)]
-            app.activateIgnoringOtherApps(true);
         }
     }
 
@@ -493,6 +521,12 @@ define_class!(
         fn timer_tick(&self, _sender: &NSTimer) {
             self.ivars().simulator.borrow_mut().tick();
             self.refresh_image();
+        }
+
+        #[unsafe(method(toggleZoom:))]
+        fn toggle_zoom(&self, _sender: &AnyObject) {
+            self.ivars().zoomed.set(!self.ivars().zoomed.get());
+            self.apply_zoom_layout();
         }
 
         #[unsafe(method(advanceSecond:))]
@@ -518,8 +552,11 @@ define_class!(
             };
 
             let point = sender.locationInView(Some(&view));
-            let x = point.x.round() as i32;
-            let y = (DISPLAY_SIZE.height as f64 - point.y).round() as i32;
+            let view_frame = view.frame();
+            let x = ((point.x / view_frame.size.width) * DISPLAY_SIZE.width as f64).round() as i32;
+            let y = (((view_frame.size.height - point.y) / view_frame.size.height)
+                * DISPLAY_SIZE.height as f64)
+                .round() as i32;
 
             if x < 0 || y < 0 || x >= DISPLAY_SIZE.width as i32 || y >= DISPLAY_SIZE.height as i32 {
                 return;
@@ -588,6 +625,42 @@ impl Delegate {
     fn debug_text(&self) -> String {
         self.ivars().simulator.borrow().debug_text()
     }
+
+    fn apply_zoom_layout(&self) {
+        let window = self
+            .ivars()
+            .window
+            .get()
+            .expect("window should exist after launch");
+        let image_view = self
+            .ivars()
+            .image_view
+            .get()
+            .expect("image view should exist after launch");
+        let side_panel = self
+            .ivars()
+            .side_panel
+            .get()
+            .expect("side panel should exist after launch");
+        let zoom_button = self
+            .ivars()
+            .zoom_button
+            .get()
+            .expect("zoom button should exist after launch");
+
+        let zoomed = self.ivars().zoomed.get();
+        let layout = layout_for_window(window, zoomed);
+        window.setContentMinSize(layout.content_size);
+        window.setContentSize(layout.content_size);
+        image_view.setFrame(layout.display_frame);
+        side_panel.setFrame(layout.side_frame);
+
+        if zoomed {
+            zoom_button.setTitle(&NSString::from_str("Native scale"));
+        } else {
+            zoom_button.setTitle(&NSString::from_str("Zoom 2x"));
+        }
+    }
 }
 
 fn add_button(
@@ -598,7 +671,7 @@ fn add_button(
     action: objc2::runtime::Sel,
     target: &Delegate,
     mtm: MainThreadMarker,
-) {
+) -> Retained<NSButton> {
     let button = unsafe {
         NSButton::buttonWithTitle_target_action(
             &NSString::from_str(title),
@@ -607,9 +680,57 @@ fn add_button(
             mtm,
         )
     };
-    button.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(178.0, 32.0)));
-    button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+    button.setFrame(NSRect::new(
+        NSPoint::new(x, y),
+        NSSize::new(BUTTON_WIDTH, BUTTON_HEIGHT),
+    ));
+    button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
     content_view.addSubview(&button);
+    button
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+    content_size: NSSize,
+    display_frame: NSRect,
+    side_frame: NSRect,
+    side_inner_height: f64,
+}
+
+fn layout_for_window(window: &NSWindow, zoomed: bool) -> Layout {
+    layout_for_backing_scale(window.backingScaleFactor().max(1.0), zoomed)
+}
+
+fn layout_for_backing_scale(backing_scale: f64, zoomed: bool) -> Layout {
+    let native_display_points = DISPLAY_SIZE.width as f64 / backing_scale;
+    let zoomed_display_points = native_display_points * 2.0;
+    let display_points = if zoomed {
+        zoomed_display_points
+    } else {
+        native_display_points
+    };
+    let content_width =
+        WINDOW_MARGIN + zoomed_display_points + SIDE_GAP + SIDE_WIDTH + WINDOW_MARGIN;
+    let content_height = WINDOW_MARGIN * 2.0 + zoomed_display_points;
+    let reserved_display_x = WINDOW_MARGIN;
+    let reserved_display_y = WINDOW_MARGIN;
+    let display_x = reserved_display_x + (zoomed_display_points - display_points) / 2.0;
+    let display_y = reserved_display_y + (zoomed_display_points - display_points) / 2.0;
+    let side_height = content_height - WINDOW_MARGIN * 2.0;
+    let side_x = WINDOW_MARGIN + zoomed_display_points + SIDE_GAP;
+
+    Layout {
+        content_size: NSSize::new(content_width, content_height),
+        display_frame: NSRect::new(
+            NSPoint::new(display_x, display_y),
+            NSSize::new(display_points, display_points),
+        ),
+        side_frame: NSRect::new(
+            NSPoint::new(side_x, WINDOW_MARGIN),
+            NSSize::new(SIDE_WIDTH, side_height),
+        ),
+        side_inner_height: side_height,
+    }
 }
 
 fn scale_channel(value: u8, max: u8) -> u8 {

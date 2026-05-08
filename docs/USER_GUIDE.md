@@ -13,6 +13,8 @@ The simulator no longer uses SDL2. It uses a native macOS AppKit window through 
 ## Use The Demo
 
 - The window represents the 466 x 466 AMOLED display on the Waveshare board.
+- The simulator opens at native physical-pixel scale for the current Mac display.
+- Use `Zoom 2x` to enlarge the device framebuffer without changing what the embedded renderer produces. The window reserves space for 2x mode, so toggling zoom does not resize the window.
 - Click anywhere inside the display area to simulate a tap.
 - Use the on-screen Start and Stop controls to run or pause the stopwatch.
 - The simulator-only tap highlight stays bright for one second and then fades.
