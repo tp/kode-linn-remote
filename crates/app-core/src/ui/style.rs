@@ -15,3 +15,5 @@ pub(super) const ACTION_STOP: Rgb565 = Rgb565::new(24, 4, 6);
 pub(super) const ACTION_STOP_BORDER: Rgb565 = Rgb565::new(31, 13, 14);
 pub(super) const ACTION_INACTIVE: Rgb565 = Rgb565::new(3, 4, 6);
 pub(super) const ACTION_INACTIVE_BORDER: Rgb565 = Rgb565::new(7, 10, 13);
+pub(super) const VOLUME_TRACK: Rgb565 = Rgb565::new(9, 45, 31);
+pub(super) const VOLUME_ACTIVE: Rgb565 = Rgb565::new(0, 12, 27);

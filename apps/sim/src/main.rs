@@ -6,7 +6,7 @@ use std::{
     time::Instant,
 };
 
-use app_core::{App, DISPLAY_SIZE, Event, NetworkStatus, TouchPoint};
+use app_core::{App, DISPLAY_SIZE, Event, NetworkStatus, Screen, TouchPoint};
 use embedded_graphics::{
     Pixel,
     draw_target::DrawTarget,
@@ -187,7 +187,7 @@ struct NativeSimulator {
 
 impl NativeSimulator {
     fn new() -> Self {
-        let mut app = App::new();
+        let mut app = App::new_on_screen(default_screen());
         let _ = app.update(Event::NetworkStatus(NetworkStatus::Online));
 
         Self {
@@ -295,6 +295,14 @@ impl NativeSimulator {
 
     fn debug_text(&self) -> String {
         self.render_stats.debug_text()
+    }
+}
+
+fn default_screen() -> Screen {
+    match std::env::var("APP_SCREEN").as_deref() {
+        Ok("stopwatch" | "stop-watch" | "stop_watch") => Screen::Stopwatch,
+        Ok("hifi" | "hifi-control" | "hifi_control") => Screen::HifiControl,
+        _ => Screen::Launcher,
     }
 }
 

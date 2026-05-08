@@ -34,6 +34,13 @@ pub enum NetworkStatus {
     Online,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Screen {
+    Launcher,
+    Stopwatch,
+    HifiControl,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UpdateOutcome {
     pub render_requested: bool,
@@ -50,20 +57,47 @@ pub struct App {
     uptime_ms: u64,
     network_status: NetworkStatus,
     interaction_count: u32,
-    stopwatch_running: bool,
-    stopwatch_seconds: u64,
-    last_stopwatch_second: u64,
+    ui_layouts: ui::ScreenLayouts,
+    active_screen: ActiveScreen,
+}
+
+#[derive(Debug)]
+enum ActiveScreen {
+    Launcher(ui::screens::launcher::State),
+    Stopwatch(ui::screens::stopwatch::State),
+    HifiControl(ui::screens::hifi::State),
+}
+
+impl ActiveScreen {
+    const fn new(screen: Screen) -> Self {
+        match screen {
+            Screen::Launcher => Self::Launcher(ui::screens::launcher::State::new()),
+            Screen::Stopwatch => Self::Stopwatch(ui::screens::stopwatch::State::new()),
+            Screen::HifiControl => Self::HifiControl(ui::screens::hifi::State::new()),
+        }
+    }
+
+    const fn screen(&self) -> Screen {
+        match self {
+            Self::Launcher(_) => Screen::Launcher,
+            Self::Stopwatch(_) => Screen::Stopwatch,
+            Self::HifiControl(_) => Screen::HifiControl,
+        }
+    }
 }
 
 impl App {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        Self::new_on_screen(Screen::Launcher)
+    }
+
+    pub fn new_on_screen(screen: Screen) -> Self {
         Self {
             uptime_ms: 0,
             network_status: NetworkStatus::Offline,
             interaction_count: 0,
-            stopwatch_running: false,
-            stopwatch_seconds: 0,
-            last_stopwatch_second: 0,
+            ui_layouts: ui::ScreenLayouts::new(ui::SCREEN_BOUNDS),
+            active_screen: ActiveScreen::new(screen),
         }
     }
 
@@ -71,7 +105,11 @@ impl App {
         let render_requested = match event {
             Event::Tick { uptime_ms } => {
                 self.uptime_ms = uptime_ms;
-                self.update_stopwatch()
+                match &mut self.active_screen {
+                    ActiveScreen::Launcher(_) => false,
+                    ActiveScreen::Stopwatch(state) => state.on_tick(uptime_ms),
+                    ActiveScreen::HifiControl(state) => state.on_tick(uptime_ms),
+                }
             }
             Event::TouchDown(point) => {
                 // The interaction counter is visible UI state, so every tap changes the frame.
@@ -82,6 +120,7 @@ impl App {
             Event::TouchUp => false,
             Event::ButtonPressed(_) => {
                 self.interaction_count = self.interaction_count.saturating_add(1);
+                self.navigate(ui::Navigation::Launcher);
                 true
             }
             Event::NetworkStatus(status) => {
@@ -105,51 +144,53 @@ impl App {
         self.interaction_count
     }
 
-    pub const fn running(&self) -> bool {
-        self.stopwatch_running
-    }
-
-    pub const fn stopwatch_seconds(&self) -> u64 {
-        self.stopwatch_seconds
-    }
-
     pub const fn network_status(&self) -> NetworkStatus {
         self.network_status
     }
 
+    pub const fn screen(&self) -> Screen {
+        self.active_screen.screen()
+    }
+
     fn handle_touch(&mut self, point: TouchPoint) {
         let point = Point::new(point.x, point.y);
-        let layout = ui::layout(ui::SCREEN_BOUNDS);
-        let interaction_state = ui::InteractionState {
-            stopwatch_running: self.stopwatch_running,
+
+        let navigation = match &mut self.active_screen {
+            ActiveScreen::Launcher(_) => {
+                ui::screens::launcher::hit_test(self.ui_layouts.launcher(), point)
+            }
+            ActiveScreen::Stopwatch(state) => {
+                if let Some(action) =
+                    ui::screens::stopwatch::hit_test(self.ui_layouts.stopwatch(), point, state)
+                {
+                    state.handle(action, self.uptime_ms);
+                }
+                None
+            }
+            ActiveScreen::HifiControl(state) => {
+                if let Some(action) = ui::screens::hifi::hit_test(self.ui_layouts.hifi(), point) {
+                    state.handle(action, self.uptime_ms);
+                }
+                None
+            }
         };
 
-        match ui::hit_test(&layout, point, interaction_state) {
-            Some(ui::UiAction::StartStopwatch) => {
-                self.stopwatch_running = true;
-                self.last_stopwatch_second = self.uptime_ms / 1000;
-            }
-            Some(ui::UiAction::StopStopwatch) => {
-                self.update_stopwatch();
-                self.stopwatch_running = false;
-            }
-            None => {}
+        if let Some(navigation) = navigation {
+            self.navigate(navigation);
         }
     }
 
-    fn update_stopwatch(&mut self) -> bool {
-        if !self.stopwatch_running {
-            return false;
+    fn navigate(&mut self, navigation: ui::Navigation) {
+        self.active_screen = ActiveScreen::new(navigation.screen());
+        if let ActiveScreen::HifiControl(state) = &mut self.active_screen {
+            state.on_enter(self.uptime_ms);
         }
+    }
 
-        let current_second = self.uptime_ms / 1000;
-        let elapsed = current_second.saturating_sub(self.last_stopwatch_second);
-        if elapsed > 0 {
-            self.stopwatch_seconds = self.stopwatch_seconds.saturating_add(elapsed);
-            self.last_stopwatch_second = current_second;
-            true
-        } else {
-            false
+    fn ui_context(&self) -> ui::AppContext {
+        ui::AppContext {
+            network_status: self.network_status,
+            interaction_count: self.interaction_count,
         }
     }
 }
@@ -178,15 +219,45 @@ mod tests {
     }
 
     fn start_button_touch() -> TouchPoint {
-        let (start, _) = ui::button_centers();
+        let (start, _) = ui::stopwatch_button_centers();
 
         touch_point(start)
     }
 
     fn stop_button_touch() -> TouchPoint {
-        let (_, stop) = ui::button_centers();
+        let (_, stop) = ui::stopwatch_button_centers();
 
         touch_point(stop)
+    }
+
+    fn launcher_stopwatch_touch() -> TouchPoint {
+        let (stopwatch, _) = ui::launcher_button_centers();
+
+        touch_point(stopwatch)
+    }
+
+    fn launcher_hifi_touch() -> TouchPoint {
+        let (_, hifi) = ui::launcher_button_centers();
+
+        touch_point(hifi)
+    }
+
+    fn hifi_play_touch() -> TouchPoint {
+        touch_point(ui::hifi_play_button_center())
+    }
+
+    fn stopwatch_state(app: &App) -> &ui::screens::stopwatch::State {
+        match &app.active_screen {
+            ActiveScreen::Stopwatch(state) => state,
+            _ => panic!("expected stopwatch screen"),
+        }
+    }
+
+    fn hifi_state(app: &App) -> &ui::screens::hifi::State {
+        match &app.active_screen {
+            ActiveScreen::HifiControl(state) => state,
+            _ => panic!("expected hifi screen"),
+        }
     }
 
     #[test]
@@ -201,7 +272,7 @@ mod tests {
 
     #[test]
     fn running_stopwatch_requests_render_once_per_second() {
-        let mut app = App::new();
+        let mut app = App::new_on_screen(Screen::Stopwatch);
 
         app.update(Event::TouchDown(start_button_touch()));
 
@@ -228,25 +299,25 @@ mod tests {
 
     #[test]
     fn start_and_stop_control_stopwatch() {
-        let mut app = App::new();
+        let mut app = App::new_on_screen(Screen::Stopwatch);
 
         app.update(Event::TouchDown(start_button_touch()));
         app.update(Event::Tick { uptime_ms: 1_000 });
         app.update(Event::Tick { uptime_ms: 2_000 });
 
-        assert!(app.running());
-        assert_eq!(app.stopwatch_seconds(), 2);
+        assert!(stopwatch_state(&app).running());
+        assert_eq!(stopwatch_state(&app).seconds(), 2);
 
         app.update(Event::TouchDown(stop_button_touch()));
         app.update(Event::Tick { uptime_ms: 5_000 });
 
-        assert!(!app.running());
-        assert_eq!(app.stopwatch_seconds(), 2);
+        assert!(!stopwatch_state(&app).running());
+        assert_eq!(stopwatch_state(&app).seconds(), 2);
     }
 
     #[test]
     fn stopped_stopwatch_does_not_advance_with_uptime() {
-        let mut app = App::new();
+        let mut app = App::new_on_screen(Screen::Stopwatch);
 
         app.update(Event::TouchDown(start_button_touch()));
         app.update(Event::Tick { uptime_ms: 3_000 });
@@ -254,7 +325,7 @@ mod tests {
         app.update(Event::Tick { uptime_ms: 20_000 });
 
         assert_eq!(app.uptime_ms(), 20_000);
-        assert_eq!(app.stopwatch_seconds(), 3);
+        assert_eq!(stopwatch_state(&app).seconds(), 3);
     }
 
     #[test]
@@ -272,6 +343,81 @@ mod tests {
         let app = App::new();
 
         assert_eq!(app.network_status(), NetworkStatus::Offline);
+    }
+
+    #[test]
+    fn default_screen_is_launcher() {
+        let app = App::new();
+
+        assert_eq!(app.screen(), Screen::Launcher);
+    }
+
+    #[test]
+    fn launcher_selects_app_screens() {
+        let mut app = App::new();
+
+        app.update(Event::TouchDown(launcher_stopwatch_touch()));
+        assert_eq!(app.screen(), Screen::Stopwatch);
+
+        let mut app = App::new();
+        app.update(Event::TouchDown(launcher_hifi_touch()));
+        assert_eq!(app.screen(), Screen::HifiControl);
+    }
+
+    #[test]
+    fn navigation_recreates_screen_state() {
+        let mut app = App::new_on_screen(Screen::Stopwatch);
+
+        app.update(Event::TouchDown(start_button_touch()));
+        app.update(Event::Tick { uptime_ms: 2_000 });
+        assert_eq!(stopwatch_state(&app).seconds(), 2);
+
+        app.update(Event::ButtonPressed(Button::User));
+        app.update(Event::TouchDown(launcher_stopwatch_touch()));
+
+        assert_eq!(app.screen(), Screen::Stopwatch);
+        assert!(!stopwatch_state(&app).running());
+        assert_eq!(stopwatch_state(&app).seconds(), 0);
+    }
+
+    #[test]
+    fn hifi_counts_down_while_playing() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+
+        assert!(
+            app.update(Event::Tick { uptime_ms: 1_000 })
+                .render_requested
+        );
+        assert_eq!(
+            hifi_state(&app).remaining_seconds(),
+            hifi_state(&app).total_seconds() - 1
+        );
+        assert!(hifi_state(&app).playing());
+
+        app.update(Event::TouchDown(hifi_play_touch()));
+        assert!(!hifi_state(&app).playing());
+        assert!(
+            !app.update(Event::Tick { uptime_ms: 5_000 })
+                .render_requested
+        );
+        assert_eq!(
+            hifi_state(&app).remaining_seconds(),
+            hifi_state(&app).total_seconds() - 1
+        );
+    }
+
+    #[test]
+    fn hifi_stops_when_countdown_reaches_zero() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+
+        let total_seconds = hifi_state(&app).total_seconds();
+        let outcome = app.update(Event::Tick {
+            uptime_ms: total_seconds * 1000,
+        });
+
+        assert!(outcome.render_requested);
+        assert_eq!(hifi_state(&app).remaining_seconds(), 0);
+        assert!(!hifi_state(&app).playing());
     }
 
     #[test]
@@ -301,9 +447,21 @@ mod tests {
             NetworkStatus::Connecting,
             NetworkStatus::Online,
         ] {
-            let mut app = App::new();
+            let mut app = App::new_on_screen(Screen::Stopwatch);
             app.update(Event::NetworkStatus(status));
 
+            let mut display = MockDisplay::<Rgb565>::new();
+            display.set_allow_overdraw(true);
+            display.set_allow_out_of_bounds_drawing(true);
+
+            app.render(&mut display).unwrap();
+        }
+    }
+
+    #[test]
+    fn render_draws_all_screens() {
+        for screen in [Screen::Launcher, Screen::Stopwatch, Screen::HifiControl] {
+            let app = App::new_on_screen(screen);
             let mut display = MockDisplay::<Rgb565>::new();
             display.set_allow_overdraw(true);
             display.set_allow_out_of_bounds_drawing(true);

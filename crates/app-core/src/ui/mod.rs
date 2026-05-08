@@ -1,20 +1,83 @@
-mod hit_test;
-mod layout;
+mod components;
+mod geometry;
 mod render;
+pub(crate) mod screens;
 mod style;
 
-pub(crate) use hit_test::{InteractionState, UiAction, hit_test};
-pub(crate) use layout::{SCREEN_BOUNDS, layout};
+use embedded_graphics::primitives::Rectangle;
+pub(crate) use geometry::SCREEN_BOUNDS;
+
+use crate::{NetworkStatus, Screen};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Navigation {
+    Launcher,
+    Stopwatch,
+    HifiControl,
+}
+
+impl Navigation {
+    pub(crate) const fn screen(self) -> Screen {
+        match self {
+            Self::Launcher => Screen::Launcher,
+            Self::Stopwatch => Screen::Stopwatch,
+            Self::HifiControl => Screen::HifiControl,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AppContext {
+    pub(crate) network_status: NetworkStatus,
+    pub(crate) interaction_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScreenLayouts {
+    launcher: screens::launcher::Layout,
+    stopwatch: screens::stopwatch::Layout,
+    hifi: screens::hifi::Layout,
+}
+
+impl ScreenLayouts {
+    pub(crate) fn new(bounds: Rectangle) -> Self {
+        Self {
+            launcher: screens::launcher::layout(bounds),
+            stopwatch: screens::stopwatch::layout(bounds),
+            hifi: screens::hifi::layout(bounds),
+        }
+    }
+
+    pub(crate) const fn launcher(&self) -> &screens::launcher::Layout {
+        &self.launcher
+    }
+
+    pub(crate) const fn stopwatch(&self) -> &screens::stopwatch::Layout {
+        &self.stopwatch
+    }
+
+    pub(crate) const fn hifi(&self) -> &screens::hifi::Layout {
+        &self.hifi
+    }
+}
 
 #[cfg(test)]
-pub(crate) fn button_centers() -> (
+pub(crate) fn stopwatch_button_centers() -> (
     embedded_graphics::geometry::Point,
     embedded_graphics::geometry::Point,
 ) {
-    let ui_layout = layout(SCREEN_BOUNDS);
+    screens::stopwatch::button_centers(SCREEN_BOUNDS)
+}
 
-    (
-        ui_layout.buttons.start.center(),
-        ui_layout.buttons.stop.center(),
-    )
+#[cfg(test)]
+pub(crate) fn launcher_button_centers() -> (
+    embedded_graphics::geometry::Point,
+    embedded_graphics::geometry::Point,
+) {
+    screens::launcher::button_centers(SCREEN_BOUNDS)
+}
+
+#[cfg(test)]
+pub(crate) fn hifi_play_button_center() -> embedded_graphics::geometry::Point {
+    screens::hifi::play_button_center(SCREEN_BOUNDS)
 }
