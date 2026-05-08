@@ -11,47 +11,17 @@ use embedded_graphics::{
 };
 use mplusfonts::{mplus, style::BitmapFontStyleBuilder};
 
-use crate::{App, DISPLAY_SIZE, NetworkStatus, RenderError};
+use super::layout::{SCREEN_BOUNDS, layout};
+use super::style::*;
+use crate::{App, NetworkStatus, RenderError};
 
-pub(crate) const START_BUTTON_HIT_BOUNDS: Rectangle =
-    Rectangle::new(Point::new(44, 140), Size::new(170, 72));
-pub(crate) const STOP_BUTTON_HIT_BOUNDS: Rectangle =
-    Rectangle::new(Point::new(252, 140), Size::new(170, 72));
-
-const HEADER_PANEL: Rectangle = Rectangle::new(Point::new(24, 24), Size::new(418, 92));
-const CARD_RADIUS: u32 = 18;
-const BUTTON_RADIUS: u32 = 18;
-
-const TITLE_ORIGIN: Point = Point::new(44, 48);
-const LOWER_ROW_Y: i32 = 244;
-const LOWER_ROW_SPACING: i32 = 44;
-const IDEAL_TIME_DEMO_ORIGIN: Point = Point::new(44, LOWER_ROW_Y);
-const IDEAL_TIME_VALUE_ORIGIN: Point = Point::new(140, LOWER_ROW_Y);
-const STOPWATCH_TEXT_ORIGIN: Point = Point::new(44, LOWER_ROW_Y + LOWER_ROW_SPACING);
-const NETWORK_TEXT_ORIGIN: Point = Point::new(44, LOWER_ROW_Y + 2 * LOWER_ROW_SPACING);
-const NETWORK_UNAVAILABLE_TEXT_ORIGIN: Point = Point::new(78, LOWER_ROW_Y + 2 * LOWER_ROW_SPACING);
-const NETWORK_ICON_CENTER: Point = Point::new(55, LOWER_ROW_Y + 2 * LOWER_ROW_SPACING + 20);
-const NETWORK_ICON_DIAMETER: u32 = 22;
-const INTERACTIONS_TEXT_ORIGIN: Point = Point::new(44, LOWER_ROW_Y + 3 * LOWER_ROW_SPACING);
 const BUTTON_LABEL_OFFSET: Point = Point::new(0, 1);
+const NETWORK_ICON_DIAMETER: u32 = 22;
 const TIME_DIGIT_CELL_WIDTH: i32 = 18;
 const TIME_COLON_GAP: i32 = 4;
 const TIME_COLON_DOT_SIZE: u32 = 3;
 const TIME_COLON_TOP_OFFSET: i32 = 15;
 const TIME_COLON_BOTTOM_OFFSET: i32 = 27;
-
-const OLED_BLACK: Rgb565 = Rgb565::BLACK;
-const SURFACE: Rgb565 = Rgb565::new(1, 2, 3);
-const SURFACE_BORDER: Rgb565 = Rgb565::new(5, 9, 11);
-const TEXT_PRIMARY: Rgb565 = Rgb565::WHITE;
-const TEXT_SECONDARY: Rgb565 = TEXT_PRIMARY;
-const TEXT_DISABLED: Rgb565 = Rgb565::new(10, 18, 20);
-const ACTION_START: Rgb565 = Rgb565::new(1, 30, 13);
-const ACTION_START_BORDER: Rgb565 = Rgb565::new(7, 42, 20);
-const ACTION_STOP: Rgb565 = Rgb565::new(24, 4, 6);
-const ACTION_STOP_BORDER: Rgb565 = Rgb565::new(31, 13, 14);
-const ACTION_INACTIVE: Rgb565 = Rgb565::new(3, 4, 6);
-const ACTION_INACTIVE_BORDER: Rgb565 = Rgb565::new(7, 10, 13);
 
 macro_rules! ui_font {
     ($weight:tt) => {
@@ -72,16 +42,23 @@ impl App {
     where
         D: DrawTarget<Color = Rgb565>,
     {
+        let ui_layout = layout(SCREEN_BOUNDS);
         let title_font = ui_font!(BOLD);
         let body_font = ui_font!(500);
         let top_text_style = TextStyleBuilder::new().baseline(Baseline::Top).build();
 
-        Rectangle::new(Point::zero(), DISPLAY_SIZE)
+        SCREEN_BOUNDS
             .into_styled(PrimitiveStyle::with_fill(OLED_BLACK))
             .draw(display)
             .map_err(RenderError::Draw)?;
 
-        draw_panel(display, HEADER_PANEL, CARD_RADIUS, SURFACE, SURFACE_BORDER)?;
+        draw_panel(
+            display,
+            ui_layout.header.panel,
+            CARD_RADIUS,
+            SURFACE,
+            SURFACE_BORDER,
+        )?;
 
         let title_style = BitmapFontStyleBuilder::new()
             .text_color(TEXT_PRIMARY)
@@ -90,7 +67,7 @@ impl App {
             .build();
         Text::with_text_style(
             "ESP32-C6 Home Tools",
-            TITLE_ORIGIN,
+            ui_layout.header.title_origin,
             title_style,
             top_text_style,
         )
@@ -99,14 +76,14 @@ impl App {
 
         draw_button(
             display,
-            START_BUTTON_HIT_BOUNDS,
+            ui_layout.buttons.start,
             "START",
             !self.stopwatch_running,
             ButtonTone::Start,
         )?;
         draw_button(
             display,
-            STOP_BUTTON_HIT_BOUNDS,
+            ui_layout.buttons.stop,
             "STOP",
             self.stopwatch_running,
             ButtonTone::Stop,
@@ -120,7 +97,7 @@ impl App {
 
         Text::with_text_style(
             "ideal",
-            IDEAL_TIME_DEMO_ORIGIN,
+            ui_layout.info.ideal.label.top_left,
             body_style.clone(),
             top_text_style,
         )
@@ -128,7 +105,7 @@ impl App {
         .map_err(RenderError::Draw)?;
         draw_ideal_duration(
             display,
-            IDEAL_TIME_VALUE_ORIGIN,
+            ui_layout.info.ideal.value.top_left,
             Duration::from_secs(self.stopwatch_seconds),
             body_style.clone(),
         )?;
@@ -138,7 +115,7 @@ impl App {
             .map_err(|_| RenderError::TextFormat)?;
         Text::with_text_style(
             &stopwatch,
-            STOPWATCH_TEXT_ORIGIN,
+            ui_layout.info.stopwatch.top_left,
             body_style.clone(),
             top_text_style,
         )
@@ -146,10 +123,10 @@ impl App {
         .map_err(RenderError::Draw)?;
 
         let network_text_origin = if self.network_status == NetworkStatus::Online {
-            NETWORK_TEXT_ORIGIN
+            ui_layout.info.network.text_without_icon_origin
         } else {
-            draw_network_unavailable_icon(display)?;
-            NETWORK_UNAVAILABLE_TEXT_ORIGIN
+            draw_network_unavailable_icon(display, ui_layout.info.network.icon_center)?;
+            ui_layout.info.network.text_with_icon_origin
         };
         Text::with_text_style(
             network_text(self.network_status),
@@ -165,7 +142,7 @@ impl App {
             .map_err(|_| RenderError::TextFormat)?;
         Text::with_text_style(
             &interactions,
-            INTERACTIONS_TEXT_ORIGIN,
+            ui_layout.info.interactions.top_left,
             body_style,
             top_text_style,
         )
@@ -266,7 +243,8 @@ fn digit_text(digit: u8) -> &'static str {
         6 => "6",
         7 => "7",
         8 => "8",
-        _ => "9",
+        9 => "9",
+        _ => unreachable!("digit_text expects a single decimal digit"),
     }
 }
 
@@ -309,22 +287,22 @@ fn network_text(status: NetworkStatus) -> &'static str {
     }
 }
 
-fn draw_network_unavailable_icon<D>(display: &mut D) -> Result<(), RenderError<D::Error>>
+fn draw_network_unavailable_icon<D>(
+    display: &mut D,
+    center: Point,
+) -> Result<(), RenderError<D::Error>>
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    Circle::with_center(NETWORK_ICON_CENTER, NETWORK_ICON_DIAMETER)
+    Circle::with_center(center, NETWORK_ICON_DIAMETER)
         .into_styled(PrimitiveStyle::with_stroke(TEXT_SECONDARY, 2))
         .draw(display)
         .map_err(RenderError::Draw)?;
 
-    Line::new(
-        NETWORK_ICON_CENTER + Point::new(-8, 8),
-        NETWORK_ICON_CENTER + Point::new(8, -8),
-    )
-    .into_styled(PrimitiveStyle::with_stroke(TEXT_SECONDARY, 2))
-    .draw(display)
-    .map_err(RenderError::Draw)
+    Line::new(center + Point::new(-8, 8), center + Point::new(8, -8))
+        .into_styled(PrimitiveStyle::with_stroke(TEXT_SECONDARY, 2))
+        .draw(display)
+        .map_err(RenderError::Draw)
 }
 
 fn draw_button<D>(

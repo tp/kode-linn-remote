@@ -119,13 +119,21 @@ impl App {
 
     fn handle_touch(&mut self, point: TouchPoint) {
         let point = Point::new(point.x, point.y);
+        let layout = ui::layout(ui::SCREEN_BOUNDS);
+        let interaction_state = ui::InteractionState {
+            stopwatch_running: self.stopwatch_running,
+        };
 
-        if ui::START_BUTTON_HIT_BOUNDS.contains(point) && !self.stopwatch_running {
-            self.stopwatch_running = true;
-            self.last_stopwatch_second = self.uptime_ms / 1000;
-        } else if ui::STOP_BUTTON_HIT_BOUNDS.contains(point) && self.stopwatch_running {
-            self.update_stopwatch();
-            self.stopwatch_running = false;
+        match ui::hit_test(&layout, point, interaction_state) {
+            Some(ui::UiAction::StartStopwatch) => {
+                self.stopwatch_running = true;
+                self.last_stopwatch_second = self.uptime_ms / 1000;
+            }
+            Some(ui::UiAction::StopStopwatch) => {
+                self.update_stopwatch();
+                self.stopwatch_running = false;
+            }
+            None => {}
         }
     }
 
@@ -158,8 +166,28 @@ extern crate std;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use embedded_graphics::geometry::Point;
     use embedded_graphics::mock_display::MockDisplay;
     use embedded_graphics::pixelcolor::Rgb565;
+
+    fn touch_point(point: Point) -> TouchPoint {
+        TouchPoint {
+            x: point.x,
+            y: point.y,
+        }
+    }
+
+    fn start_button_touch() -> TouchPoint {
+        let (start, _) = ui::button_centers();
+
+        touch_point(start)
+    }
+
+    fn stop_button_touch() -> TouchPoint {
+        let (_, stop) = ui::button_centers();
+
+        touch_point(stop)
+    }
 
     #[test]
     fn tick_updates_uptime() {
@@ -175,7 +203,7 @@ mod tests {
     fn running_stopwatch_requests_render_once_per_second() {
         let mut app = App::new();
 
-        app.update(Event::TouchDown(TouchPoint { x: 80, y: 170 }));
+        app.update(Event::TouchDown(start_button_touch()));
 
         assert!(!app.update(Event::Tick { uptime_ms: 500 }).render_requested);
         assert!(
@@ -202,14 +230,14 @@ mod tests {
     fn start_and_stop_control_stopwatch() {
         let mut app = App::new();
 
-        app.update(Event::TouchDown(TouchPoint { x: 80, y: 170 }));
+        app.update(Event::TouchDown(start_button_touch()));
         app.update(Event::Tick { uptime_ms: 1_000 });
         app.update(Event::Tick { uptime_ms: 2_000 });
 
         assert!(app.running());
         assert_eq!(app.stopwatch_seconds(), 2);
 
-        app.update(Event::TouchDown(TouchPoint { x: 300, y: 170 }));
+        app.update(Event::TouchDown(stop_button_touch()));
         app.update(Event::Tick { uptime_ms: 5_000 });
 
         assert!(!app.running());
@@ -220,9 +248,9 @@ mod tests {
     fn stopped_stopwatch_does_not_advance_with_uptime() {
         let mut app = App::new();
 
-        app.update(Event::TouchDown(TouchPoint { x: 80, y: 170 }));
+        app.update(Event::TouchDown(start_button_touch()));
         app.update(Event::Tick { uptime_ms: 3_000 });
-        app.update(Event::TouchDown(TouchPoint { x: 300, y: 170 }));
+        app.update(Event::TouchDown(stop_button_touch()));
         app.update(Event::Tick { uptime_ms: 20_000 });
 
         assert_eq!(app.uptime_ms(), 20_000);
