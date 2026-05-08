@@ -29,3 +29,4 @@ image = { version = "0.25.9", default-features = false, features = ["png"] }
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
 objc2-foundation = "0.3.2"
+u8g2-fonts = { version = "0.7.2", default-features = false }

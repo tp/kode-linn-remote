@@ -1,15 +1,14 @@
 #![no_std]
 
-use core::fmt::Write;
-
 use embedded_graphics::{
-    mono_font::{MonoTextStyle, ascii::FONT_10X20},
     pixelcolor::Rgb565,
     prelude::*,
     primitives::{PrimitiveStyle, Rectangle},
-    text::{Baseline, Text},
 };
-use heapless::String;
+use u8g2_fonts::{
+    FontRenderer, fonts,
+    types::{FontColor, HorizontalAlignment, VerticalPosition},
+};
 
 pub const DISPLAY_SIZE: Size = Size::new(466, 466);
 const START_BUTTON: Rectangle = Rectangle::new(Point::new(44, 140), Size::new(170, 72));
@@ -46,6 +45,12 @@ pub enum NetworkStatus {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UpdateOutcome {
     pub render_requested: bool,
+}
+
+#[derive(Debug)]
+pub enum RenderError<E> {
+    Draw(E),
+    Font(u8g2_fonts::Error<E>),
 }
 
 #[derive(Debug)]
@@ -99,56 +104,69 @@ impl App {
         UpdateOutcome { render_requested }
     }
 
-    pub fn render<D>(&self, display: &mut D) -> Result<(), D::Error>
+    pub fn render<D>(&self, display: &mut D) -> Result<(), RenderError<D::Error>>
     where
         D: DrawTarget<Color = Rgb565>,
     {
-        display.clear(Rgb565::BLACK)?;
+        display.clear(Rgb565::BLACK).map_err(RenderError::Draw)?;
 
         Rectangle::new(Point::zero(), DISPLAY_SIZE)
             .into_styled(PrimitiveStyle::with_fill(Rgb565::new(2, 5, 8)))
-            .draw(display)?;
+            .draw(display)
+            .map_err(RenderError::Draw)?;
 
         Rectangle::new(Point::new(24, 24), Size::new(418, 92))
             .into_styled(PrimitiveStyle::with_fill(Rgb565::new(6, 18, 14)))
-            .draw(display)?;
+            .draw(display)
+            .map_err(RenderError::Draw)?;
 
-        let title_style = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
-        Text::with_baseline(
-            "ESP32-C6 Home Tools",
-            Point::new(44, 48),
-            title_style,
-            Baseline::Top,
-        )
-        .draw(display)?;
-
-        let body_style = MonoTextStyle::new(&FONT_10X20, Rgb565::new(23, 55, 47));
+        title_font()
+            .render(
+                "ESP32-C6 Home Tools",
+                Point::new(44, 48),
+                VerticalPosition::Top,
+                FontColor::Transparent(Rgb565::WHITE),
+                display,
+            )
+            .map_err(RenderError::Font)?;
 
         draw_button(display, START_BUTTON, "START", !self.stopwatch_running)?;
         draw_button(display, STOP_BUTTON, "STOP", self.stopwatch_running)?;
 
-        let mut stopwatch: String<32> = String::new();
-        let _ = write!(stopwatch, "stopwatch: {}s", self.stopwatch_seconds);
-        Text::with_baseline(&stopwatch, Point::new(44, 244), body_style, Baseline::Top)
-            .draw(display)?;
+        body_font()
+            .render(
+                format_args!("stopwatch: {}s", self.stopwatch_seconds),
+                Point::new(44, 244),
+                VerticalPosition::Top,
+                FontColor::Transparent(Rgb565::new(23, 55, 47)),
+                display,
+            )
+            .map_err(RenderError::Font)?;
 
         let network = match self.network_status {
             NetworkStatus::Offline => "network: offline",
             NetworkStatus::Connecting => "network: connecting",
             NetworkStatus::Online => "network: online",
         };
-        Text::with_baseline(network, Point::new(44, 312), body_style, Baseline::Top)
-            .draw(display)?;
+        body_font()
+            .render(
+                network,
+                Point::new(44, 312),
+                VerticalPosition::Top,
+                FontColor::Transparent(Rgb565::new(23, 55, 47)),
+                display,
+            )
+            .map_err(RenderError::Font)?;
 
-        let mut interactions: String<32> = String::new();
-        let _ = write!(interactions, "interactions: {}", self.interaction_count);
-        Text::with_baseline(
-            &interactions,
-            Point::new(44, 352),
-            body_style,
-            Baseline::Top,
-        )
-        .draw(display)?;
+        body_font()
+            .render(
+                format_args!("interactions: {}", self.interaction_count),
+                Point::new(44, 352),
+                VerticalPosition::Top,
+                FontColor::Transparent(Rgb565::new(23, 55, 47)),
+                display,
+            )
+            .map_err(RenderError::Font)?;
 
         Ok(())
     }
@@ -213,7 +231,7 @@ fn draw_button<D>(
     rect: Rectangle,
     label: &str,
     active: bool,
-) -> Result<(), D::Error>
+) -> Result<(), RenderError<D::Error>>
 where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -229,18 +247,33 @@ where
     };
 
     rect.into_styled(PrimitiveStyle::with_fill(fill))
-        .draw(display)?;
+        .draw(display)
+        .map_err(RenderError::Draw)?;
 
-    let style = MonoTextStyle::new(&FONT_10X20, text);
-    Text::with_baseline(
-        label,
-        Point::new(rect.top_left.x + 32, rect.top_left.y + 24),
-        style,
-        Baseline::Top,
-    )
-    .draw(display)?;
+    button_font()
+        .render_aligned(
+            label,
+            rect.center() + Point::new(0, 1),
+            VerticalPosition::Center,
+            HorizontalAlignment::Center,
+            FontColor::Transparent(text),
+            display,
+        )
+        .map_err(RenderError::Font)?;
 
     Ok(())
+}
+
+const fn body_font() -> FontRenderer {
+    FontRenderer::new::<fonts::u8g2_font_helvR12_tr>()
+}
+
+const fn title_font() -> FontRenderer {
+    FontRenderer::new::<fonts::u8g2_font_helvB12_tr>()
+}
+
+const fn button_font() -> FontRenderer {
+    FontRenderer::new::<fonts::u8g2_font_helvB12_tr>()
 }
 
 #[cfg(test)]

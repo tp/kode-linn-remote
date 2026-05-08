@@ -19,6 +19,8 @@ The tap highlight is a simulator-only overlay. The shared app core receives the 
 
 The Mac simulator shows render debug counters outside the device display. `core requests` count times `app-core` reported that visible app state changed, `core frames` count actual shared-core renders, and `sim redraws` count AppKit refreshes including simulator-only overlays.
 
+Text rendering is part of `app-core::App::render`, using `u8g2-fonts` Helvetica variants.
+
 ## Hardware Direction
 
 The firmware is set up for the no_std Espressif stack:

@@ -14,6 +14,7 @@ version = "0.1.0"
 dependencies = [
  "embedded-graphics",
  "heapless 0.9.1",
+ "u8g2-fonts",
 ]
 
 [[package]]
@@ -1255,6 +1256,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
  "winnow",
+]
+
+[[package]]
+name = "u8g2-fonts"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "825f57be1429fd60f335a4aade11e128a7ae4f89d75ca3a003cb8410a91093f7"
+dependencies = [
+ "embedded-graphics-core",
 ]
 
 [[package]]
