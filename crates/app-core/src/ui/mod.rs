@@ -7,24 +7,7 @@ mod style;
 use embedded_graphics::primitives::Rectangle;
 pub(crate) use geometry::SCREEN_BOUNDS;
 
-use crate::{NetworkStatus, Screen};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Navigation {
-    Launcher,
-    Stopwatch,
-    HifiControl,
-}
-
-impl Navigation {
-    pub(crate) const fn screen(self) -> Screen {
-        match self {
-            Self::Launcher => Screen::Launcher,
-            Self::Stopwatch => Screen::Stopwatch,
-            Self::HifiControl => Screen::HifiControl,
-        }
-    }
-}
+use crate::NetworkStatus;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AppContext {

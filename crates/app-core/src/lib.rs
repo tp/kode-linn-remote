@@ -69,11 +69,11 @@ enum ActiveScreen {
 }
 
 impl ActiveScreen {
-    const fn new(screen: Screen) -> Self {
+    const fn new(screen: Screen, uptime_ms: u64) -> Self {
         match screen {
             Screen::Launcher => Self::Launcher(ui::screens::launcher::State::new()),
             Screen::Stopwatch => Self::Stopwatch(ui::screens::stopwatch::State::new()),
-            Screen::HifiControl => Self::HifiControl(ui::screens::hifi::State::new()),
+            Screen::HifiControl => Self::HifiControl(ui::screens::hifi::State::new(uptime_ms)),
         }
     }
 
@@ -97,7 +97,7 @@ impl App {
             network_status: NetworkStatus::Offline,
             interaction_count: 0,
             ui_layouts: ui::ScreenLayouts::new(ui::SCREEN_BOUNDS),
-            active_screen: ActiveScreen::new(screen),
+            active_screen: ActiveScreen::new(screen, 0),
         }
     }
 
@@ -120,7 +120,7 @@ impl App {
             Event::TouchUp => false,
             Event::ButtonPressed(_) => {
                 self.interaction_count = self.interaction_count.saturating_add(1);
-                self.navigate(ui::Navigation::Launcher);
+                self.navigate(Screen::Launcher);
                 true
             }
             Event::NetworkStatus(status) => {
@@ -155,36 +155,25 @@ impl App {
     fn handle_touch(&mut self, point: TouchPoint) {
         let point = Point::new(point.x, point.y);
 
-        let navigation = match &mut self.active_screen {
+        let destination = match &mut self.active_screen {
             ActiveScreen::Launcher(_) => {
-                ui::screens::launcher::hit_test(self.ui_layouts.launcher(), point)
+                ui::screens::launcher::handle_touch(self.ui_layouts.launcher(), point)
             }
             ActiveScreen::Stopwatch(state) => {
-                if let Some(action) =
-                    ui::screens::stopwatch::hit_test(self.ui_layouts.stopwatch(), point, state)
-                {
-                    state.handle(action, self.uptime_ms);
-                }
-                None
+                state.handle_touch(self.ui_layouts.stopwatch(), point, self.uptime_ms)
             }
             ActiveScreen::HifiControl(state) => {
-                if let Some(action) = ui::screens::hifi::hit_test(self.ui_layouts.hifi(), point) {
-                    state.handle(action, self.uptime_ms);
-                }
-                None
+                state.handle_touch(self.ui_layouts.hifi(), point, self.uptime_ms)
             }
         };
 
-        if let Some(navigation) = navigation {
-            self.navigate(navigation);
+        if let Some(destination) = destination {
+            self.navigate(destination);
         }
     }
 
-    fn navigate(&mut self, navigation: ui::Navigation) {
-        self.active_screen = ActiveScreen::new(navigation.screen());
-        if let ActiveScreen::HifiControl(state) = &mut self.active_screen {
-            state.on_enter(self.uptime_ms);
-        }
+    fn navigate(&mut self, screen: Screen) {
+        self.active_screen = ActiveScreen::new(screen, self.uptime_ms);
     }
 
     fn ui_context(&self) -> ui::AppContext {

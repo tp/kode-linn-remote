@@ -83,7 +83,7 @@ pub(crate) struct State {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Action {
+enum Action {
     Start,
     Stop,
 }
@@ -123,7 +123,18 @@ impl State {
         true
     }
 
-    pub(crate) fn handle(&mut self, action: Action, uptime_ms: u64) {
+    pub(crate) fn handle_touch(
+        &mut self,
+        layout: &Layout,
+        point: Point,
+        uptime_ms: u64,
+    ) -> Option<crate::Screen> {
+        let action = hit_test(layout, point, self)?;
+        self.handle(action, uptime_ms);
+        None
+    }
+
+    fn handle(&mut self, action: Action, uptime_ms: u64) {
         match action {
             Action::Start => {
                 self.running = true;
@@ -170,7 +181,7 @@ pub(crate) fn layout(bounds: Rectangle) -> Layout {
     }
 }
 
-pub(crate) fn hit_test(layout: &Layout, point: Point, state: &State) -> Option<Action> {
+fn hit_test(layout: &Layout, point: Point, state: &State) -> Option<Action> {
     if layout.buttons.start.contains(point) && !state.running {
         Some(Action::Start)
     } else if layout.buttons.stop.contains(point) && state.running {

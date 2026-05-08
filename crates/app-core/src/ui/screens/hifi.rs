@@ -86,19 +86,21 @@ pub(crate) struct State {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Action {
+enum Action {
     TogglePlayback,
 }
 
 impl State {
-    pub(crate) const fn new() -> Self {
+    pub(crate) const fn new(uptime_ms: u64) -> Self {
+        let current_second = uptime_ms / 1000;
+
         Self {
             playing: true,
             volume_percent: 60,
             total_seconds: 20 * 60,
             remaining_seconds: 20 * 60,
-            last_second: 0,
-            current_second: 0,
+            last_second: current_second,
+            current_second,
         }
     }
 
@@ -115,12 +117,6 @@ impl State {
     #[cfg(test)]
     pub(crate) const fn remaining_seconds(&self) -> u64 {
         self.remaining_seconds
-    }
-
-    pub(crate) fn on_enter(&mut self, uptime_ms: u64) {
-        let current_second = uptime_ms / 1000;
-        self.current_second = current_second;
-        self.last_second = current_second;
     }
 
     pub(crate) fn on_tick(&mut self, uptime_ms: u64) -> bool {
@@ -146,7 +142,18 @@ impl State {
         true
     }
 
-    pub(crate) fn handle(&mut self, action: Action, uptime_ms: u64) {
+    pub(crate) fn handle_touch(
+        &mut self,
+        layout: &Layout,
+        point: Point,
+        uptime_ms: u64,
+    ) -> Option<crate::Screen> {
+        let action = hit_test(layout, point)?;
+        self.handle(action, uptime_ms);
+        None
+    }
+
+    fn handle(&mut self, action: Action, uptime_ms: u64) {
         match action {
             Action::TogglePlayback => {
                 if self.playing {
@@ -202,7 +209,7 @@ pub(crate) fn layout(bounds: Rectangle) -> Layout {
     }
 }
 
-pub(crate) fn hit_test(layout: &Layout, point: Point) -> Option<Action> {
+fn hit_test(layout: &Layout, point: Point) -> Option<Action> {
     if layout.play_button.contains(point) {
         Some(Action::TogglePlayback)
     } else {

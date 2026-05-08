@@ -6,10 +6,9 @@ use embedded_graphics::{
 };
 use mplusfonts::{mplus, style::BitmapFontStyleBuilder};
 
-use crate::RenderError;
+use crate::{RenderError, Screen};
 
 use super::super::{
-    Navigation,
     components::{ButtonTone, draw_button, ui_font},
     geometry::horizontal_pair,
     style::{OLED_BLACK, TEXT_PRIMARY},
@@ -56,11 +55,15 @@ pub(crate) fn layout(bounds: Rectangle) -> Layout {
     }
 }
 
-pub(crate) fn hit_test(layout: &Layout, point: Point) -> Option<Navigation> {
+pub(crate) fn handle_touch(layout: &Layout, point: Point) -> Option<Screen> {
+    hit_test(layout, point)
+}
+
+fn hit_test(layout: &Layout, point: Point) -> Option<Screen> {
     if layout.stopwatch_button.contains(point) {
-        Some(Navigation::Stopwatch)
+        Some(Screen::Stopwatch)
     } else if layout.hifi_button.contains(point) {
-        Some(Navigation::HifiControl)
+        Some(Screen::HifiControl)
     } else {
         None
     }
@@ -133,11 +136,11 @@ mod tests {
 
         assert_eq!(
             hit_test(&ui_layout, ui_layout.stopwatch_button.center()),
-            Some(Navigation::Stopwatch)
+            Some(Screen::Stopwatch)
         );
         assert_eq!(
             hit_test(&ui_layout, ui_layout.hifi_button.center()),
-            Some(Navigation::HifiControl)
+            Some(Screen::HifiControl)
         );
     }
 }
