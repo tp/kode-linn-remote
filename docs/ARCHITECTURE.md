@@ -6,7 +6,7 @@ The workspace separates app behavior from hardware access.
 
 - `app-core` owns state, events, update logic, and drawing. It is `no_std` and can run in firmware or on the Mac simulator. State transitions live in the crate root; presentation details live in `app-core::ui`.
 - `board-waveshare-c6` records hardware facts and will grow into the board support layer for display, touch, GPIO expansion, IMU, RTC, and storage.
-- `sim` adapts native macOS button actions into app events and renders the app into an AppKit window.
+- `sim` adapts native macOS controls into app events and renders the app into an AppKit window.
 - `firmware` initializes ESP32-C6 hardware and will adapt physical peripherals into the same app events.
 
 ## Event Flow

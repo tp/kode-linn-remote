@@ -21,7 +21,7 @@ Controls:
 
 - Click anywhere inside the display area to send a tap to the shared app core.
 - Use the on-screen Start and Stop controls to run or pause the stopwatch.
-- Use the simulator side buttons to mimic hardware button presses, advance time, and change network status.
+- Use the simulator side controls to mimic hardware button presses, advance time, and choose network status.
 - Close the window to quit.
 
 ## Check The Core

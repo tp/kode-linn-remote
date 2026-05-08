@@ -4,7 +4,9 @@ use core::time::Duration;
 use embedded_graphics::{
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
+    primitives::{
+        Circle, Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle,
+    },
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
 use mplusfonts::{mplus, style::BitmapFontStyleBuilder};
@@ -27,6 +29,9 @@ const IDEAL_TIME_DEMO_ORIGIN: Point = Point::new(44, LOWER_ROW_Y);
 const IDEAL_TIME_VALUE_ORIGIN: Point = Point::new(140, LOWER_ROW_Y);
 const STOPWATCH_TEXT_ORIGIN: Point = Point::new(44, LOWER_ROW_Y + LOWER_ROW_SPACING);
 const NETWORK_TEXT_ORIGIN: Point = Point::new(44, LOWER_ROW_Y + 2 * LOWER_ROW_SPACING);
+const NETWORK_UNAVAILABLE_TEXT_ORIGIN: Point = Point::new(78, LOWER_ROW_Y + 2 * LOWER_ROW_SPACING);
+const NETWORK_ICON_CENTER: Point = Point::new(55, LOWER_ROW_Y + 2 * LOWER_ROW_SPACING + 20);
+const NETWORK_ICON_DIAMETER: u32 = 22;
 const INTERACTIONS_TEXT_ORIGIN: Point = Point::new(44, LOWER_ROW_Y + 3 * LOWER_ROW_SPACING);
 const BUTTON_LABEL_OFFSET: Point = Point::new(0, 1);
 const TIME_DIGIT_CELL_WIDTH: i32 = 18;
@@ -140,9 +145,15 @@ impl App {
         .draw(display)
         .map_err(RenderError::Draw)?;
 
+        let network_text_origin = if self.network_status == NetworkStatus::Online {
+            NETWORK_TEXT_ORIGIN
+        } else {
+            draw_network_unavailable_icon(display)?;
+            NETWORK_UNAVAILABLE_TEXT_ORIGIN
+        };
         Text::with_text_style(
             network_text(self.network_status),
-            NETWORK_TEXT_ORIGIN,
+            network_text_origin,
             body_style.clone(),
             top_text_style,
         )
@@ -296,6 +307,24 @@ fn network_text(status: NetworkStatus) -> &'static str {
         NetworkStatus::Connecting => "network: connecting",
         NetworkStatus::Online => "network: online",
     }
+}
+
+fn draw_network_unavailable_icon<D>(display: &mut D) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    Circle::with_center(NETWORK_ICON_CENTER, NETWORK_ICON_DIAMETER)
+        .into_styled(PrimitiveStyle::with_stroke(TEXT_SECONDARY, 2))
+        .draw(display)
+        .map_err(RenderError::Draw)?;
+
+    Line::new(
+        NETWORK_ICON_CENTER + Point::new(-8, 8),
+        NETWORK_ICON_CENTER + Point::new(8, -8),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(TEXT_SECONDARY, 2))
+    .draw(display)
+    .map_err(RenderError::Draw)
 }
 
 fn draw_button<D>(

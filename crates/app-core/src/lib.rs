@@ -113,6 +113,10 @@ impl App {
         self.stopwatch_seconds
     }
 
+    pub const fn network_status(&self) -> NetworkStatus {
+        self.network_status
+    }
+
     fn handle_touch(&mut self, point: TouchPoint) {
         let point = Point::new(point.x, point.y);
 
@@ -233,5 +237,50 @@ mod tests {
         display.set_allow_out_of_bounds_drawing(true);
 
         app.render(&mut display).unwrap();
+    }
+
+    #[test]
+    fn default_network_status_is_offline() {
+        let app = App::new();
+
+        assert_eq!(app.network_status(), NetworkStatus::Offline);
+    }
+
+    #[test]
+    fn network_status_change_requests_render() {
+        let mut app = App::new();
+
+        let outcome = app.update(Event::NetworkStatus(NetworkStatus::Online));
+
+        assert_eq!(app.network_status(), NetworkStatus::Online);
+        assert!(outcome.render_requested);
+    }
+
+    #[test]
+    fn repeated_network_status_does_not_request_render() {
+        let mut app = App::new();
+
+        let outcome = app.update(Event::NetworkStatus(NetworkStatus::Offline));
+
+        assert_eq!(app.network_status(), NetworkStatus::Offline);
+        assert!(!outcome.render_requested);
+    }
+
+    #[test]
+    fn render_draws_all_network_statuses() {
+        for status in [
+            NetworkStatus::Offline,
+            NetworkStatus::Connecting,
+            NetworkStatus::Online,
+        ] {
+            let mut app = App::new();
+            app.update(Event::NetworkStatus(status));
+
+            let mut display = MockDisplay::<Rgb565>::new();
+            display.set_allow_overdraw(true);
+            display.set_allow_out_of_bounds_drawing(true);
+
+            app.render(&mut display).unwrap();
+        }
     }
 }

@@ -19,7 +19,7 @@ The simulator no longer uses SDL2. It uses a native macOS AppKit window through 
 - Use the on-screen Start and Stop controls to run or pause the stopwatch.
 - The simulator-only tap highlight stays bright for one second and then fades.
 - Use the Boot and User buttons to mimic hardware button inputs.
-- Use the network buttons to cycle the mocked network status.
+- Use the network dropdown to choose the mocked network status.
 - Time advances automatically; use `Advance +1s` when you want an extra manual tick.
 - Use the debug panel to compare core render requests with simulator redraws.
 - Close the window to exit.

@@ -22,7 +22,7 @@ use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
     NSBackingStoreType, NSButton, NSClickGestureRecognizer, NSImage, NSImageScaling, NSImageView,
-    NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSPopUpButton, NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSData, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
@@ -134,8 +134,11 @@ struct NativeSimulator {
 
 impl NativeSimulator {
     fn new() -> Self {
+        let mut app = App::new();
+        let _ = app.update(Event::NetworkStatus(NetworkStatus::Online));
+
         Self {
-            app: App::new(),
+            app,
             app_framebuffer: Framebuffer::new(DISPLAY_SIZE),
             output_framebuffer: Framebuffer::new(DISPLAY_SIZE),
             app_frame_dirty: true,
@@ -428,30 +431,10 @@ define_class!(
                 self,
                 mtm,
             );
-            add_button(
+            add_network_status_popup(
                 &side_panel,
-                "Network offline",
                 0.0,
                 layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 4.4,
-                sel!(networkOffline:),
-                self,
-                mtm,
-            );
-            add_button(
-                &side_panel,
-                "Network connecting",
-                0.0,
-                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 5.4,
-                sel!(networkConnecting:),
-                self,
-                mtm,
-            );
-            add_button(
-                &side_panel,
-                "Network online",
-                0.0,
-                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 6.4,
-                sel!(networkOnline:),
                 self,
                 mtm,
             );
@@ -575,19 +558,15 @@ define_class!(
             self.refresh_image();
         }
 
-        #[unsafe(method(networkOffline:))]
-        fn network_offline(&self, _sender: &AnyObject) {
-            self.send_event(Event::NetworkStatus(NetworkStatus::Offline));
-        }
-
-        #[unsafe(method(networkConnecting:))]
-        fn network_connecting(&self, _sender: &AnyObject) {
-            self.send_event(Event::NetworkStatus(NetworkStatus::Connecting));
-        }
-
-        #[unsafe(method(networkOnline:))]
-        fn network_online(&self, _sender: &AnyObject) {
-            self.send_event(Event::NetworkStatus(NetworkStatus::Online));
+        #[unsafe(method(networkStatusChanged:))]
+        fn network_status_changed(&self, sender: &NSPopUpButton) {
+            let status = match sender.indexOfSelectedItem() {
+                0 => NetworkStatus::Online,
+                1 => NetworkStatus::Connecting,
+                2 => NetworkStatus::Offline,
+                _ => return,
+            };
+            self.send_event(Event::NetworkStatus(status));
         }
     }
 );
@@ -708,6 +687,31 @@ fn add_button(
     button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
     content_view.addSubview(&button);
     button
+}
+
+fn add_network_status_popup(
+    content_view: &NSView,
+    x: f64,
+    y: f64,
+    target: &Delegate,
+    mtm: MainThreadMarker,
+) -> Retained<NSPopUpButton> {
+    let popup = NSPopUpButton::initWithFrame_pullsDown(
+        NSPopUpButton::alloc(mtm),
+        NSRect::new(NSPoint::new(x, y), NSSize::new(BUTTON_WIDTH, BUTTON_HEIGHT)),
+        false,
+    );
+    popup.addItemWithTitle(&NSString::from_str("Online"));
+    popup.addItemWithTitle(&NSString::from_str("Connecting"));
+    popup.addItemWithTitle(&NSString::from_str("Offline"));
+    popup.selectItemAtIndex(0);
+    unsafe {
+        popup.setTarget(Some(target.as_ref()));
+        popup.setAction(Some(sel!(networkStatusChanged:)));
+    }
+    popup.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
+    content_view.addSubview(&popup);
+    popup
 }
 
 #[derive(Clone, Copy, Debug)]
