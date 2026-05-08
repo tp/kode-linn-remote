@@ -235,20 +235,6 @@ mod tests {
         touch_point(ui::hifi_play_button_center())
     }
 
-    fn stopwatch_state(app: &App) -> &ui::screens::stopwatch::State {
-        match &app.active_screen {
-            ActiveScreen::Stopwatch(state) => state,
-            _ => panic!("expected stopwatch screen"),
-        }
-    }
-
-    fn hifi_state(app: &App) -> &ui::screens::hifi::State {
-        match &app.active_screen {
-            ActiveScreen::HifiControl(state) => state,
-            _ => panic!("expected hifi screen"),
-        }
-    }
-
     #[test]
     fn tick_updates_uptime() {
         let mut app = App::new();
@@ -291,17 +277,16 @@ mod tests {
         let mut app = App::new_on_screen(Screen::Stopwatch);
 
         app.update(Event::TouchDown(start_button_touch()));
-        app.update(Event::Tick { uptime_ms: 1_000 });
-        app.update(Event::Tick { uptime_ms: 2_000 });
-
-        assert!(stopwatch_state(&app).running());
-        assert_eq!(stopwatch_state(&app).seconds(), 2);
+        assert!(
+            app.update(Event::Tick { uptime_ms: 1_000 })
+                .render_requested
+        );
 
         app.update(Event::TouchDown(stop_button_touch()));
-        app.update(Event::Tick { uptime_ms: 5_000 });
-
-        assert!(!stopwatch_state(&app).running());
-        assert_eq!(stopwatch_state(&app).seconds(), 2);
+        assert!(
+            !app.update(Event::Tick { uptime_ms: 5_000 })
+                .render_requested
+        );
     }
 
     #[test]
@@ -311,10 +296,12 @@ mod tests {
         app.update(Event::TouchDown(start_button_touch()));
         app.update(Event::Tick { uptime_ms: 3_000 });
         app.update(Event::TouchDown(stop_button_touch()));
-        app.update(Event::Tick { uptime_ms: 20_000 });
 
+        assert!(
+            !app.update(Event::Tick { uptime_ms: 20_000 })
+                .render_requested
+        );
         assert_eq!(app.uptime_ms(), 20_000);
-        assert_eq!(stopwatch_state(&app).seconds(), 3);
     }
 
     #[test]
@@ -358,15 +345,19 @@ mod tests {
         let mut app = App::new_on_screen(Screen::Stopwatch);
 
         app.update(Event::TouchDown(start_button_touch()));
-        app.update(Event::Tick { uptime_ms: 2_000 });
-        assert_eq!(stopwatch_state(&app).seconds(), 2);
+        assert!(
+            app.update(Event::Tick { uptime_ms: 2_000 })
+                .render_requested
+        );
 
         app.update(Event::ButtonPressed(Button::User));
         app.update(Event::TouchDown(launcher_stopwatch_touch()));
 
         assert_eq!(app.screen(), Screen::Stopwatch);
-        assert!(!stopwatch_state(&app).running());
-        assert_eq!(stopwatch_state(&app).seconds(), 0);
+        assert!(
+            !app.update(Event::Tick { uptime_ms: 3_000 })
+                .render_requested
+        );
     }
 
     #[test]
@@ -377,21 +368,11 @@ mod tests {
             app.update(Event::Tick { uptime_ms: 1_000 })
                 .render_requested
         );
-        assert_eq!(
-            hifi_state(&app).remaining_seconds(),
-            hifi_state(&app).total_seconds() - 1
-        );
-        assert!(hifi_state(&app).playing());
 
         app.update(Event::TouchDown(hifi_play_touch()));
-        assert!(!hifi_state(&app).playing());
         assert!(
             !app.update(Event::Tick { uptime_ms: 5_000 })
                 .render_requested
-        );
-        assert_eq!(
-            hifi_state(&app).remaining_seconds(),
-            hifi_state(&app).total_seconds() - 1
         );
     }
 
@@ -399,14 +380,17 @@ mod tests {
     fn hifi_stops_when_countdown_reaches_zero() {
         let mut app = App::new_on_screen(Screen::HifiControl);
 
-        let total_seconds = hifi_state(&app).total_seconds();
         let outcome = app.update(Event::Tick {
-            uptime_ms: total_seconds * 1000,
+            uptime_ms: 20 * 60 * 1000,
         });
 
         assert!(outcome.render_requested);
-        assert_eq!(hifi_state(&app).remaining_seconds(), 0);
-        assert!(!hifi_state(&app).playing());
+        assert!(
+            !app.update(Event::Tick {
+                uptime_ms: 20 * 60 * 1000 + 1_000
+            })
+            .render_requested
+        );
     }
 
     #[test]

@@ -104,21 +104,6 @@ impl State {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) const fn playing(&self) -> bool {
-        self.playing
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn total_seconds(&self) -> u64 {
-        self.total_seconds
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn remaining_seconds(&self) -> u64 {
-        self.remaining_seconds
-    }
-
     pub(crate) fn on_tick(&mut self, uptime_ms: u64) -> bool {
         if !self.playing || self.remaining_seconds == 0 {
             return false;
@@ -361,6 +346,34 @@ mod tests {
             ui_layout.progress.top_left.x + (ui_layout.progress.size.width / 2) as i32,
             ui_layout.volume.center.x
         );
+    }
+
+    #[test]
+    fn state_counts_down_and_stops_at_zero() {
+        let mut state = State::new(0);
+
+        assert!(state.on_tick(1_000));
+        assert_eq!(state.remaining_seconds, state.total_seconds - 1);
+        assert!(state.playing);
+
+        assert!(state.on_tick(state.total_seconds * 1000));
+        assert_eq!(state.remaining_seconds, 0);
+        assert!(!state.playing);
+        assert!(!state.on_tick(state.total_seconds * 1000 + 1_000));
+    }
+
+    #[test]
+    fn paused_state_does_not_count_down_or_rotate_tracks() {
+        let mut state = State::new(0);
+
+        state.handle(Action::TogglePlayback, 1_000);
+        let remaining = state.remaining_seconds;
+        let track_index = state.track_index();
+
+        assert!(!state.playing);
+        assert!(!state.on_tick(5_000));
+        assert_eq!(state.remaining_seconds, remaining);
+        assert_eq!(state.track_index(), track_index);
     }
 }
 

@@ -97,16 +97,6 @@ impl State {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) const fn running(&self) -> bool {
-        self.running
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn seconds(&self) -> u64 {
-        self.seconds
-    }
-
     pub(crate) fn on_tick(&mut self, uptime_ms: u64) -> bool {
         if !self.running {
             return false;
@@ -454,5 +444,22 @@ mod tests {
             ui_layout.info.network.icon_center - ui_layout.info.network.bounds.top_left,
             NETWORK_ICON_OFFSET
         );
+    }
+
+    #[test]
+    fn state_tracks_elapsed_running_seconds() {
+        let mut state = State::new();
+
+        state.handle(Action::Start, 0);
+        assert!(state.on_tick(1_000));
+        assert!(state.on_tick(3_000));
+        assert_eq!(state.seconds, 3);
+        assert!(state.running);
+
+        state.handle(Action::Stop, 5_000);
+        assert_eq!(state.seconds, 5);
+        assert!(!state.running);
+        assert!(!state.on_tick(20_000));
+        assert_eq!(state.seconds, 5);
     }
 }
