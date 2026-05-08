@@ -71,27 +71,32 @@ impl App {
     }
 
     pub fn update(&mut self, event: Event) -> UpdateOutcome {
-        match event {
+        let render_requested = match event {
             Event::Tick { uptime_ms } => {
                 self.uptime_ms = uptime_ms;
-                self.update_stopwatch();
+                self.update_stopwatch()
             }
             Event::TouchDown(point) => {
                 self.interaction_count = self.interaction_count.saturating_add(1);
                 self.handle_touch(point);
+                true
             }
-            Event::TouchUp => {}
+            Event::TouchUp => false,
             Event::ButtonPressed(_) => {
                 self.interaction_count = self.interaction_count.saturating_add(1);
+                true
             }
             Event::NetworkStatus(status) => {
-                self.network_status = status;
+                if self.network_status == status {
+                    false
+                } else {
+                    self.network_status = status;
+                    true
+                }
             }
-        }
+        };
 
-        UpdateOutcome {
-            render_requested: true,
-        }
+        UpdateOutcome { render_requested }
     }
 
     pub fn render<D>(&self, display: &mut D) -> Result<(), D::Error>
@@ -164,21 +169,25 @@ impl App {
         self.stopwatch_seconds
     }
 
-    fn handle_touch(&mut self, point: TouchPoint) {
+    fn handle_touch(&mut self, point: TouchPoint) -> bool {
         let point = Point::new(point.x, point.y);
 
         if START_BUTTON.contains(point) && !self.stopwatch_running {
             self.stopwatch_running = true;
             self.last_stopwatch_second = self.uptime_ms / 1000;
+            true
         } else if STOP_BUTTON.contains(point) && self.stopwatch_running {
             self.update_stopwatch();
             self.stopwatch_running = false;
+            true
+        } else {
+            false
         }
     }
 
-    fn update_stopwatch(&mut self) {
+    fn update_stopwatch(&mut self) -> bool {
         if !self.stopwatch_running {
-            return;
+            return false;
         }
 
         let current_second = self.uptime_ms / 1000;
@@ -186,6 +195,9 @@ impl App {
         if elapsed > 0 {
             self.stopwatch_seconds = self.stopwatch_seconds.saturating_add(elapsed);
             self.last_stopwatch_second = current_second;
+            true
+        } else {
+            false
         }
     }
 }
@@ -246,7 +258,24 @@ mod tests {
         let outcome = app.update(Event::Tick { uptime_ms: 12_000 });
 
         assert_eq!(app.uptime_ms(), 12_000);
-        assert!(outcome.render_requested);
+        assert!(!outcome.render_requested);
+    }
+
+    #[test]
+    fn running_stopwatch_requests_render_once_per_second() {
+        let mut app = App::new();
+
+        app.update(Event::TouchDown(TouchPoint { x: 80, y: 170 }));
+
+        assert!(!app.update(Event::Tick { uptime_ms: 500 }).render_requested);
+        assert!(
+            app.update(Event::Tick { uptime_ms: 1_000 })
+                .render_requested
+        );
+        assert!(
+            !app.update(Event::Tick { uptime_ms: 1_200 })
+                .render_requested
+        );
     }
 
     #[test]

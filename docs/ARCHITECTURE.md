@@ -17,6 +17,8 @@ The simulator runs a short AppKit timer only as a refresh cadence. Each refresh 
 
 The tap highlight is a simulator-only overlay. The shared app core receives the tap coordinate for control hit-testing, but it does not render pointer feedback.
 
+The Mac simulator shows render debug counters outside the device display. `core requests` count times `app-core` reported that visible app state changed, `core frames` count actual shared-core renders, and `sim redraws` count AppKit refreshes including simulator-only overlays.
+
 ## Hardware Direction
 
 The firmware is set up for the no_std Espressif stack:

@@ -22,7 +22,7 @@ use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
     NSBackingStoreType, NSButton, NSClickGestureRecognizer, NSImage, NSImageScaling, NSImageView,
-    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSData, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
@@ -33,7 +33,7 @@ const REFRESH_INTERVAL_SECONDS: f64 = 0.1;
 const TAP_FULL_MS: u64 = 1_000;
 const TAP_FADE_MS: u64 = 700;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Framebuffer {
     size: Size,
     pixels: Vec<Rgb565>,
@@ -67,6 +67,11 @@ impl Framebuffer {
             )
             .expect("framebuffer PNG encoding should succeed");
         png
+    }
+
+    fn copy_from(&mut self, other: &Self) {
+        assert_eq!(self.size, other.size);
+        self.pixels.copy_from_slice(&other.pixels);
     }
 }
 
@@ -112,25 +117,35 @@ impl OriginDimensions for Framebuffer {
 #[derive(Debug)]
 struct NativeSimulator {
     app: App,
-    framebuffer: Framebuffer,
+    app_framebuffer: Framebuffer,
+    output_framebuffer: Framebuffer,
+    app_frame_dirty: bool,
     started_at: Instant,
     manual_time_offset_ms: u64,
     tap_highlight: Option<TapHighlight>,
+    render_stats: RenderStats,
 }
 
 impl NativeSimulator {
     fn new() -> Self {
         Self {
             app: App::new(),
-            framebuffer: Framebuffer::new(DISPLAY_SIZE),
+            app_framebuffer: Framebuffer::new(DISPLAY_SIZE),
+            output_framebuffer: Framebuffer::new(DISPLAY_SIZE),
+            app_frame_dirty: true,
             started_at: Instant::now(),
             manual_time_offset_ms: 0,
             tap_highlight: None,
+            render_stats: RenderStats::new(),
         }
     }
 
     fn update(&mut self, event: Event) {
-        self.app.update(event);
+        let outcome = self.app.update(event);
+        if outcome.render_requested {
+            self.app_frame_dirty = true;
+            self.render_stats.record_core_request();
+        }
     }
 
     fn tick(&mut self) {
@@ -160,11 +175,19 @@ impl NativeSimulator {
     }
 
     fn redraw_png(&mut self) -> Vec<u8> {
-        self.app
-            .render(&mut self.framebuffer)
-            .expect("app rendering should succeed");
+        if self.app_frame_dirty {
+            self.app
+                .render(&mut self.app_framebuffer)
+                .expect("app rendering should succeed");
+            self.app_frame_dirty = false;
+            self.render_stats.record_core_frame_rendered();
+        }
+
+        self.output_framebuffer.copy_from(&self.app_framebuffer);
         self.render_tap_highlight();
-        self.framebuffer.to_png()
+        self.render_stats.record_simulator_redraw();
+        self.render_stats.update_sample();
+        self.output_framebuffer.to_png()
     }
 
     fn render_tap_highlight(&mut self) {
@@ -182,8 +205,12 @@ impl NativeSimulator {
         let b = 4 + ((10_u16 * alpha as u16) / 255) as u8;
         Circle::with_center(Point::new(tap.point.x, tap.point.y), 18)
             .into_styled(PrimitiveStyle::with_fill(Rgb565::new(r, g, b)))
-            .draw(&mut self.framebuffer)
+            .draw(&mut self.output_framebuffer)
             .expect("simulator overlay rendering should succeed");
+    }
+
+    fn debug_text(&self) -> String {
+        self.render_stats.debug_text()
     }
 }
 
@@ -194,9 +221,85 @@ struct TapHighlight {
 }
 
 #[derive(Debug)]
+struct RenderStats {
+    core_requests_total: u64,
+    core_frames_total: u64,
+    simulator_redraws_total: u64,
+    sample_started_at: Instant,
+    sample_core_requests: u64,
+    sample_core_frames: u64,
+    sample_simulator_redraws: u64,
+    core_request_hz: f64,
+    core_frame_hz: f64,
+    simulator_redraw_hz: f64,
+}
+
+impl RenderStats {
+    fn new() -> Self {
+        Self {
+            core_requests_total: 0,
+            core_frames_total: 0,
+            simulator_redraws_total: 0,
+            sample_started_at: Instant::now(),
+            sample_core_requests: 0,
+            sample_core_frames: 0,
+            sample_simulator_redraws: 0,
+            core_request_hz: 0.0,
+            core_frame_hz: 0.0,
+            simulator_redraw_hz: 0.0,
+        }
+    }
+
+    fn record_core_request(&mut self) {
+        self.core_requests_total = self.core_requests_total.saturating_add(1);
+        self.sample_core_requests = self.sample_core_requests.saturating_add(1);
+    }
+
+    fn record_core_frame_rendered(&mut self) {
+        self.core_frames_total = self.core_frames_total.saturating_add(1);
+        self.sample_core_frames = self.sample_core_frames.saturating_add(1);
+    }
+
+    fn record_simulator_redraw(&mut self) {
+        self.simulator_redraws_total = self.simulator_redraws_total.saturating_add(1);
+        self.sample_simulator_redraws = self.sample_simulator_redraws.saturating_add(1);
+    }
+
+    fn update_sample(&mut self) {
+        let elapsed = self.sample_started_at.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+
+        if elapsed_secs < 1.0 {
+            return;
+        }
+
+        self.core_request_hz = self.sample_core_requests as f64 / elapsed_secs;
+        self.core_frame_hz = self.sample_core_frames as f64 / elapsed_secs;
+        self.simulator_redraw_hz = self.sample_simulator_redraws as f64 / elapsed_secs;
+        self.sample_started_at = Instant::now();
+        self.sample_core_requests = 0;
+        self.sample_core_frames = 0;
+        self.sample_simulator_redraws = 0;
+    }
+
+    fn debug_text(&self) -> String {
+        format!(
+            "Debug\ncore requests: {}\ncore req/s: {:.1}\ncore frames: {}\ncore fps: {:.1}\nsim redraws: {}\nsim fps: {:.1}",
+            self.core_requests_total,
+            self.core_request_hz,
+            self.core_frames_total,
+            self.core_frame_hz,
+            self.simulator_redraws_total,
+            self.simulator_redraw_hz
+        )
+    }
+}
+
+#[derive(Debug)]
 struct AppDelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
     image_view: OnceCell<Retained<NSImageView>>,
+    debug_label: OnceCell<Retained<NSTextField>>,
     tap_recognizer: OnceCell<Retained<NSClickGestureRecognizer>>,
     timer: OnceCell<Retained<NSTimer>>,
     simulator: RefCell<NativeSimulator>,
@@ -207,6 +310,7 @@ impl Default for AppDelegateIvars {
         Self {
             window: OnceCell::new(),
             image_view: OnceCell::new(),
+            debug_label: OnceCell::new(),
             tap_recognizer: OnceCell::new(),
             timer: OnceCell::new(),
             simulator: RefCell::new(NativeSimulator::new()),
@@ -324,6 +428,17 @@ define_class!(
                 mtm,
             );
 
+            let debug_label = NSTextField::wrappingLabelWithString(
+                &NSString::from_str(&self.debug_text()),
+                mtm,
+            );
+            debug_label.setFrame(NSRect::new(
+                NSPoint::new(524.0, 64.0),
+                NSSize::new(210.0, 148.0),
+            ));
+            debug_label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+            content_view.addSubview(&debug_label);
+
             let timer = unsafe {
                 NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                     REFRESH_INTERVAL_SECONDS,
@@ -340,6 +455,10 @@ define_class!(
                 .image_view
                 .set(image_view)
                 .expect("image view should be stored once");
+            self.ivars()
+                .debug_label
+                .set(debug_label)
+                .expect("debug label should be stored once");
             self.ivars()
                 .tap_recognizer
                 .set(tap_recognizer)
@@ -449,12 +568,25 @@ impl Delegate {
             .get()
             .expect("image view should exist after launch");
         image_view.setImage(Some(&image));
+        self.refresh_debug_label();
     }
 
     fn render_image(&self) -> Retained<NSImage> {
         let png = self.ivars().simulator.borrow_mut().redraw_png();
         let data = NSData::with_bytes(&png);
         NSImage::initWithData(NSImage::alloc(), &data).expect("AppKit should decode simulator PNG")
+    }
+
+    fn refresh_debug_label(&self) {
+        let Some(debug_label) = self.ivars().debug_label.get() else {
+            return;
+        };
+
+        debug_label.setStringValue(&NSString::from_str(&self.debug_text()));
+    }
+
+    fn debug_text(&self) -> String {
+        self.ivars().simulator.borrow().debug_text()
     }
 }
 

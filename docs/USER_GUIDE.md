@@ -19,6 +19,7 @@ The simulator no longer uses SDL2. It uses a native macOS AppKit window through 
 - Use the Boot and User buttons to mimic hardware button inputs.
 - Use the network buttons to cycle the mocked network status.
 - Time advances automatically; use `Advance +1s` when you want an extra manual tick.
+- Use the debug panel to compare core render requests with simulator redraws.
 - Close the window to exit.
 
 ## What The Demo Shows
