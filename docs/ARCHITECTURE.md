@@ -19,7 +19,11 @@ The tap highlight is a simulator-only overlay. The shared app core receives the 
 
 The Mac simulator shows render debug counters outside the device display. `core requests` count times `app-core` reported that visible app state changed, `core frames` count actual shared-core renders, and `sim redraws` count AppKit refreshes including simulator-only overlays.
 
-Text rendering is part of `app-core::App::render`, using `u8g2-fonts` Helvetica variants. Font sizes are chosen in physical display pixels; because the target AMOLED is high density, the UI uses larger 24px Helvetica variants rather than desktop-style point sizes.
+Text rendering is part of `app-core::App::render`, using generated `mplusfonts` bitmap fonts. The generated font data is subset to printable ASCII for now and uses compile-time rasterization, antialiasing, and kerning while keeping firmware rendering deterministic.
+
+The UI is OLED-first: the screen background is true black, with small near-black surfaces and restrained action colors to keep power use low while preserving contrast. App colors live as named constants in `app-core`; the current palette uses muted green for Start, red for Stop, soft off-white secondary text, and subdued inactive controls. Buttons and panels render as rounded rectangles with subtle 1px borders.
+
+Touch hit-testing intentionally uses each control's rectangular bounds, even when the visual shape is rounded. This keeps touch handling simple, forgiving, and consistent between simulator and firmware; taps in the small rounded-off corner areas still activate the control. Only switch to shape-accurate hit-testing if a future layout has overlapping controls or visible affordances that make rectangular targets misleading.
 
 Simulator zoom changes the AppKit image view size only. The embedded framebuffer remains 466 x 466 pixels at both native scale and 2x zoom. The window layout always reserves the 2x display area so controls and window size stay stable.
 

@@ -8,4 +8,4 @@ rust-version.workspace = true
 [dependencies]
 embedded-graphics.workspace = true
 heapless.workspace = true
-u8g2-fonts.workspace = true
+mplusfonts.workspace = true

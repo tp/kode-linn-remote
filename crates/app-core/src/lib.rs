@@ -1,18 +1,34 @@
 #![no_std]
 
+use core::fmt::Write as _;
+
 use embedded_graphics::{
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
+    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
+    text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
-use u8g2_fonts::{
-    FontRenderer, fonts,
-    types::{FontColor, HorizontalAlignment, VerticalPosition},
-};
+use mplusfonts::{mplus, style::BitmapFontStyleBuilder};
 
 pub const DISPLAY_SIZE: Size = Size::new(466, 466);
 const START_BUTTON: Rectangle = Rectangle::new(Point::new(44, 140), Size::new(170, 72));
 const STOP_BUTTON: Rectangle = Rectangle::new(Point::new(252, 140), Size::new(170, 72));
+const HEADER_PANEL: Rectangle = Rectangle::new(Point::new(24, 24), Size::new(418, 92));
+const CARD_RADIUS: u32 = 18;
+const BUTTON_RADIUS: u32 = 18;
+
+const OLED_BLACK: Rgb565 = Rgb565::BLACK;
+const SURFACE: Rgb565 = Rgb565::new(1, 2, 3);
+const SURFACE_BORDER: Rgb565 = Rgb565::new(5, 9, 11);
+const TEXT_PRIMARY: Rgb565 = Rgb565::WHITE;
+const TEXT_SECONDARY: Rgb565 = TEXT_PRIMARY;
+const TEXT_DISABLED: Rgb565 = Rgb565::new(10, 18, 20);
+const ACTION_START: Rgb565 = Rgb565::new(1, 30, 13);
+const ACTION_START_BORDER: Rgb565 = Rgb565::new(7, 42, 20);
+const ACTION_STOP: Rgb565 = Rgb565::new(24, 4, 6);
+const ACTION_STOP_BORDER: Rgb565 = Rgb565::new(31, 13, 14);
+const ACTION_INACTIVE: Rgb565 = Rgb565::new(3, 4, 6);
+const ACTION_INACTIVE_BORDER: Rgb565 = Rgb565::new(7, 10, 13);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -50,7 +66,7 @@ pub struct UpdateOutcome {
 #[derive(Debug)]
 pub enum RenderError<E> {
     Draw(E),
-    Font(u8g2_fonts::Error<E>),
+    TextFormat,
 }
 
 #[derive(Debug)]
@@ -110,63 +126,105 @@ impl App {
     {
         display.clear(Rgb565::BLACK).map_err(RenderError::Draw)?;
 
+        let title_font = mplus!(
+            2,
+            BOLD,
+            line_height(40),
+            true,
+            4,
+            4,
+            kern(' '..='~', ["ff", "ffi", "ffl"])
+        );
+        let body_font = mplus!(
+            2,
+            500,
+            line_height(40),
+            true,
+            4,
+            4,
+            kern(' '..='~', ["ff", "ffi", "ffl"])
+        );
+        let top_text_style = TextStyleBuilder::new().baseline(Baseline::Top).build();
+
         Rectangle::new(Point::zero(), DISPLAY_SIZE)
-            .into_styled(PrimitiveStyle::with_fill(Rgb565::new(2, 5, 8)))
+            .into_styled(PrimitiveStyle::with_fill(OLED_BLACK))
             .draw(display)
             .map_err(RenderError::Draw)?;
 
-        Rectangle::new(Point::new(24, 24), Size::new(418, 92))
-            .into_styled(PrimitiveStyle::with_fill(Rgb565::new(6, 18, 14)))
-            .draw(display)
-            .map_err(RenderError::Draw)?;
+        draw_panel(display, HEADER_PANEL, CARD_RADIUS, SURFACE, SURFACE_BORDER)?;
 
-        title_font()
-            .render(
-                "ESP32-C6 Home Tools",
-                Point::new(44, 48),
-                VerticalPosition::Top,
-                FontColor::Transparent(Rgb565::WHITE),
-                display,
-            )
-            .map_err(RenderError::Font)?;
+        let title_style = BitmapFontStyleBuilder::new()
+            .text_color(TEXT_PRIMARY)
+            .background_color(SURFACE)
+            .font(&title_font)
+            .build();
+        Text::with_text_style(
+            "ESP32-C6 Home Tools",
+            Point::new(44, 48),
+            title_style,
+            top_text_style,
+        )
+        .draw(display)
+        .map_err(RenderError::Draw)?;
 
-        draw_button(display, START_BUTTON, "START", !self.stopwatch_running)?;
-        draw_button(display, STOP_BUTTON, "STOP", self.stopwatch_running)?;
+        draw_button(
+            display,
+            START_BUTTON,
+            "START",
+            !self.stopwatch_running,
+            ButtonTone::Start,
+        )?;
+        draw_button(
+            display,
+            STOP_BUTTON,
+            "STOP",
+            self.stopwatch_running,
+            ButtonTone::Stop,
+        )?;
 
-        body_font()
-            .render(
-                format_args!("stopwatch: {}s", self.stopwatch_seconds),
-                Point::new(44, 244),
-                VerticalPosition::Top,
-                FontColor::Transparent(Rgb565::new(23, 55, 47)),
-                display,
-            )
-            .map_err(RenderError::Font)?;
+        let body_style = BitmapFontStyleBuilder::new()
+            .text_color(TEXT_SECONDARY)
+            .background_color(OLED_BLACK)
+            .font(&body_font)
+            .build();
+
+        let mut stopwatch = heapless::String::<32>::new();
+        write!(stopwatch, "stopwatch: {}s", self.stopwatch_seconds)
+            .map_err(|_| RenderError::TextFormat)?;
+        Text::with_text_style(
+            &stopwatch,
+            Point::new(44, 244),
+            body_style.clone(),
+            top_text_style,
+        )
+        .draw(display)
+        .map_err(RenderError::Draw)?;
 
         let network = match self.network_status {
             NetworkStatus::Offline => "network: offline",
             NetworkStatus::Connecting => "network: connecting",
             NetworkStatus::Online => "network: online",
         };
-        body_font()
-            .render(
-                network,
-                Point::new(44, 312),
-                VerticalPosition::Top,
-                FontColor::Transparent(Rgb565::new(23, 55, 47)),
-                display,
-            )
-            .map_err(RenderError::Font)?;
+        Text::with_text_style(
+            network,
+            Point::new(44, 312),
+            body_style.clone(),
+            top_text_style,
+        )
+        .draw(display)
+        .map_err(RenderError::Draw)?;
 
-        body_font()
-            .render(
-                format_args!("interactions: {}", self.interaction_count),
-                Point::new(44, 352),
-                VerticalPosition::Top,
-                FontColor::Transparent(Rgb565::new(23, 55, 47)),
-                display,
-            )
-            .map_err(RenderError::Font)?;
+        let mut interactions = heapless::String::<32>::new();
+        write!(interactions, "interactions: {}", self.interaction_count)
+            .map_err(|_| RenderError::TextFormat)?;
+        Text::with_text_style(
+            &interactions,
+            Point::new(44, 352),
+            body_style,
+            top_text_style,
+        )
+        .draw(display)
+        .map_err(RenderError::Draw)?;
 
         Ok(())
     }
@@ -226,54 +284,82 @@ impl Default for App {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ButtonTone {
+    Start,
+    Stop,
+}
+
 fn draw_button<D>(
     display: &mut D,
     rect: Rectangle,
     label: &str,
     active: bool,
+    tone: ButtonTone,
 ) -> Result<(), RenderError<D::Error>>
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    let fill = if active {
-        Rgb565::new(4, 28, 16)
-    } else {
-        Rgb565::new(3, 8, 10)
+    let (fill, border) = match (active, tone) {
+        (true, ButtonTone::Start) => (ACTION_START, ACTION_START_BORDER),
+        (true, ButtonTone::Stop) => (ACTION_STOP, ACTION_STOP_BORDER),
+        (false, _) => (ACTION_INACTIVE, ACTION_INACTIVE_BORDER),
     };
-    let text = if active {
-        Rgb565::WHITE
-    } else {
-        Rgb565::new(12, 24, 22)
-    };
+    let text = if active { TEXT_PRIMARY } else { TEXT_DISABLED };
 
-    rect.into_styled(PrimitiveStyle::with_fill(fill))
-        .draw(display)
-        .map_err(RenderError::Draw)?;
+    draw_panel(display, rect, BUTTON_RADIUS, fill, border)?;
 
-    button_font()
-        .render_aligned(
-            label,
-            rect.center() + Point::new(0, 1),
-            VerticalPosition::Center,
-            HorizontalAlignment::Center,
-            FontColor::Transparent(text),
-            display,
-        )
-        .map_err(RenderError::Font)?;
+    let button_font = mplus!(
+        2,
+        BOLD,
+        line_height(40),
+        true,
+        4,
+        4,
+        kern(' '..='~', ["ff", "ffi", "ffl"])
+    );
+    let character_style = BitmapFontStyleBuilder::new()
+        .text_color(text)
+        .background_color(fill)
+        .font(&button_font)
+        .build();
+    let text_style = TextStyleBuilder::new()
+        .alignment(Alignment::Center)
+        .baseline(Baseline::Middle)
+        .build();
+
+    Text::with_text_style(
+        label,
+        rect.center() + Point::new(0, 1),
+        character_style,
+        text_style,
+    )
+    .draw(display)
+    .map_err(RenderError::Draw)?;
 
     Ok(())
 }
 
-const fn body_font() -> FontRenderer {
-    FontRenderer::new::<fonts::u8g2_font_helvR24_tr>()
-}
-
-const fn title_font() -> FontRenderer {
-    FontRenderer::new::<fonts::u8g2_font_helvB24_tr>()
-}
-
-const fn button_font() -> FontRenderer {
-    FontRenderer::new::<fonts::u8g2_font_helvB24_tr>()
+fn draw_panel<D>(
+    display: &mut D,
+    rect: Rectangle,
+    radius: u32,
+    fill: Rgb565,
+    stroke: Rgb565,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    RoundedRectangle::with_equal_corners(rect, Size::new(radius, radius))
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .fill_color(fill)
+                .stroke_color(stroke)
+                .stroke_width(1)
+                .build(),
+        )
+        .draw(display)
+        .map_err(RenderError::Draw)
 }
 
 #[cfg(test)]
