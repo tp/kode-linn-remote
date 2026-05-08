@@ -1,4 +1,5 @@
 use core::fmt::Write as _;
+use core::time::Duration;
 
 use embedded_graphics::{
     pixelcolor::Rgb565,
@@ -20,10 +21,19 @@ const CARD_RADIUS: u32 = 18;
 const BUTTON_RADIUS: u32 = 18;
 
 const TITLE_ORIGIN: Point = Point::new(44, 48);
-const STOPWATCH_TEXT_ORIGIN: Point = Point::new(44, 244);
-const NETWORK_TEXT_ORIGIN: Point = Point::new(44, 312);
-const INTERACTIONS_TEXT_ORIGIN: Point = Point::new(44, 352);
+const LOWER_ROW_Y: i32 = 244;
+const LOWER_ROW_SPACING: i32 = 44;
+const IDEAL_TIME_DEMO_ORIGIN: Point = Point::new(44, LOWER_ROW_Y);
+const IDEAL_TIME_VALUE_ORIGIN: Point = Point::new(140, LOWER_ROW_Y);
+const STOPWATCH_TEXT_ORIGIN: Point = Point::new(44, LOWER_ROW_Y + LOWER_ROW_SPACING);
+const NETWORK_TEXT_ORIGIN: Point = Point::new(44, LOWER_ROW_Y + 2 * LOWER_ROW_SPACING);
+const INTERACTIONS_TEXT_ORIGIN: Point = Point::new(44, LOWER_ROW_Y + 3 * LOWER_ROW_SPACING);
 const BUTTON_LABEL_OFFSET: Point = Point::new(0, 1);
+const TIME_DIGIT_CELL_WIDTH: i32 = 18;
+const TIME_COLON_GAP: i32 = 4;
+const TIME_COLON_DOT_SIZE: u32 = 3;
+const TIME_COLON_TOP_OFFSET: i32 = 15;
+const TIME_COLON_BOTTOM_OFFSET: i32 = 27;
 
 const OLED_BLACK: Rgb565 = Rgb565::BLACK;
 const SURFACE: Rgb565 = Rgb565::new(1, 2, 3);
@@ -103,6 +113,21 @@ impl App {
             .font(&body_font)
             .build();
 
+        Text::with_text_style(
+            "ideal",
+            IDEAL_TIME_DEMO_ORIGIN,
+            body_style.clone(),
+            top_text_style,
+        )
+        .draw(display)
+        .map_err(RenderError::Draw)?;
+        draw_ideal_duration(
+            display,
+            IDEAL_TIME_VALUE_ORIGIN,
+            Duration::from_secs(self.stopwatch_seconds),
+            body_style.clone(),
+        )?;
+
         let mut stopwatch = heapless::String::<32>::new();
         write!(stopwatch, "stopwatch: {}s", self.stopwatch_seconds)
             .map_err(|_| RenderError::TextFormat)?;
@@ -138,6 +163,125 @@ impl App {
 
         Ok(())
     }
+}
+
+fn draw_ideal_duration<D>(
+    display: &mut D,
+    origin: Point,
+    duration: Duration,
+    character_style: impl embedded_graphics::text::renderer::TextRenderer<Color = Rgb565> + Clone,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let (hours, minutes, seconds) = duration_parts(duration);
+    let separator_width = 2 * TIME_COLON_GAP + TIME_COLON_DOT_SIZE as i32;
+    let group_width = 2 * TIME_DIGIT_CELL_WIDTH;
+
+    draw_two_digit_group(display, origin, hours, character_style.clone())?;
+
+    let first_colon_x = origin.x + group_width + TIME_COLON_GAP;
+    draw_time_colon(display, Point::new(first_colon_x, origin.y), TEXT_SECONDARY)?;
+
+    let minutes_x = origin.x + group_width + separator_width;
+    draw_two_digit_group(
+        display,
+        Point::new(minutes_x, origin.y),
+        minutes,
+        character_style.clone(),
+    )?;
+
+    let second_colon_x = minutes_x + group_width + TIME_COLON_GAP;
+    draw_time_colon(
+        display,
+        Point::new(second_colon_x, origin.y),
+        TEXT_SECONDARY,
+    )?;
+
+    let seconds_x = minutes_x + group_width + separator_width;
+    draw_two_digit_group(
+        display,
+        Point::new(seconds_x, origin.y),
+        seconds,
+        character_style,
+    )
+}
+
+fn duration_parts(duration: Duration) -> (u8, u8, u8) {
+    let total_seconds = duration.as_secs();
+    let seconds = (total_seconds % 60) as u8;
+    let total_minutes = total_seconds / 60;
+    let minutes = (total_minutes % 60) as u8;
+    let hours = ((total_minutes / 60) % 100) as u8;
+
+    (hours, minutes, seconds)
+}
+
+fn draw_two_digit_group<D>(
+    display: &mut D,
+    origin: Point,
+    value: u8,
+    character_style: impl embedded_graphics::text::renderer::TextRenderer<Color = Rgb565> + Clone,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let top_text_style = TextStyleBuilder::new().baseline(Baseline::Top).build();
+    let tens = digit_text(value / 10);
+    let ones = digit_text(value % 10);
+
+    for (digit, x_offset) in [(tens, 0), (ones, TIME_DIGIT_CELL_WIDTH)] {
+        Text::with_text_style(
+            digit,
+            origin + Point::new(x_offset, 0),
+            character_style.clone(),
+            top_text_style,
+        )
+        .draw(display)
+        .map_err(RenderError::Draw)?;
+    }
+
+    Ok(())
+}
+
+fn digit_text(digit: u8) -> &'static str {
+    match digit {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        _ => "9",
+    }
+}
+
+fn draw_time_colon<D>(
+    display: &mut D,
+    origin: Point,
+    color: Rgb565,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let style = PrimitiveStyle::with_fill(color);
+    for y_offset in [TIME_COLON_TOP_OFFSET, TIME_COLON_BOTTOM_OFFSET] {
+        RoundedRectangle::with_equal_corners(
+            Rectangle::new(
+                origin + Point::new(0, y_offset),
+                Size::new(TIME_COLON_DOT_SIZE, TIME_COLON_DOT_SIZE),
+            ),
+            Size::new(2, 2),
+        )
+        .into_styled(style)
+        .draw(display)
+        .map_err(RenderError::Draw)?;
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
