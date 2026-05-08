@@ -17,6 +17,8 @@ The simulator runs a short AppKit timer only as a refresh cadence. Each refresh 
 
 The tap highlight is a simulator-only overlay. The shared app core receives the tap coordinate for control hit-testing, but it does not render pointer feedback.
 
+The simulator can mask the rectangular framebuffer to the board's round visible display area. Circle mode is the default, and simulator taps outside the visible circle are ignored so desktop interaction matches the hardware shape.
+
 The Mac simulator shows render debug counters outside the device display. `core requests` count times `app-core` reported that visible app state changed, `core frames` count actual shared-core renders, and `sim redraws` count AppKit refreshes including simulator-only overlays.
 
 Text rendering uses generated `mplusfonts` bitmap fonts. The generated font data is subset to printable ASCII for now and uses compile-time rasterization, antialiasing, and kerning while keeping firmware rendering deterministic.

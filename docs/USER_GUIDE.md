@@ -20,6 +20,7 @@ The simulator no longer uses SDL2. It uses a native macOS AppKit window through 
 - The simulator-only tap highlight stays bright for one second and then fades.
 - Use the Boot and User buttons to mimic hardware button inputs.
 - Use the network dropdown to choose the mocked network status.
+- Use the display shape dropdown to switch between the round hardware mask and the full rectangular framebuffer.
 - Time advances automatically; use `Advance +1s` when you want an extra manual tick.
 - Use the debug panel to compare core render requests with simulator redraws.
 - Close the window to exit.

@@ -39,6 +39,55 @@ const BUTTON_WIDTH: f64 = 178.0;
 const BUTTON_HEIGHT: f64 = 32.0;
 const BUTTON_SPACING: f64 = 44.0;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DisplayShape {
+    Circle,
+    Rectangle,
+}
+
+impl DisplayShape {
+    fn contains(self, point: TouchPoint, size: Size) -> bool {
+        if point.x < 0
+            || point.y < 0
+            || point.x >= size.width as i32
+            || point.y >= size.height as i32
+        {
+            return false;
+        }
+
+        match self {
+            Self::Circle => {
+                let radius = size.width.min(size.height) as i64 / 2;
+                let center_x = size.width as i64 / 2;
+                let center_y = size.height as i64 / 2;
+                let dx = point.x as i64 - center_x;
+                let dy = point.y as i64 - center_y;
+                dx * dx + dy * dy <= radius * radius
+            }
+            Self::Rectangle => true,
+        }
+    }
+
+    fn alpha_at(self, x: u32, y: u32, size: Size) -> u8 {
+        match self {
+            Self::Circle => {
+                let radius = size.width.min(size.height) as i64 / 2;
+                let center_x = size.width as i64 / 2;
+                let center_y = size.height as i64 / 2;
+                let dx = x as i64 - center_x;
+                let dy = y as i64 - center_y;
+
+                if dx * dx + dy * dy <= radius * radius {
+                    255
+                } else {
+                    0
+                }
+            }
+            Self::Rectangle => 255,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Framebuffer {
     size: Size,
@@ -53,14 +102,16 @@ impl Framebuffer {
         }
     }
 
-    fn to_png(&self) -> Vec<u8> {
+    fn to_png(&self, display_shape: DisplayShape) -> Vec<u8> {
         let mut rgba = Vec::with_capacity(self.pixels.len() * 4);
 
-        for color in &self.pixels {
+        for (index, color) in self.pixels.iter().enumerate() {
+            let x = index as u32 % self.size.width;
+            let y = index as u32 / self.size.width;
             rgba.push(scale_channel(color.r(), Rgb565::MAX_R));
             rgba.push(scale_channel(color.g(), Rgb565::MAX_G));
             rgba.push(scale_channel(color.b(), Rgb565::MAX_B));
-            rgba.push(255);
+            rgba.push(display_shape.alpha_at(x, y, self.size));
         }
 
         let mut png = Vec::new();
@@ -126,6 +177,8 @@ struct NativeSimulator {
     app_framebuffer: Framebuffer,
     output_framebuffer: Framebuffer,
     app_frame_dirty: bool,
+    output_frame_dirty: bool,
+    display_shape: DisplayShape,
     started_at: Instant,
     manual_time_offset_ms: u64,
     tap_highlight: Option<TapHighlight>,
@@ -142,6 +195,8 @@ impl NativeSimulator {
             app_framebuffer: Framebuffer::new(DISPLAY_SIZE),
             output_framebuffer: Framebuffer::new(DISPLAY_SIZE),
             app_frame_dirty: true,
+            output_frame_dirty: true,
+            display_shape: DisplayShape::Circle,
             started_at: Instant::now(),
             manual_time_offset_ms: 0,
             tap_highlight: None,
@@ -153,6 +208,7 @@ impl NativeSimulator {
         let outcome = self.app.update(event);
         if outcome.render_requested {
             self.app_frame_dirty = true;
+            self.output_frame_dirty = true;
             self.render_stats.record_core_request();
         }
     }
@@ -175,8 +231,20 @@ impl NativeSimulator {
             point,
             started_at_ms: uptime_ms,
         });
+        self.output_frame_dirty = true;
         self.update(Event::Tick { uptime_ms });
         self.update(Event::TouchDown(point));
+    }
+
+    fn set_display_shape(&mut self, display_shape: DisplayShape) {
+        if self.display_shape != display_shape {
+            self.display_shape = display_shape;
+            self.output_frame_dirty = true;
+        }
+    }
+
+    fn contains_visible_point(&self, point: TouchPoint) -> bool {
+        self.display_shape.contains(point, DISPLAY_SIZE)
     }
 
     fn uptime_ms(&self) -> u64 {
@@ -185,7 +253,7 @@ impl NativeSimulator {
     }
 
     fn redraw_png_if_needed(&mut self) -> Option<Vec<u8>> {
-        if !self.app_frame_dirty && self.tap_highlight.is_none() {
+        if !self.app_frame_dirty && !self.output_frame_dirty && self.tap_highlight.is_none() {
             return None;
         }
 
@@ -199,9 +267,10 @@ impl NativeSimulator {
 
         self.output_framebuffer.copy_from(&self.app_framebuffer);
         self.render_tap_highlight();
+        self.output_frame_dirty = false;
         self.render_stats.record_simulator_redraw();
         self.render_stats.update_sample();
-        Some(self.output_framebuffer.to_png())
+        Some(self.output_framebuffer.to_png(self.display_shape))
     }
 
     fn render_tap_highlight(&mut self) {
@@ -211,6 +280,7 @@ impl NativeSimulator {
 
         let Some(alpha) = tap_alpha(self.uptime_ms().saturating_sub(tap.started_at_ms)) else {
             self.tap_highlight = None;
+            self.output_frame_dirty = true;
             return;
         };
 
@@ -438,6 +508,13 @@ define_class!(
                 self,
                 mtm,
             );
+            add_display_shape_popup(
+                &side_panel,
+                0.0,
+                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 5.4,
+                self,
+                mtm,
+            );
 
             let debug_label = NSTextField::wrappingLabelWithString(
                 &NSString::from_str(&self.debug_text()),
@@ -551,6 +628,15 @@ define_class!(
                 return;
             }
 
+            if !self
+                .ivars()
+                .simulator
+                .borrow()
+                .contains_visible_point(TouchPoint { x, y })
+            {
+                return;
+            }
+
             self.ivars()
                 .simulator
                 .borrow_mut()
@@ -567,6 +653,11 @@ define_class!(
                 _ => return,
             };
             self.send_event(Event::NetworkStatus(status));
+        }
+
+        #[unsafe(method(displayShapeChanged:))]
+        fn display_shape_changed(&self, sender: &NSPopUpButton) {
+            self.set_display_shape_from_index(sender.indexOfSelectedItem());
         }
     }
 );
@@ -619,6 +710,19 @@ impl Delegate {
 
     fn debug_text(&self) -> String {
         self.ivars().simulator.borrow().debug_text()
+    }
+
+    fn set_display_shape_from_index(&self, index: isize) {
+        let display_shape = match index {
+            0 => DisplayShape::Circle,
+            1 => DisplayShape::Rectangle,
+            _ => return,
+        };
+        self.ivars()
+            .simulator
+            .borrow_mut()
+            .set_display_shape(display_shape);
+        self.refresh_image();
     }
 
     fn apply_zoom_layout(&self) {
@@ -708,6 +812,30 @@ fn add_network_status_popup(
     unsafe {
         popup.setTarget(Some(target.as_ref()));
         popup.setAction(Some(sel!(networkStatusChanged:)));
+    }
+    popup.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
+    content_view.addSubview(&popup);
+    popup
+}
+
+fn add_display_shape_popup(
+    content_view: &NSView,
+    x: f64,
+    y: f64,
+    target: &Delegate,
+    mtm: MainThreadMarker,
+) -> Retained<NSPopUpButton> {
+    let popup = NSPopUpButton::initWithFrame_pullsDown(
+        NSPopUpButton::alloc(mtm),
+        NSRect::new(NSPoint::new(x, y), NSSize::new(BUTTON_WIDTH, BUTTON_HEIGHT)),
+        false,
+    );
+    popup.addItemWithTitle(&NSString::from_str("Circle"));
+    popup.addItemWithTitle(&NSString::from_str("Rectangle"));
+    popup.selectItemAtIndex(0);
+    unsafe {
+        popup.setTarget(Some(target.as_ref()));
+        popup.setAction(Some(sel!(displayShapeChanged:)));
     }
     popup.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
     content_view.addSubview(&popup);
