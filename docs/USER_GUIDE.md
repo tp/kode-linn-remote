@@ -37,10 +37,22 @@ The simulator and firmware use the same `app-core` crate, so application behavio
 
 ## Flashing The Device
 
-Once the board arrives, connect it over USB and run:
+Connect the board over USB and run:
 
 ```sh
 cargo run -p firmware --target riscv32imac-unknown-none-elf --release
 ```
 
-The first firmware milestone only proves that the Rust firmware starts and can run the shared app core. Display and touch output will be added after validating the board wiring.
+The first firmware milestone proves that the ESP-IDF bootloader accepts the Rust
+image, the firmware starts, and the shared app core can receive ticks. A
+successful boot prints a serial banner followed by one-second heartbeat lines:
+
+```text
+boot: Waveshare ESP32-C6 Touch AMOLED 1.43
+display: CO5300 466x466
+touch: FT6146, imu: QMI8658, rtc: PCF85063, gpio expander: TCA9554
+app-core: initialized
+heartbeat: uptime=0ms interactions=0 redraw=false
+```
+
+Display and touch output will be added after validating the board wiring.

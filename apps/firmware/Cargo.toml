@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 app-core.workspace = true
 board-waveshare-c6.workspace = true
+embedded-graphics.workspace = true
 esp-backtrace = { workspace = true, features = ["esp32c6", "panic-handler", "println"] }
-esp-hal = { workspace = true, features = ["esp32c6"] }
+esp-bootloader-esp-idf = { workspace = true, features = ["esp32c6"] }
+esp-hal = { workspace = true, features = ["esp32c6", "unstable"] }
 esp-println = { workspace = true, features = ["esp32c6", "jtag-serial"] }
