@@ -3,7 +3,7 @@ use core::time::Duration;
 use embedded_graphics::{
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
+    primitives::{Circle, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
 use mplusfonts::{mplus, style::BitmapFontStyleBuilder};
@@ -17,6 +17,7 @@ const TIME_COLON_GAP: i32 = 4;
 const TIME_COLON_DOT_SIZE: u32 = 3;
 const TIME_COLON_TOP_OFFSET: i32 = 15;
 const TIME_COLON_BOTTOM_OFFSET: i32 = 27;
+const SPINNER_DOT_COUNT: u32 = 8;
 pub(super) const DURATION_WIDTH: i32 =
     3 * 2 * TIME_DIGIT_CELL_WIDTH + 2 * (2 * TIME_COLON_GAP + TIME_COLON_DOT_SIZE as i32);
 
@@ -169,6 +170,47 @@ where
         seconds,
         character_style,
     )
+}
+
+pub(super) fn draw_spinner<D>(
+    display: &mut D,
+    center: Point,
+    phase: u8,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    const OFFSETS: [Point; SPINNER_DOT_COUNT as usize] = [
+        Point::new(0, -32),
+        Point::new(23, -23),
+        Point::new(32, 0),
+        Point::new(23, 23),
+        Point::new(0, 32),
+        Point::new(-23, 23),
+        Point::new(-32, 0),
+        Point::new(-23, -23),
+    ];
+    const COLORS: [Rgb565; SPINNER_DOT_COUNT as usize] = [
+        Rgb565::new(20, 63, 31),
+        Rgb565::new(12, 55, 31),
+        Rgb565::new(7, 44, 30),
+        Rgb565::new(5, 32, 25),
+        Rgb565::new(4, 22, 20),
+        Rgb565::new(5, 32, 25),
+        Rgb565::new(7, 44, 30),
+        Rgb565::new(12, 55, 31),
+    ];
+
+    let phase = phase as usize % OFFSETS.len();
+    for index in 0..OFFSETS.len() {
+        let color = COLORS[(index + phase) % COLORS.len()];
+        Circle::with_center(center + OFFSETS[index], 18)
+            .into_styled(PrimitiveStyle::with_fill(color))
+            .draw(display)
+            .map_err(RenderError::Draw)?;
+    }
+
+    Ok(())
 }
 
 fn duration_parts(duration: Duration) -> (u8, u8, u8) {

@@ -1,18 +1,22 @@
 #![no_std]
 
 use embedded_graphics::prelude::*;
+use heapless::String;
 
 mod ui;
 
+pub use ui::screens::hifi::Command as HifiCommand;
+
 pub const DISPLAY_SIZE: Size = Size::new(466, 466);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     Tick { uptime_ms: u64 },
     TouchDown(TouchPoint),
     TouchUp,
     ButtonPressed(Button),
     NetworkStatus(NetworkStatus),
+    HifiStatus(HifiStatus),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +48,66 @@ pub enum Screen {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UpdateOutcome {
     pub render_requested: bool,
+    pub command: Option<Command>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Command {
+    Hifi(HifiCommand),
+}
+
+pub const HIFI_TEXT_LEN: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HifiStatus {
+    pub title: String<HIFI_TEXT_LEN>,
+    pub artist: String<HIFI_TEXT_LEN>,
+    pub album: String<HIFI_TEXT_LEN>,
+    pub playback: PlaybackState,
+    pub elapsed_seconds: u32,
+    pub duration_seconds: u32,
+    pub volume_percent: u8,
+}
+
+impl HifiStatus {
+    pub fn empty() -> Self {
+        Self {
+            title: String::new(),
+            artist: String::new(),
+            album: String::new(),
+            playback: PlaybackState::Unknown,
+            elapsed_seconds: 0,
+            duration_seconds: 0,
+            volume_percent: 0,
+        }
+    }
+
+    pub fn waiting() -> Self {
+        Self {
+            title: string_from("Waiting for Linn"),
+            artist: String::new(),
+            album: String::new(),
+            playback: PlaybackState::Stopped,
+            elapsed_seconds: 0,
+            duration_seconds: 0,
+            volume_percent: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackState {
+    Playing,
+    Paused,
+    Stopped,
+    Buffering,
+    Unknown,
+}
+
+fn string_from<const N: usize>(value: &str) -> String<N> {
+    let mut output = String::new();
+    let _ = output.push_str(value);
+    output
 }
 
 #[derive(Debug)]
@@ -69,7 +133,7 @@ enum ActiveScreen {
 }
 
 impl ActiveScreen {
-    const fn new(screen: Screen, uptime_ms: u64) -> Self {
+    fn new(screen: Screen, uptime_ms: u64) -> Self {
         match screen {
             Screen::Launcher => Self::Launcher(ui::screens::launcher::State::new()),
             Screen::Stopwatch => Self::Stopwatch(ui::screens::stopwatch::State::new()),
@@ -102,6 +166,7 @@ impl App {
     }
 
     pub fn update(&mut self, event: Event) -> UpdateOutcome {
+        let mut command = None;
         let render_requested = match event {
             Event::Tick { uptime_ms } => {
                 self.uptime_ms = uptime_ms;
@@ -114,7 +179,7 @@ impl App {
             Event::TouchDown(point) => {
                 // The interaction counter is visible UI state, so every tap changes the frame.
                 self.interaction_count = self.interaction_count.saturating_add(1);
-                self.handle_touch(point);
+                command = self.handle_touch(point);
                 true
             }
             Event::TouchUp => false,
@@ -131,9 +196,16 @@ impl App {
                     true
                 }
             }
+            Event::HifiStatus(status) => match &mut self.active_screen {
+                ActiveScreen::HifiControl(state) => state.apply_status(status, self.uptime_ms),
+                ActiveScreen::Launcher(_) | ActiveScreen::Stopwatch(_) => false,
+            },
         };
 
-        UpdateOutcome { render_requested }
+        UpdateOutcome {
+            render_requested,
+            command,
+        }
     }
 
     pub const fn uptime_ms(&self) -> u64 {
@@ -152,24 +224,31 @@ impl App {
         self.active_screen.screen()
     }
 
-    fn handle_touch(&mut self, point: TouchPoint) {
+    fn handle_touch(&mut self, point: TouchPoint) -> Option<Command> {
         let point = Point::new(point.x, point.y);
 
-        let destination = match &mut self.active_screen {
-            ActiveScreen::Launcher(_) => {
-                ui::screens::launcher::handle_touch(self.ui_layouts.launcher(), point)
-            }
-            ActiveScreen::Stopwatch(state) => {
-                state.handle_touch(self.ui_layouts.stopwatch(), point, self.uptime_ms)
-            }
+        let (destination, command) = match &mut self.active_screen {
+            ActiveScreen::Launcher(_) => (
+                ui::screens::launcher::handle_touch(self.ui_layouts.launcher(), point),
+                None,
+            ),
+            ActiveScreen::Stopwatch(state) => (
+                state.handle_touch(self.ui_layouts.stopwatch(), point, self.uptime_ms),
+                None,
+            ),
             ActiveScreen::HifiControl(state) => {
-                state.handle_touch(self.ui_layouts.hifi(), point, self.uptime_ms)
+                let command = state
+                    .handle_touch(self.ui_layouts.hifi(), point, self.uptime_ms)
+                    .map(Command::Hifi);
+                (None, command)
             }
         };
 
         if let Some(destination) = destination {
             self.navigate(destination);
         }
+
+        command
     }
 
     fn navigate(&mut self, screen: Screen) {
@@ -233,6 +312,14 @@ mod tests {
 
     fn hifi_play_touch() -> TouchPoint {
         touch_point(ui::hifi_play_button_center())
+    }
+
+    fn hifi_pin_1_touch() -> TouchPoint {
+        touch_point(ui::hifi_pin_1_button_center())
+    }
+
+    fn hifi_pin_2_touch() -> TouchPoint {
+        touch_point(ui::hifi_pin_2_button_center())
     }
 
     #[test]
@@ -363,6 +450,11 @@ mod tests {
     #[test]
     fn hifi_counts_down_while_playing() {
         let mut app = App::new_on_screen(Screen::HifiControl);
+        let mut status = HifiStatus::waiting();
+        status.playback = PlaybackState::Playing;
+        status.elapsed_seconds = 10;
+        status.duration_seconds = 120;
+        app.update(Event::HifiStatus(status));
 
         assert!(
             app.update(Event::Tick { uptime_ms: 1_000 })
@@ -377,19 +469,92 @@ mod tests {
     }
 
     #[test]
-    fn hifi_stops_when_countdown_reaches_zero() {
+    fn hifi_pin_1_touch_requests_invoke_command() {
         let mut app = App::new_on_screen(Screen::HifiControl);
 
-        let outcome = app.update(Event::Tick {
-            uptime_ms: 20 * 60 * 1000,
-        });
+        let outcome = app.update(Event::TouchDown(hifi_pin_1_touch()));
+
+        assert!(outcome.render_requested);
+        assert_eq!(
+            outcome.command,
+            Some(Command::Hifi(HifiCommand::ActivatePreset { preset: 1 }))
+        );
+    }
+
+    #[test]
+    fn hifi_pin_2_touch_requests_invoke_command() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+
+        let outcome = app.update(Event::TouchDown(hifi_pin_2_touch()));
+
+        assert!(outcome.render_requested);
+        assert_eq!(
+            outcome.command,
+            Some(Command::Hifi(HifiCommand::ActivatePreset { preset: 2 }))
+        );
+    }
+
+    #[test]
+    fn hifi_play_touch_requests_toggle_command_when_paused() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        let mut status = HifiStatus::waiting();
+        status.playback = PlaybackState::Paused;
+        app.update(Event::HifiStatus(status));
+
+        let outcome = app.update(Event::TouchDown(hifi_play_touch()));
+
+        assert!(outcome.render_requested);
+        assert_eq!(
+            outcome.command,
+            Some(Command::Hifi(HifiCommand::TogglePlayback))
+        );
+    }
+
+    #[test]
+    fn hifi_play_touch_requests_toggle_command_while_playing() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        let mut status = HifiStatus::waiting();
+        status.playback = PlaybackState::Playing;
+        app.update(Event::HifiStatus(status));
+
+        let outcome = app.update(Event::TouchDown(hifi_play_touch()));
+
+        assert!(outcome.render_requested);
+        assert_eq!(
+            outcome.command,
+            Some(Command::Hifi(HifiCommand::TogglePlayback))
+        );
+    }
+
+    #[test]
+    fn hifi_status_updates_screen() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        let mut status = HifiStatus::waiting();
+        status.playback = PlaybackState::Playing;
+        status.elapsed_seconds = 30;
+        status.duration_seconds = 120;
+        status.volume_percent = 42;
+
+        let outcome = app.update(Event::HifiStatus(status));
+
+        assert!(outcome.render_requested);
+    }
+
+    #[test]
+    fn hifi_stops_when_countdown_reaches_zero() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        let mut status = HifiStatus::waiting();
+        status.playback = PlaybackState::Playing;
+        status.elapsed_seconds = 119;
+        status.duration_seconds = 120;
+        app.update(Event::HifiStatus(status));
+
+        let outcome = app.update(Event::Tick { uptime_ms: 1_000 });
 
         assert!(outcome.render_requested);
         assert!(
-            !app.update(Event::Tick {
-                uptime_ms: 20 * 60 * 1000 + 1_000
-            })
-            .render_requested
+            !app.update(Event::Tick { uptime_ms: 2_000 })
+                .render_requested
         );
     }
 

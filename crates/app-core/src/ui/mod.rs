@@ -64,3 +64,13 @@ pub(crate) fn launcher_button_centers() -> (
 pub(crate) fn hifi_play_button_center() -> embedded_graphics::geometry::Point {
     screens::hifi::play_button_center(SCREEN_BOUNDS)
 }
+
+#[cfg(test)]
+pub(crate) fn hifi_pin_1_button_center() -> embedded_graphics::geometry::Point {
+    screens::hifi::pin_1_button_center(SCREEN_BOUNDS)
+}
+
+#[cfg(test)]
+pub(crate) fn hifi_pin_2_button_center() -> embedded_graphics::geometry::Point {
+    screens::hifi::pin_2_button_center(SCREEN_BOUNDS)
+}

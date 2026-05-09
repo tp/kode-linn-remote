@@ -6,7 +6,9 @@ use std::{
     time::Instant,
 };
 
-use app_core::{App, DISPLAY_SIZE, Event, NetworkStatus, Screen, TouchPoint};
+use app_config::AppConfig;
+use app_core::{App, Command, DISPLAY_SIZE, Event, NetworkStatus, Screen, TouchPoint};
+use app_runtime::{AppRuntime, host_tcp::HostTcpConnector, lpec::LpecHifi};
 use embedded_graphics::{
     Pixel,
     draw_target::DrawTarget,
@@ -38,6 +40,7 @@ const SIDE_WIDTH: f64 = 210.0;
 const BUTTON_WIDTH: f64 = 178.0;
 const BUTTON_HEIGHT: f64 = 32.0;
 const BUTTON_SPACING: f64 = 44.0;
+const HIFI_STATUS_POLL_MS: u64 = 2_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DisplayShape {
@@ -179,8 +182,10 @@ struct NativeSimulator {
     app_frame_dirty: bool,
     output_frame_dirty: bool,
     display_shape: DisplayShape,
+    runtime: AppRuntime<LpecHifi<HostTcpConnector>>,
     started_at: Instant,
     manual_time_offset_ms: u64,
+    last_hifi_status_poll_ms: u64,
     tap_highlight: Option<TapHighlight>,
     render_stats: RenderStats,
 }
@@ -197,8 +202,13 @@ impl NativeSimulator {
             app_frame_dirty: true,
             output_frame_dirty: true,
             display_shape: DisplayShape::Circle,
+            runtime: AppRuntime::new(LpecHifi::new(
+                HostTcpConnector::new(),
+                AppConfig::load_local_or_default().linn_lpec_endpoint,
+            )),
             started_at: Instant::now(),
             manual_time_offset_ms: 0,
+            last_hifi_status_poll_ms: 0,
             tap_highlight: None,
             render_stats: RenderStats::new(),
         }
@@ -206,6 +216,9 @@ impl NativeSimulator {
 
     fn update(&mut self, event: Event) {
         let outcome = self.app.update(event);
+        if let Some(command) = outcome.command {
+            self.handle_command(command);
+        }
         if outcome.render_requested {
             self.app_frame_dirty = true;
             self.output_frame_dirty = true;
@@ -213,11 +226,31 @@ impl NativeSimulator {
         }
     }
 
+    fn handle_command(&mut self, command: Command) {
+        if let Err(error) = self.runtime.handle_command(command) {
+            eprintln!("failed to handle app command {command:?}: {error:?}");
+        }
+    }
+
     fn tick(&mut self) {
-        self.update(Event::Tick {
-            uptime_ms: self.uptime_ms(),
-        });
+        let uptime_ms = self.uptime_ms();
+        self.update(Event::Tick { uptime_ms });
+        self.poll_hifi_status_if_needed(uptime_ms);
         self.render_stats.update_sample();
+    }
+
+    fn poll_hifi_status_if_needed(&mut self, uptime_ms: u64) {
+        if self.app.screen() != Screen::HifiControl
+            || uptime_ms.saturating_sub(self.last_hifi_status_poll_ms) < HIFI_STATUS_POLL_MS
+        {
+            return;
+        }
+
+        self.last_hifi_status_poll_ms = uptime_ms;
+        match self.runtime.hifi_status() {
+            Ok(status) => self.update(Event::HifiStatus(status)),
+            Err(error) => eprintln!("failed to read Linn hifi status: {error:?}"),
+        }
     }
 
     fn advance_by(&mut self, delta_ms: u64) {

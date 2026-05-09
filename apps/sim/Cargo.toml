@@ -6,7 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+app-config = { workspace = true, features = ["std"] }
 app-core.workspace = true
+app-runtime = { workspace = true, features = ["std"] }
 embedded-graphics.workspace = true
 image.workspace = true
 objc2.workspace = true

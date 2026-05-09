@@ -5,20 +5,25 @@ use core::{fmt, str};
 use heapless::{String, Vec};
 
 pub const DEFAULT_PORT: u16 = 23;
-pub const MAX_LINE_LEN: usize = 384;
-pub const MAX_ARG_LEN: usize = 128;
+pub const MAX_LINE_LEN: usize = 4096;
+pub const MAX_ARG_LEN: usize = 2048;
 pub const MAX_ARGS: usize = 8;
 pub const MAX_EVENTS: usize = 16;
 
 pub type Line = String<MAX_LINE_LEN>;
 pub type ResponseArg = String<MAX_ARG_LEN>;
+pub type RemoteDescription = String<MAX_LINE_LEN>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Service {
     AvTransport,
     RenderingControl,
+    Playlist,
+    Info,
+    Time,
     Product,
     Preamp,
+    Volume,
     Pins,
 }
 
@@ -27,8 +32,12 @@ impl Service {
         match self {
             Self::AvTransport => "MediaRenderer/AVTransport",
             Self::RenderingControl => "MediaRenderer/RenderingControl",
+            Self::Playlist => "Ds/Playlist",
+            Self::Info => "Ds/Info",
+            Self::Time => "Ds/Time",
             Self::Product => "Ds/Product",
             Self::Preamp => "Preamp/Preamp",
+            Self::Volume => "Ds/Volume",
             Self::Pins => "Ds/Pins",
         }
     }
@@ -104,8 +113,36 @@ pub fn previous() -> Action<'static> {
     Action::new(Service::AvTransport, 1, "Previous", &["0"])
 }
 
+pub fn playlist_transport_state() -> Action<'static> {
+    Action::new(Service::Playlist, 1, "TransportState", &[])
+}
+
+pub fn playlist_play() -> Action<'static> {
+    Action::new(Service::Playlist, 1, "Play", &[])
+}
+
+pub fn playlist_pause() -> Action<'static> {
+    Action::new(Service::Playlist, 1, "Pause", &[])
+}
+
+pub fn info_metatext() -> Action<'static> {
+    Action::new(Service::Info, 1, "Metatext", &[])
+}
+
+pub fn info_track() -> Action<'static> {
+    Action::new(Service::Info, 1, "Track", &[])
+}
+
+pub fn time() -> Action<'static> {
+    Action::new(Service::Time, 1, "Time", &[])
+}
+
 pub fn get_volume() -> Action<'static> {
     Action::new(Service::Preamp, 1, "Volume", &[])
+}
+
+pub fn get_ds_volume() -> Action<'static> {
+    Action::new(Service::Volume, 1, "Volume", &[])
 }
 
 pub fn set_volume_arg(volume: &str) -> Action<'_> {
@@ -172,7 +209,7 @@ pub enum Message<'a> {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error<E = core::convert::Infallible> {
     Fmt,
     LineTooLong,
@@ -182,7 +219,10 @@ pub enum Error<E = core::convert::Infallible> {
     TooManyEvents,
     InvalidNumber,
     UnexpectedMessage,
-    Remote { code: u16 },
+    Remote {
+        code: u16,
+        description: RemoteDescription,
+    },
     Transport(E),
 }
 
@@ -339,7 +379,10 @@ where
                 Message::Response { args } => {
                     return copy_response_args(&args).map_err(Error::erase);
                 }
-                Message::Error { code, .. } => return Err(Error::Remote { code }),
+                Message::Error { code, description } => {
+                    let description = copy_remote_description(description).map_err(Error::erase)?;
+                    return Err(Error::Remote { code, description });
+                }
                 Message::Alive { .. } | Message::ByeBye { .. } | Message::Event { .. } => {}
                 Message::Subscribe { .. } | Message::Unsubscribe { .. } => {
                     return Err(Error::UnexpectedMessage);
@@ -366,6 +409,14 @@ where
 
     pub fn previous(&mut self) -> Result<(), Error<T::Error>> {
         self.action(previous()).map(|_| ())
+    }
+
+    pub fn playlist_play(&mut self) -> Result<(), Error<T::Error>> {
+        self.action(playlist_play()).map(|_| ())
+    }
+
+    pub fn playlist_pause(&mut self) -> Result<(), Error<T::Error>> {
+        self.action(playlist_pause()).map(|_| ())
     }
 
     pub fn volume(&mut self) -> Result<u8, Error<T::Error>> {
@@ -418,10 +469,18 @@ impl Error {
             Self::TooManyEvents => Error::TooManyEvents,
             Self::InvalidNumber => Error::InvalidNumber,
             Self::UnexpectedMessage => Error::UnexpectedMessage,
-            Self::Remote { code } => Error::Remote { code },
+            Self::Remote { code, description } => Error::Remote { code, description },
             Self::Transport(never) => match never {},
         }
     }
+}
+
+fn copy_remote_description(description: &str) -> Result<RemoteDescription, Error> {
+    let mut copied = RemoteDescription::new();
+    copied
+        .push_str(description)
+        .map_err(|_| Error::LineTooLong)?;
+    Ok(copied)
 }
 
 fn push_quoted_xml_arg(line: &mut Line, arg: &str) -> Result<(), Error> {
@@ -620,6 +679,14 @@ mod tests {
             format_action(next()).unwrap().as_str(),
             "ACTION MediaRenderer/AVTransport 1 Next \"0\""
         );
+        assert_eq!(
+            format_action(playlist_play()).unwrap().as_str(),
+            "ACTION Ds/Playlist 1 Play"
+        );
+        assert_eq!(
+            format_action(playlist_pause()).unwrap().as_str(),
+            "ACTION Ds/Playlist 1 Pause"
+        );
     }
 
     #[test]
@@ -721,11 +788,17 @@ mod tests {
     }
 
     #[test]
-    fn client_surfaces_remote_error_code() {
+    fn client_surfaces_remote_error_code_and_description() {
         let transport = ScriptedTransport::new(&["ERROR 103 \"Service not found\""]);
         let mut client = Client::new(transport);
 
-        assert_eq!(client.stop(), Err(Error::Remote { code: 103 }));
+        assert_eq!(
+            client.stop(),
+            Err(Error::Remote {
+                code: 103,
+                description: copy_remote_description("Service not found").unwrap()
+            })
+        );
     }
 
     struct ScriptedTransport {

@@ -18,12 +18,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "app-config"
+version = "0.1.0"
+dependencies = [
+ "app-runtime",
+ "heapless 0.9.1",
+]
+
+[[package]]
 name = "app-core"
 version = "0.1.0"
 dependencies = [
  "embedded-graphics",
  "heapless 0.9.1",
  "mplusfonts",
+]
+
+[[package]]
+name = "app-runtime"
+version = "0.1.0"
+dependencies = [
+ "app-core",
+ "heapless 0.9.1",
+ "linn-lpec",
 ]
 
 [[package]]
@@ -800,6 +817,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "linn-ci-gateway"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.9.1",
+]
+
+[[package]]
 name = "linn-lpec"
 version = "0.1.0"
 dependencies = [
@@ -1283,7 +1307,9 @@ dependencies = [
 name = "sim"
 version = "0.1.0"
 dependencies = [
+ "app-config",
  "app-core",
+ "app-runtime",
  "embedded-graphics",
  "image",
  "objc2",

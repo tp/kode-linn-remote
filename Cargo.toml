@@ -3,14 +3,21 @@ resolver = "3"
 members = [
     "apps/firmware",
     "apps/sim",
+    "crates/app-config",
     "crates/app-core",
+    "crates/app-runtime",
     "crates/board-waveshare-c6",
+    "crates/linn-ci-gateway",
     "crates/linn-lpec",
 ]
 default-members = [
     "apps/sim",
+    "crates/app-config",
     "crates/app-core",
+    "crates/app-runtime",
     "crates/board-waveshare-c6",
+    "crates/linn-ci-gateway",
+    "crates/linn-lpec",
 ]
 
 [workspace.package]
@@ -19,7 +26,9 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.88"
 
 [workspace.dependencies]
+app-config = { path = "crates/app-config", default-features = false }
 app-core = { path = "crates/app-core" }
+app-runtime = { path = "crates/app-runtime", default-features = false }
 board-waveshare-c6 = { path = "crates/board-waveshare-c6" }
 embedded-graphics = { version = "0.8.2", default-features = false }
 esp-backtrace = { version = "0.19.0", default-features = false }
@@ -27,6 +36,7 @@ esp-hal = "1.0.0"
 esp-println = { version = "0.17.0", default-features = false }
 heapless = { version = "0.9", default-features = false }
 image = { version = "0.25.9", default-features = false, features = ["png"] }
+linn-ci-gateway = { path = "crates/linn-ci-gateway" }
 linn-lpec = { path = "crates/linn-lpec" }
 mplusfonts = { version = "0.3.4", default-features = false }
 objc2 = "0.6.4"
