@@ -1,6 +1,7 @@
 use core::time::Duration;
 
 use embedded_graphics::{
+    Pixel,
     pixelcolor::Rgb565,
     prelude::*,
     primitives::{Arc, PrimitiveStyle, Rectangle, Triangle},
@@ -8,7 +9,9 @@ use embedded_graphics::{
 };
 use mplusfonts::{mplus, style::BitmapFontStyleBuilder};
 
-use crate::{HifiStatus, PlaybackState, RenderError};
+use crate::{
+    HIFI_ARTWORK_PIXELS, HIFI_ARTWORK_SIZE, HifiArtwork, HifiStatus, PlaybackState, RenderError,
+};
 
 use super::super::{
     components::{
@@ -57,6 +60,7 @@ pub(super) struct VolumeLayout {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct State {
     status: HifiStatus,
+    artwork: Option<HifiArtwork>,
     created_at_ms: u64,
     loading: bool,
     last_second: u64,
@@ -82,6 +86,7 @@ impl State {
 
         Self {
             status: HifiStatus::waiting(),
+            artwork: None,
             created_at_ms: uptime_ms,
             loading: true,
             last_second: current_second,
@@ -133,6 +138,13 @@ impl State {
     pub(crate) fn apply_status(&mut self, status: HifiStatus, uptime_ms: u64) -> bool {
         let was_loading = self.loading;
         let has_live_content = has_live_content(&status);
+        if self
+            .artwork
+            .as_ref()
+            .is_some_and(|artwork| artwork.source_uri != status.album_art_uri)
+        {
+            self.artwork = None;
+        }
 
         if self.status == status && (!was_loading || !has_live_content) {
             return false;
@@ -146,6 +158,22 @@ impl State {
         let current_second = uptime_ms / 1000;
         self.current_second = current_second;
         self.last_second = current_second;
+        true
+    }
+
+    pub(crate) fn apply_artwork(&mut self, artwork: HifiArtwork) -> bool {
+        if artwork.source_uri.is_empty()
+            || artwork.source_uri != self.status.album_art_uri
+            || artwork.pixels.len() != HIFI_ARTWORK_PIXELS
+        {
+            return false;
+        }
+
+        if self.artwork.as_ref() == Some(&artwork) {
+            return false;
+        }
+
+        self.artwork = Some(artwork);
         true
     }
 
@@ -279,6 +307,10 @@ where
         ui_layout.play_button,
         state.status.playback,
         spinner_phase(state.current_ms),
+        state.artwork.as_ref().filter(|artwork| {
+            state.status.playback == PlaybackState::Playing
+                && artwork.source_uri == state.status.album_art_uri
+        }),
     )?;
     for (index, rect) in ui_layout.pin_buttons.iter().enumerate() {
         draw_button(
@@ -533,6 +565,7 @@ fn draw_play_pause_button<D>(
     rect: Rectangle,
     playback: PlaybackState,
     spinner_phase: u8,
+    artwork: Option<&HifiArtwork>,
 ) -> Result<(), RenderError<D::Error>>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -541,11 +574,15 @@ where
 
     match playback {
         PlaybackState::Playing => {
-            for x_offset in [-21, 5] {
-                let bar = Rectangle::new(center + Point::new(x_offset, -32), Size::new(16, 64));
-                bar.into_styled(PrimitiveStyle::with_fill(TEXT_PRIMARY))
-                    .draw(display)
-                    .map_err(RenderError::Draw)?;
+            if let Some(artwork) = artwork {
+                draw_artwork(display, center, artwork)?;
+            } else {
+                for x_offset in [-21, 5] {
+                    let bar = Rectangle::new(center + Point::new(x_offset, -32), Size::new(16, 64));
+                    bar.into_styled(PrimitiveStyle::with_fill(TEXT_PRIMARY))
+                        .draw(display)
+                        .map_err(RenderError::Draw)?;
+                }
             }
         }
         PlaybackState::Buffering => {
@@ -564,6 +601,35 @@ where
     }
 
     Ok(())
+}
+
+fn draw_artwork<D>(
+    display: &mut D,
+    center: Point,
+    artwork: &HifiArtwork,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let top_left = center
+        - Point::new(
+            (HIFI_ARTWORK_SIZE / 2) as i32,
+            (HIFI_ARTWORK_SIZE / 2) as i32,
+        );
+    let size = HIFI_ARTWORK_SIZE as i32;
+
+    display
+        .draw_iter((0..size).flat_map(|y| {
+            (0..size).filter_map(move |x| {
+                let index = (y as usize * HIFI_ARTWORK_SIZE as usize) + x as usize;
+                artwork
+                    .pixels
+                    .get(index)
+                    .copied()
+                    .map(|color| Pixel(top_left + Point::new(x, y), color))
+            })
+        }))
+        .map_err(RenderError::Draw)
 }
 
 fn rect_visual_center(rect: Rectangle) -> Point {

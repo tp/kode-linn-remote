@@ -13,3 +13,5 @@ std = []
 app-core.workspace = true
 heapless.workspace = true
 linn-lpec.workspace = true
+zune-core.workspace = true
+zune-jpeg.workspace = true

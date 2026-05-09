@@ -1,17 +1,43 @@
-use app_core::{HifiCommand, HifiStatus, PlaybackState};
+use app_core::{HIFI_ARTWORK_SIZE, HifiArtwork, HifiCommand, HifiStatus, PlaybackState};
+use heapless::Vec;
 use linn_lpec::{Client as LinnClient, Line, Transport};
+use zune_core::bytestream::ZCursor;
+use zune_jpeg::JpegDecoder;
 
 use crate::{
     HifiController,
     net::{ByteStream, Endpoint, TcpConnector},
 };
 
+const MAX_ARTWORK_BYTES: usize = 128 * 1024;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error<E> {
     Connect(E),
     LineTooLong,
     UnexpectedEof,
+    InvalidArtworkUri,
+    InvalidHttpResponse,
+    HttpError,
+    ArtworkTooLarge,
+    ArtworkDecode,
     Protocol(linn_lpec::Error<core::convert::Infallible>),
+}
+
+impl Error<core::convert::Infallible> {
+    fn erase_transport<E>(self) -> Error<E> {
+        match self {
+            Self::Connect(never) => match never {},
+            Self::LineTooLong => Error::LineTooLong,
+            Self::UnexpectedEof => Error::UnexpectedEof,
+            Self::InvalidArtworkUri => Error::InvalidArtworkUri,
+            Self::InvalidHttpResponse => Error::InvalidHttpResponse,
+            Self::HttpError => Error::HttpError,
+            Self::ArtworkTooLarge => Error::ArtworkTooLarge,
+            Self::ArtworkDecode => Error::ArtworkDecode,
+            Self::Protocol(error) => Error::Protocol(error),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -49,6 +75,18 @@ where
 
     fn invoke_pin(&mut self, pin: u8) -> Result<(), Error<C::Error>> {
         self.client()?.invoke_pin(pin).map_err(map_client_error)
+    }
+
+    fn load_artwork(&mut self, uri: &str) -> Result<HifiArtwork, Error<C::Error>> {
+        let request = ArtworkRequest::parse(uri).map_err(Error::erase_transport)?;
+        let mut stream = self
+            .connector
+            .connect_host(request.host, request.port)
+            .map_err(Error::Connect)?;
+        write_http_get(&mut stream, request.host, request.path).map_err(Error::Connect)?;
+        let response = read_http_response(&mut stream)?;
+        let body = response_body(&response).map_err(Error::erase_transport)?;
+        decode_jpeg_artwork(uri, body).map_err(Error::erase_transport)
     }
 
     fn toggle_playback(&mut self) -> Result<(), Error<C::Error>> {
@@ -123,6 +161,35 @@ where
 
         Ok(status)
     }
+
+    fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error> {
+        self.load_artwork(uri)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArtworkRequest<'a> {
+    host: &'a str,
+    port: u16,
+    path: &'a str,
+}
+
+impl<'a> ArtworkRequest<'a> {
+    fn parse(uri: &'a str) -> Result<Self, Error<core::convert::Infallible>> {
+        let rest = uri
+            .strip_prefix("http://")
+            .or_else(|| uri.strip_prefix("https://"))
+            .ok_or(Error::InvalidArtworkUri)?;
+        let (host_port, path) = rest
+            .split_once('/')
+            .map(|(host, path)| (host, path))
+            .unwrap_or((rest, ""));
+        let (host, port) = host_port
+            .rsplit_once(':')
+            .and_then(|(host, port)| parse_u16(port).map(|port| (host, port)))
+            .unwrap_or((host_port, 80));
+        Ok(Self { host, port, path })
+    }
 }
 
 fn map_client_error<E>(error: linn_lpec::Error<Error<E>>) -> Error<E> {
@@ -172,6 +239,101 @@ fn playback_can_pause(playback: PlaybackState) -> bool {
     matches!(playback, PlaybackState::Playing | PlaybackState::Buffering)
 }
 
+fn write_http_get<S>(stream: &mut S, host: &str, path: &str) -> Result<(), S::Error>
+where
+    S: ByteStream,
+{
+    stream.write_all(b"GET /")?;
+    stream.write_all(path.as_bytes())?;
+    stream.write_all(b" HTTP/1.0\r\nHost: ")?;
+    stream.write_all(host.as_bytes())?;
+    stream.write_all(b"\r\nUser-Agent: esp32-rust\r\nConnection: close\r\n\r\n")?;
+    stream.flush()
+}
+
+fn read_http_response<S>(stream: &mut S) -> Result<Vec<u8, MAX_ARTWORK_BYTES>, Error<S::Error>>
+where
+    S: ByteStream,
+{
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let count = stream.read(&mut chunk).map_err(Error::Connect)?;
+        if count == 0 {
+            return Ok(response);
+        }
+        response
+            .extend_from_slice(&chunk[..count])
+            .map_err(|_| Error::ArtworkTooLarge)?;
+    }
+}
+
+fn response_body(response: &[u8]) -> Result<&[u8], Error<core::convert::Infallible>> {
+    let Some(header_end) = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+    else {
+        return Err(Error::InvalidHttpResponse);
+    };
+    let status_line_end = response[..header_end]
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .ok_or(Error::InvalidHttpResponse)?;
+    let status_line = &response[..status_line_end];
+    if !status_line.starts_with(b"HTTP/1.") || !status_line.windows(5).any(|part| part == b" 200 ")
+    {
+        return Err(Error::HttpError);
+    }
+    Ok(&response[header_end..])
+}
+
+fn decode_jpeg_artwork(
+    uri: &str,
+    bytes: &[u8],
+) -> Result<HifiArtwork, Error<core::convert::Infallible>> {
+    let mut decoder = JpegDecoder::new(ZCursor::new(bytes));
+    let decoded = decoder.decode().map_err(|_| Error::ArtworkDecode)?;
+    let info = decoder.info().ok_or(Error::ArtworkDecode)?;
+    let width = info.width as usize;
+    let height = info.height as usize;
+    if width == 0 || height == 0 {
+        return Err(Error::ArtworkDecode);
+    }
+    let components = decoded
+        .len()
+        .checked_div(width.saturating_mul(height))
+        .ok_or(Error::ArtworkDecode)?;
+    if !matches!(components, 1 | 3 | 4) {
+        return Err(Error::ArtworkDecode);
+    }
+
+    let crop_size = width.min(height);
+    let crop_x = (width - crop_size) / 2;
+    let crop_y = (height - crop_size) / 2;
+    let mut artwork = HifiArtwork::new(uri).ok_or(Error::InvalidArtworkUri)?;
+    for y in 0..HIFI_ARTWORK_SIZE as usize {
+        let source_y = crop_y + (y * crop_size / HIFI_ARTWORK_SIZE as usize);
+        for x in 0..HIFI_ARTWORK_SIZE as usize {
+            let source_x = crop_x + (x * crop_size / HIFI_ARTWORK_SIZE as usize);
+            let source = (source_y * width + source_x) * components;
+            let (r, g, b) = if components == 1 {
+                let luma = decoded[source];
+                (luma, luma, luma)
+            } else {
+                (decoded[source], decoded[source + 1], decoded[source + 2])
+            };
+            if !artwork.push_rgb888(r, g, b) {
+                return Err(Error::ArtworkDecode);
+            }
+        }
+    }
+    if !artwork.is_complete() {
+        return Err(Error::ArtworkDecode);
+    }
+    Ok(artwork)
+}
+
 fn parse_u32(value: &str) -> Option<u32> {
     let mut number = 0_u32;
     if value.is_empty() {
@@ -188,10 +350,16 @@ fn parse_u32(value: &str) -> Option<u32> {
     Some(number)
 }
 
+fn parse_u16(value: &str) -> Option<u16> {
+    let number = parse_u32(value)?;
+    u16::try_from(number).ok()
+}
+
 fn apply_metadata(status: &mut HifiStatus, metadata: &str) {
     copy_tag(metadata, "dc:title", &mut status.title);
     copy_tag(metadata, "upnp:artist", &mut status.artist);
     copy_tag(metadata, "upnp:album", &mut status.album);
+    copy_album_art_uri(metadata, &mut status.album_art_uri);
 
     if status.artist.is_empty() {
         copy_tag(metadata, "artist", &mut status.artist);
@@ -221,6 +389,49 @@ fn copy_tag<const N: usize>(xml: &str, tag: &str, output: &mut heapless::String<
 
     output.clear();
     copy_xml_text(&xml[content_start..content_end], output);
+}
+
+fn copy_album_art_uri<const N: usize>(xml: &str, output: &mut heapless::String<N>) {
+    if copy_album_art_uri_for_profile(xml, "JPEG_TN", output) {
+        return;
+    }
+    let _ = copy_album_art_uri_for_profile(xml, "", output);
+}
+
+fn copy_album_art_uri_for_profile<const N: usize>(
+    xml: &str,
+    profile: &str,
+    output: &mut heapless::String<N>,
+) -> bool {
+    let mut offset = 0;
+    while offset < xml.len() {
+        let Some(relative_start) = xml[offset..].find("<upnp:albumArtURI") else {
+            return false;
+        };
+        let tag_start = offset + relative_start;
+        let Some(content_start) = xml[tag_start..]
+            .find('>')
+            .map(|relative| tag_start + relative + 1)
+        else {
+            return false;
+        };
+        let open_tag = &xml[tag_start..content_start];
+        if profile.is_empty() || open_tag.contains(profile) {
+            let Some(content_end) = xml[content_start..]
+                .find("</upnp:albumArtURI>")
+                .map(|relative| content_start + relative)
+            else {
+                return false;
+            };
+            output.clear();
+            copy_xml_text(&xml[content_start..content_end], output);
+            return !output.is_empty();
+        }
+
+        offset = content_start;
+    }
+
+    false
 }
 
 fn find_tag_start(xml: &str, tag: &str) -> Option<usize> {
@@ -360,12 +571,16 @@ mod tests {
 
         apply_metadata(
             &mut status,
-            r#"<?xml version="1.0" encoding="UTF-8"?><DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dc="http://purl.org/dc/elements/1.1/"><item id="55642869" parentID="-1" restricted="1"><upnp:class>object.item.audioItem.musicTrack</upnp:class><dc:title>Caroline</dc:title><upnp:album>Village</upnp:album><upnp:artist>Jacob Banks</upnp:artist></item></DIDL-Lite>"#,
+            r#"<?xml version="1.0" encoding="UTF-8"?><DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dc="http://purl.org/dc/elements/1.1/"><item id="55642869" parentID="-1" restricted="1"><upnp:class>object.item.audioItem.musicTrack</upnp:class><dc:title>Caroline</dc:title><upnp:album>Village</upnp:album><upnp:artist>Jacob Banks</upnp:artist><upnp:albumArtURI dlna:profileID="JPEG_MED">http://192.168.7.218/art/medium.jpg</upnp:albumArtURI><upnp:albumArtURI dlna:profileID="JPEG_TN">http://192.168.7.218/art/thumb.jpg</upnp:albumArtURI></item></DIDL-Lite>"#,
         );
 
         assert_eq!(status.title.as_str(), "Caroline");
         assert_eq!(status.artist.as_str(), "Jacob Banks");
         assert_eq!(status.album.as_str(), "Village");
+        assert_eq!(
+            status.album_art_uri.as_str(),
+            "http://192.168.7.218/art/thumb.jpg"
+        );
     }
 
     #[test]
@@ -375,5 +590,16 @@ mod tests {
             parse_playback_state("TRANSITIONING"),
             PlaybackState::Buffering
         );
+    }
+
+    #[test]
+    fn artwork_request_uses_plain_http_for_https_hosts() {
+        let request =
+            ArtworkRequest::parse("https://static.qobuz.com/images/covers/mb/x1/cover_230.jpg")
+                .unwrap();
+
+        assert_eq!(request.host, "static.qobuz.com");
+        assert_eq!(request.port, 80);
+        assert_eq!(request.path, "images/covers/mb/x1/cover_230.jpg");
     }
 }

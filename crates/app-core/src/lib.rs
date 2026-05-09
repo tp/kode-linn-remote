@@ -1,7 +1,7 @@
 #![no_std]
 
-use embedded_graphics::prelude::*;
-use heapless::String;
+use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
+use heapless::{String, Vec};
 
 mod ui;
 
@@ -17,6 +17,7 @@ pub enum Event {
     ButtonPressed(Button),
     NetworkStatus(NetworkStatus),
     HifiStatus(HifiStatus),
+    HifiArtwork(HifiArtwork),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,13 +57,17 @@ pub enum Command {
     Hifi(HifiCommand),
 }
 
+pub const HIFI_ARTWORK_PIXELS: usize = HIFI_ARTWORK_SIZE as usize * HIFI_ARTWORK_SIZE as usize;
+pub const HIFI_ARTWORK_SIZE: u32 = 96;
 pub const HIFI_TEXT_LEN: usize = 64;
+pub const HIFI_URI_LEN: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HifiStatus {
     pub title: String<HIFI_TEXT_LEN>,
     pub artist: String<HIFI_TEXT_LEN>,
     pub album: String<HIFI_TEXT_LEN>,
+    pub album_art_uri: String<HIFI_URI_LEN>,
     pub playback: PlaybackState,
     pub elapsed_seconds: u32,
     pub duration_seconds: u32,
@@ -75,6 +80,7 @@ impl HifiStatus {
             title: String::new(),
             artist: String::new(),
             album: String::new(),
+            album_art_uri: String::new(),
             playback: PlaybackState::Unknown,
             elapsed_seconds: 0,
             duration_seconds: 0,
@@ -87,6 +93,7 @@ impl HifiStatus {
             title: string_from("Waiting for Linn"),
             artist: String::new(),
             album: String::new(),
+            album_art_uri: String::new(),
             playback: PlaybackState::Stopped,
             elapsed_seconds: 0,
             duration_seconds: 0,
@@ -102,6 +109,35 @@ pub enum PlaybackState {
     Stopped,
     Buffering,
     Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HifiArtwork {
+    pub source_uri: String<HIFI_URI_LEN>,
+    pub pixels: Vec<Rgb565, HIFI_ARTWORK_PIXELS>,
+}
+
+impl HifiArtwork {
+    pub fn new(source_uri: &str) -> Option<Self> {
+        let mut artwork = Self {
+            source_uri: String::new(),
+            pixels: Vec::new(),
+        };
+        artwork.source_uri.push_str(source_uri).ok()?;
+        Some(artwork)
+    }
+
+    pub fn push_pixel(&mut self, color: Rgb565) -> bool {
+        self.pixels.push(color).is_ok()
+    }
+
+    pub fn push_rgb888(&mut self, red: u8, green: u8, blue: u8) -> bool {
+        self.push_pixel(Rgb565::new(red >> 3, green >> 2, blue >> 3))
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.pixels.len() == HIFI_ARTWORK_PIXELS
+    }
 }
 
 fn string_from<const N: usize>(value: &str) -> String<N> {
@@ -198,6 +234,10 @@ impl App {
             }
             Event::HifiStatus(status) => match &mut self.active_screen {
                 ActiveScreen::HifiControl(state) => state.apply_status(status, self.uptime_ms),
+                ActiveScreen::Launcher(_) | ActiveScreen::Stopwatch(_) => false,
+            },
+            Event::HifiArtwork(artwork) => match &mut self.active_screen {
+                ActiveScreen::HifiControl(state) => state.apply_artwork(artwork),
                 ActiveScreen::Launcher(_) | ActiveScreen::Stopwatch(_) => false,
             },
         };

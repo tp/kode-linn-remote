@@ -1,6 +1,6 @@
 use std::{
     io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, ToSocketAddrs},
     time::Duration,
 };
 
@@ -60,6 +60,28 @@ impl TcpConnector for HostTcpConnector {
             self.read_timeout,
             self.write_timeout,
         )
+    }
+
+    fn connect_host(&mut self, host: &str, port: u16) -> Result<Self::Stream, Self::Error> {
+        let mut last_error = None;
+        for addr in (host, port).to_socket_addrs()? {
+            match HostTcpStream::connect(
+                addr,
+                self.connect_timeout,
+                self.read_timeout,
+                self.write_timeout,
+            ) {
+                Ok(stream) => return Ok(stream),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "host did not resolve to any address",
+            )
+        }))
     }
 }
 

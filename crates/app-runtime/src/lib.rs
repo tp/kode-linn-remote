@@ -1,6 +1,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use app_core::{Command, HifiCommand, HifiStatus};
+extern crate alloc;
+
+use app_core::{Command, HifiArtwork, HifiCommand, HifiStatus};
 
 #[cfg(feature = "std")]
 pub mod host_tcp;
@@ -17,6 +19,7 @@ pub trait HifiController {
 
     fn handle_command(&mut self, command: HifiCommand) -> Result<(), Self::Error>;
     fn status(&mut self) -> Result<HifiStatus, Self::Error>;
+    fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error>;
 }
 
 #[derive(Debug)]
@@ -49,6 +52,10 @@ where
 
     pub fn hifi_status(&mut self) -> Result<HifiStatus, RuntimeError<Hifi::Error>> {
         self.hifi.status().map_err(RuntimeError::Hifi)
+    }
+
+    pub fn hifi_artwork(&mut self, uri: &str) -> Result<HifiArtwork, RuntimeError<Hifi::Error>> {
+        self.hifi.artwork(uri).map_err(RuntimeError::Hifi)
     }
 }
 
@@ -99,6 +106,10 @@ mod tests {
 
         fn status(&mut self) -> Result<HifiStatus, Self::Error> {
             Ok(HifiStatus::waiting())
+        }
+
+        fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error> {
+            Ok(HifiArtwork::new(uri).unwrap())
         }
     }
 }

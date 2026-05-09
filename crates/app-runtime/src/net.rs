@@ -23,4 +23,5 @@ pub trait TcpConnector {
     type Error;
 
     fn connect(&mut self, endpoint: Endpoint) -> Result<Self::Stream, Self::Error>;
+    fn connect_host(&mut self, host: &str, port: u16) -> Result<Self::Stream, Self::Error>;
 }

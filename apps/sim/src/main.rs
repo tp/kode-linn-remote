@@ -7,7 +7,9 @@ use std::{
 };
 
 use app_config::AppConfig;
-use app_core::{App, Command, DISPLAY_SIZE, Event, NetworkStatus, Screen, TouchPoint};
+use app_core::{
+    App, Command, DISPLAY_SIZE, Event, NetworkStatus, PlaybackState, Screen, TouchPoint,
+};
 use app_runtime::{AppRuntime, host_tcp::HostTcpConnector, lpec::LpecHifi};
 use embedded_graphics::{
     Pixel,
@@ -186,6 +188,7 @@ struct NativeSimulator {
     started_at: Instant,
     manual_time_offset_ms: u64,
     last_hifi_status_poll_ms: u64,
+    last_hifi_artwork_uri: Option<String>,
     tap_highlight: Option<TapHighlight>,
     render_stats: RenderStats,
 }
@@ -209,6 +212,7 @@ impl NativeSimulator {
             started_at: Instant::now(),
             manual_time_offset_ms: 0,
             last_hifi_status_poll_ms: 0,
+            last_hifi_artwork_uri: None,
             tap_highlight: None,
             render_stats: RenderStats::new(),
         }
@@ -248,8 +252,30 @@ impl NativeSimulator {
 
         self.last_hifi_status_poll_ms = uptime_ms;
         match self.runtime.hifi_status() {
-            Ok(status) => self.update(Event::HifiStatus(status)),
+            Ok(status) => {
+                let artwork_uri = status.album_art_uri.as_str().to_owned();
+                let should_load_artwork =
+                    status.playback == PlaybackState::Playing && !artwork_uri.is_empty();
+                self.update(Event::HifiStatus(status));
+                if should_load_artwork {
+                    self.load_hifi_artwork_if_needed(&artwork_uri);
+                } else if artwork_uri.is_empty() {
+                    self.last_hifi_artwork_uri = None;
+                }
+            }
             Err(error) => eprintln!("failed to read Linn hifi status: {error:?}"),
+        }
+    }
+
+    fn load_hifi_artwork_if_needed(&mut self, uri: &str) {
+        if self.last_hifi_artwork_uri.as_deref() == Some(uri) {
+            return;
+        }
+
+        self.last_hifi_artwork_uri = Some(uri.to_owned());
+        match self.runtime.hifi_artwork(uri) {
+            Ok(artwork) => self.update(Event::HifiArtwork(artwork)),
+            Err(error) => eprintln!("failed to load Linn artwork {uri:?}: {error:?}"),
         }
     }
 

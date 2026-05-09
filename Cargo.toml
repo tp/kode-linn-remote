@@ -42,3 +42,5 @@ mplusfonts = { version = "0.3.4", default-features = false }
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
 objc2-foundation = "0.3.2"
+zune-core = { version = "0.5.1", default-features = false }
+zune-jpeg = { version = "0.5.15", default-features = false }
