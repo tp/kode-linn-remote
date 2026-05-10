@@ -12,7 +12,7 @@ use super::super::{
     AppContext,
     components::{
         ButtonTone, clear_rect, draw_button, draw_network_blocked_icon, draw_spinner,
-        draw_wifi_icon, ui_font,
+        draw_spinner_dots, draw_wifi_icon, ui_font,
     },
     geometry::horizontal_pair,
     painter::Painter,
@@ -38,6 +38,11 @@ pub(crate) struct Layout {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct State {
+    render_cache: RenderCache,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RenderCache {
     static_drawn: bool,
     network_status_drawn: Option<NetworkStatus>,
     spinner_phase_drawn: Option<u8>,
@@ -46,15 +51,23 @@ pub(crate) struct State {
 impl State {
     pub(crate) const fn new() -> Self {
         Self {
-            static_drawn: false,
-            network_status_drawn: None,
-            spinner_phase_drawn: None,
+            render_cache: RenderCache::new(),
         }
     }
 
     pub(crate) fn on_tick(&self, context: AppContext) -> bool {
         matches!(context.network_status, NetworkStatus::Connecting)
-            && self.spinner_phase_drawn != Some(spinner_phase(context.uptime_ms))
+            && self.render_cache.spinner_phase_drawn != Some(spinner_phase(context.uptime_ms))
+    }
+}
+
+impl RenderCache {
+    const fn new() -> Self {
+        Self {
+            static_drawn: false,
+            network_status_drawn: None,
+            spinner_phase_drawn: None,
+        }
     }
 }
 
@@ -104,10 +117,10 @@ where
     let mut painter = Painter::new(display, scratch);
     let static_chrome = StaticChrome {
         layout: *ui_layout,
-        already_drawn: state.static_drawn,
+        already_drawn: state.render_cache.static_drawn,
     };
     painter.draw(&static_chrome).map_err(RenderError::Draw)?;
-    state.static_drawn = true;
+    state.render_cache.static_drawn = true;
 
     let status_center = Point::new(ui_layout.title_origin.x + 189, NETWORK_STATUS_Y);
     let spinner_phase = spinner_phase(context.uptime_ms);
@@ -115,12 +128,12 @@ where
         center: status_center,
         status: context.network_status,
         spinner_phase,
-        previous_status: state.network_status_drawn,
-        previous_spinner_phase: state.spinner_phase_drawn,
+        previous_status: state.render_cache.network_status_drawn,
+        previous_spinner_phase: state.render_cache.spinner_phase_drawn,
     };
     painter.draw(&network_status).map_err(RenderError::Draw)?;
-    state.network_status_drawn = Some(context.network_status);
-    state.spinner_phase_drawn = match context.network_status {
+    state.render_cache.network_status_drawn = Some(context.network_status);
+    state.render_cache.spinner_phase_drawn = match context.network_status {
         NetworkStatus::Connecting => Some(spinner_phase),
         NetworkStatus::Online | NetworkStatus::Offline => None,
     };
@@ -217,6 +230,15 @@ impl Widget<()> for NetworkStatusWidget {
     where
         D: DrawTarget<Color = Rgb565>,
     {
+        // Phase-only update while still Connecting: skip the clear and just
+        // repaint the dots — they cover their previous selves exactly. The
+        // 180x96 clear was the source of the visible flicker.
+        let phase_only_update = matches!(self.status, NetworkStatus::Connecting)
+            && self.previous_status == Some(NetworkStatus::Connecting);
+        if phase_only_update {
+            return draw_spinner_dots(target, self.center, self.spinner_phase);
+        }
+
         clear_rect(target, self.bounds()).map_err(render_error_into_draw)?;
 
         match self.status {
