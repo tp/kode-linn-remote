@@ -1176,6 +1176,13 @@ fn escaped_closing_tag(tag: &str) -> heapless::String<48> {
 }
 
 fn copy_xml_text<const N: usize>(value: &str, output: &mut heapless::String<N>) {
+    let mut first_pass = heapless::String::<N>::new();
+    copy_xml_text_once(value, &mut first_pass);
+    output.clear();
+    copy_xml_text_once(first_pass.as_str(), output);
+}
+
+fn copy_xml_text_once<const N: usize>(value: &str, output: &mut heapless::String<N>) {
     let mut offset = 0;
     while offset < value.len() {
         if value.as_bytes()[offset] != b'&' {
@@ -1326,6 +1333,20 @@ mod tests {
             status.album_art_uri.as_str(),
             "https://static.qobuz.com/images/covers/thumb.jpg"
         );
+    }
+
+    #[test]
+    fn unescapes_nested_entities_in_metadata_text() {
+        let mut status = HifiStatus::empty();
+
+        apply_metadata(
+            &mut status,
+            r#"<DIDL-Lite><item><dc:title>Rock &amp;quot;Roll&amp;quot; &amp;amp; More</dc:title><upnp:album>Left &amp;lt;Right&amp;gt;</upnp:album><upnp:artist>John &amp;apos;Jack&amp;apos;</upnp:artist></item></DIDL-Lite>"#,
+        );
+
+        assert_eq!(status.title.as_str(), r#"Rock "Roll" & More"#);
+        assert_eq!(status.album.as_str(), "Left <Right>");
+        assert_eq!(status.artist.as_str(), "John 'Jack'");
     }
 
     #[test]
