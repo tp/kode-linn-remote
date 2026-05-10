@@ -209,7 +209,11 @@ where
 /// Paints just the eight dots — no clear. Each dot covers the same pixels as
 /// the previous frame's dot at the same position, so for a continuously
 /// animated spinner the clear is unnecessary work and visible flicker.
-pub(super) fn draw_spinner_dots<D>(display: &mut D, center: Point, phase: u8) -> Result<(), D::Error>
+pub(super) fn draw_spinner_dots<D>(
+    display: &mut D,
+    center: Point,
+    phase: u8,
+) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {

@@ -18,9 +18,7 @@ impl App {
         // and only happens on transitions.
         let current_screen = self.active_screen.screen();
         if self.last_rendered_screen != Some(current_screen) {
-            display
-                .clear(Rgb565::BLACK)
-                .map_err(RenderError::Draw)?;
+            display.clear(Rgb565::BLACK).map_err(RenderError::Draw)?;
             self.last_rendered_screen = Some(current_screen);
         }
 

@@ -63,8 +63,11 @@ where
         }
 
         let backend = SliceBackend(&mut self.scratch[..pixels]);
-        let mut framebuf =
-            FrameBuf::new(backend, bounds.size.width as usize, bounds.size.height as usize);
+        let mut framebuf = FrameBuf::new(
+            backend,
+            bounds.size.width as usize,
+            bounds.size.height as usize,
+        );
         // FrameBuf is Infallible, so the inner draw calls cannot fail.
         let _ = framebuf.clear(OLED_BLACK);
         {

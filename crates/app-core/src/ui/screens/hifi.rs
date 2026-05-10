@@ -847,14 +847,19 @@ impl Widget<Action> for ProgressBarWidget {
         self.rect
     }
 
+    fn use_scratch(&self) -> bool {
+        true
+    }
+
+    fn should_draw(&self) -> bool {
+        self.previous_duration != Some(self.duration)
+            || self.previous_filled_px != Some(self.filled_px)
+    }
+
     fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = Rgb565>,
     {
-        let duration_changed = self.previous_duration != Some(self.duration);
-        if !duration_changed && self.previous_filled_px == Some(self.filled_px) {
-            return Ok(());
-        }
         match draw_progress_bar(
             target,
             self.rect,
@@ -1115,11 +1120,7 @@ mod tests {
             calls: Cell::new(0),
         };
         spinner.draw(&mut t).unwrap();
-        assert_eq!(
-            t.calls.get(),
-            0,
-            "spinner should smart-skip on equal phase"
-        );
+        assert_eq!(t.calls.get(), 0, "spinner should smart-skip on equal phase");
     }
 
     #[test]
