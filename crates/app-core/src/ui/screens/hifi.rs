@@ -808,13 +808,18 @@ impl Widget<Action> for TimerDisplay {
         self.bounds
     }
 
+    fn use_scratch(&self) -> bool {
+        true
+    }
+
+    fn should_draw(&self) -> bool {
+        self.previous_elapsed != Some(self.elapsed)
+    }
+
     fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = Rgb565>,
     {
-        if self.previous_elapsed == Some(self.elapsed) {
-            return Ok(());
-        }
         let body_font = ui_font!(500);
         let body_style = BitmapFontStyleBuilder::new()
             .text_color(TEXT_SECONDARY)
