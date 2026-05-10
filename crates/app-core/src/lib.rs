@@ -363,6 +363,13 @@ mod tests {
         touch_point(ui::hifi_pin_2_button_center())
     }
 
+    fn hifi_status(playback: PlaybackState) -> HifiStatus {
+        let mut status = HifiStatus::empty();
+        status.title.push_str("Caroline").unwrap();
+        status.playback = playback;
+        status
+    }
+
     #[test]
     fn tick_updates_uptime() {
         let mut app = App::new();
@@ -491,8 +498,7 @@ mod tests {
     #[test]
     fn hifi_counts_down_while_playing() {
         let mut app = App::new_on_screen(Screen::HifiControl);
-        let mut status = HifiStatus::waiting();
-        status.playback = PlaybackState::Playing;
+        let mut status = hifi_status(PlaybackState::Playing);
         status.elapsed_seconds = 10;
         status.duration_seconds = 120;
         app.update(Event::HifiStatus(status));
@@ -538,8 +544,7 @@ mod tests {
     #[test]
     fn hifi_play_touch_requests_toggle_command_when_paused() {
         let mut app = App::new_on_screen(Screen::HifiControl);
-        let mut status = HifiStatus::waiting();
-        status.playback = PlaybackState::Paused;
+        let status = hifi_status(PlaybackState::Paused);
         app.update(Event::HifiStatus(status));
 
         let outcome = app.update(Event::TouchDown(hifi_play_touch()));
@@ -554,8 +559,7 @@ mod tests {
     #[test]
     fn hifi_play_touch_requests_toggle_command_while_playing() {
         let mut app = App::new_on_screen(Screen::HifiControl);
-        let mut status = HifiStatus::waiting();
-        status.playback = PlaybackState::Playing;
+        let status = hifi_status(PlaybackState::Playing);
         app.update(Event::HifiStatus(status));
 
         let outcome = app.update(Event::TouchDown(hifi_play_touch()));
@@ -570,8 +574,7 @@ mod tests {
     #[test]
     fn hifi_status_updates_screen() {
         let mut app = App::new_on_screen(Screen::HifiControl);
-        let mut status = HifiStatus::waiting();
-        status.playback = PlaybackState::Playing;
+        let mut status = hifi_status(PlaybackState::Playing);
         status.elapsed_seconds = 30;
         status.duration_seconds = 120;
         status.volume_percent = 42;
@@ -584,8 +587,7 @@ mod tests {
     #[test]
     fn hifi_stops_when_countdown_reaches_zero() {
         let mut app = App::new_on_screen(Screen::HifiControl);
-        let mut status = HifiStatus::waiting();
-        status.playback = PlaybackState::Playing;
+        let mut status = hifi_status(PlaybackState::Playing);
         status.elapsed_seconds = 119;
         status.duration_seconds = 120;
         app.update(Event::HifiStatus(status));

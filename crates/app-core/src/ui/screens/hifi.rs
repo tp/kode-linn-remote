@@ -38,7 +38,6 @@ const VOLUME_DIAMETER: u32 = 442;
 const VOLUME_START_DEGREES: f32 = 135.0;
 const VOLUME_SWEEP_DEGREES: f32 = 270.0;
 const VOLUME_STROKE_WIDTH: u32 = 8;
-const LOADING_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Layout {
@@ -59,13 +58,17 @@ pub(super) struct VolumeLayout {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct State {
-    status: HifiStatus,
-    artwork: Option<HifiArtwork>,
-    created_at_ms: u64,
+    data: ScreenData,
     loading: bool,
     last_second: u64,
     current_ms: u64,
     current_second: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScreenData {
+    status: HifiStatus,
+    artwork: Option<HifiArtwork>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,9 +88,7 @@ impl State {
         let current_second = uptime_ms / 1000;
 
         Self {
-            status: HifiStatus::waiting(),
-            artwork: None,
-            created_at_ms: uptime_ms,
+            data: ScreenData::empty(),
             loading: true,
             last_second: current_second,
             current_ms: uptime_ms,
@@ -98,20 +99,17 @@ impl State {
     pub(crate) fn on_tick(&mut self, uptime_ms: u64) -> bool {
         self.current_ms = uptime_ms;
         if self.loading {
-            let timed_out = uptime_ms.saturating_sub(self.created_at_ms) >= LOADING_TIMEOUT_MS;
-            if timed_out {
-                self.loading = false;
-                return true;
-            }
             self.current_second = uptime_ms / 1000;
             return true;
         }
 
-        if self.status.playback == PlaybackState::Buffering {
+        if self.data.status.playback == PlaybackState::Buffering {
             return true;
         }
 
-        if self.status.playback != PlaybackState::Playing || self.status.duration_seconds == 0 {
+        if self.data.status.playback != PlaybackState::Playing
+            || self.data.status.duration_seconds == 0
+        {
             return false;
         }
 
@@ -123,58 +121,32 @@ impl State {
             return false;
         }
 
-        self.status.elapsed_seconds = self
+        self.data.status.elapsed_seconds = self
+            .data
             .status
             .elapsed_seconds
             .saturating_add(elapsed as u32)
-            .min(self.status.duration_seconds);
+            .min(self.data.status.duration_seconds);
         self.last_second = current_second;
-        if self.status.elapsed_seconds >= self.status.duration_seconds {
-            self.status.playback = PlaybackState::Stopped;
+        if self.data.status.elapsed_seconds >= self.data.status.duration_seconds {
+            self.data.status.playback = PlaybackState::Stopped;
         }
         true
     }
 
     pub(crate) fn apply_status(&mut self, status: HifiStatus, uptime_ms: u64) -> bool {
         let was_loading = self.loading;
-        let has_live_content = has_live_content(&status);
-        if self
-            .artwork
-            .as_ref()
-            .is_some_and(|artwork| artwork.source_uri != status.album_art_uri)
-        {
-            self.artwork = None;
-        }
-
-        if self.status == status && (!was_loading || !has_live_content) {
-            return false;
-        }
-
-        self.status = status;
-        if has_live_content {
-            self.loading = false;
-        }
+        let changed = self.data.apply_status(status);
+        self.loading = !self.data.is_ready();
         self.current_ms = uptime_ms;
         let current_second = uptime_ms / 1000;
         self.current_second = current_second;
         self.last_second = current_second;
-        true
+        changed || was_loading != self.loading
     }
 
     pub(crate) fn apply_artwork(&mut self, artwork: HifiArtwork) -> bool {
-        if artwork.source_uri.is_empty()
-            || artwork.source_uri != self.status.album_art_uri
-            || artwork.pixels.len() != HIFI_ARTWORK_PIXELS
-        {
-            return false;
-        }
-
-        if self.artwork.as_ref() == Some(&artwork) {
-            return false;
-        }
-
-        self.artwork = Some(artwork);
-        true
+        self.data.apply_artwork(artwork) && !self.loading
     }
 
     pub(crate) fn handle_touch(
@@ -190,19 +162,64 @@ impl State {
     fn handle(&mut self, action: Action, uptime_ms: u64) -> Option<Command> {
         match action {
             Action::TogglePlayback => {
-                if playback_can_pause(self.status.playback) {
+                if playback_can_pause(self.data.status.playback) {
                     self.on_tick(uptime_ms);
-                    self.status.playback = PlaybackState::Paused;
+                    self.data.status.playback = PlaybackState::Paused;
                 } else {
                     let current_second = uptime_ms / 1000;
                     self.current_second = current_second;
                     self.last_second = current_second;
-                    self.status.playback = PlaybackState::Playing;
+                    self.data.status.playback = PlaybackState::Playing;
                 }
                 Some(Command::TogglePlayback)
             }
             Action::InvokePin(pin) => Some(Command::ActivatePreset { preset: pin }),
         }
+    }
+}
+
+impl ScreenData {
+    fn empty() -> Self {
+        Self {
+            status: HifiStatus::empty(),
+            artwork: None,
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        !self.status.title.is_empty() && self.status.playback != PlaybackState::Unknown
+    }
+
+    fn apply_status(&mut self, status: HifiStatus) -> bool {
+        let artwork_changed = if self
+            .artwork
+            .as_ref()
+            .is_some_and(|artwork| artwork.source_uri != status.album_art_uri)
+        {
+            self.artwork = None;
+            true
+        } else {
+            false
+        };
+        let status_changed = self.status != status;
+        self.status = status;
+        status_changed || artwork_changed
+    }
+
+    fn apply_artwork(&mut self, artwork: HifiArtwork) -> bool {
+        if artwork.source_uri.is_empty()
+            || artwork.source_uri != self.status.album_art_uri
+            || artwork.pixels.len() != HIFI_ARTWORK_PIXELS
+        {
+            return false;
+        }
+
+        if self.artwork.as_ref() == Some(&artwork) {
+            return false;
+        }
+
+        self.artwork = Some(artwork);
+        true
     }
 }
 
@@ -276,7 +293,7 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     if state.loading {
-        draw_volume(display, ui_layout, state.status.volume_percent)?;
+        draw_volume(display, ui_layout, state.data.status.volume_percent)?;
         draw_spinner(
             display,
             ui_layout.volume.center,
@@ -301,15 +318,17 @@ where
         .font(&body_font)
         .build();
 
-    draw_volume(display, ui_layout, state.status.volume_percent)?;
+    let data = &state.data;
+    let status = &data.status;
+
+    draw_volume(display, ui_layout, status.volume_percent)?;
     draw_play_pause_button(
         display,
         ui_layout.play_button,
-        state.status.playback,
+        status.playback,
         spinner_phase(state.current_ms),
-        state.artwork.as_ref().filter(|artwork| {
-            state.status.playback == PlaybackState::Playing
-                && artwork.source_uri == state.status.album_art_uri
+        data.artwork.as_ref().filter(|artwork| {
+            status.playback == PlaybackState::Playing && artwork.source_uri == status.album_art_uri
         }),
     )?;
     for (index, rect) in ui_layout.pin_buttons.iter().enumerate() {
@@ -324,14 +343,14 @@ where
     draw_duration(
         display,
         ui_layout.timer_origin,
-        Duration::from_secs(state.status.elapsed_seconds as u64),
+        Duration::from_secs(status.elapsed_seconds as u64),
         body_style.clone(),
     )?;
     draw_progress_bar(
         display,
         ui_layout.progress,
-        state.status.elapsed_seconds as u64,
-        state.status.duration_seconds as u64,
+        status.elapsed_seconds as u64,
+        status.duration_seconds as u64,
     )?;
 
     clear_rect(
@@ -342,7 +361,7 @@ where
         ),
     )?;
     Text::with_text_style(
-        non_empty_or(&state.status.title, "No track"),
+        status.title.as_str(),
         ui_layout.song_origin,
         song_style,
         centered_top_text_style,
@@ -358,7 +377,7 @@ where
         ),
     )?;
     Text::with_text_style(
-        non_empty_or(&state.status.artist, "Not playing"),
+        status.artist.as_str(),
         ui_layout.artist_origin,
         body_style,
         centered_top_text_style,
@@ -415,18 +434,6 @@ pub(crate) fn pin_1_button_center(bounds: Rectangle) -> embedded_graphics::geome
 #[cfg(test)]
 pub(crate) fn pin_2_button_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
     layout(bounds).pin_buttons[1].center()
-}
-
-fn non_empty_or<'a>(value: &'a str, fallback: &'static str) -> &'a str {
-    if value.is_empty() { fallback } else { value }
-}
-
-fn has_live_content(status: &HifiStatus) -> bool {
-    !status.title.is_empty()
-        || !status.artist.is_empty()
-        || status.duration_seconds > 0
-        || status.elapsed_seconds > 0
-        || status.playback != PlaybackState::Unknown
 }
 
 fn playback_can_pause(playback: PlaybackState) -> bool {
@@ -517,40 +524,37 @@ mod tests {
     #[test]
     fn state_advances_live_elapsed_time_while_playing() {
         let mut state = State::new(0);
-        let mut status = HifiStatus::waiting();
-        status.playback = PlaybackState::Playing;
+        let mut status = ready_status(PlaybackState::Playing);
         status.duration_seconds = 120;
         status.elapsed_seconds = 10;
         state.apply_status(status, 0);
 
         assert!(state.on_tick(1_000));
-        assert_eq!(state.status.elapsed_seconds, 11);
+        assert_eq!(state.data.status.elapsed_seconds, 11);
     }
 
     #[test]
     fn paused_state_does_not_advance_elapsed_time() {
         let mut state = State::new(0);
-        let mut status = HifiStatus::waiting();
-        status.playback = PlaybackState::Paused;
+        let mut status = ready_status(PlaybackState::Paused);
         status.duration_seconds = 120;
         status.elapsed_seconds = 10;
         state.apply_status(status, 0);
 
         assert!(!state.on_tick(5_000));
-        assert_eq!(state.status.elapsed_seconds, 10);
+        assert_eq!(state.data.status.elapsed_seconds, 10);
     }
 
     #[test]
     fn buffering_state_animates_without_advancing_elapsed_time() {
         let mut state = State::new(0);
-        let mut status = HifiStatus::waiting();
-        status.playback = PlaybackState::Buffering;
+        let mut status = ready_status(PlaybackState::Buffering);
         status.duration_seconds = 120;
         status.elapsed_seconds = 10;
         state.apply_status(status, 0);
 
         assert!(state.on_tick(120));
-        assert_eq!(state.status.elapsed_seconds, 10);
+        assert_eq!(state.data.status.elapsed_seconds, 10);
     }
 
     #[test]
@@ -562,16 +566,45 @@ mod tests {
 
         let mut status = HifiStatus::empty();
         status.title.push_str("Caroline").unwrap();
-        assert!(state.apply_status(status, 200));
+        assert!(state.apply_status(status.clone(), 200));
+        assert!(state.loading);
+
+        status.playback = PlaybackState::Playing;
+        assert!(state.apply_status(status, 300));
         assert!(!state.loading);
     }
 
     #[test]
-    fn loading_spinner_times_out() {
+    fn loading_spinner_does_not_time_out_without_major_content() {
         let mut state = State::new(0);
+        let mut status = HifiStatus::empty();
+        status.playback = PlaybackState::Playing;
+        status.duration_seconds = 120;
+        status.elapsed_seconds = 10;
 
-        assert!(state.on_tick(LOADING_TIMEOUT_MS));
+        assert!(state.apply_status(status, 200));
+        assert!(state.loading);
+        assert!(state.on_tick(60_000));
+        assert!(state.loading);
+    }
+
+    #[test]
+    fn incomplete_status_returns_to_loading() {
+        let mut state = State::new(0);
+        state.apply_status(ready_status(PlaybackState::Playing), 100);
         assert!(!state.loading);
+
+        let mut status = HifiStatus::empty();
+        status.playback = PlaybackState::Playing;
+        assert!(state.apply_status(status, 200));
+        assert!(state.loading);
+    }
+
+    fn ready_status(playback: PlaybackState) -> HifiStatus {
+        let mut status = HifiStatus::empty();
+        status.title.push_str("Caroline").unwrap();
+        status.playback = playback;
+        status
     }
 }
 
