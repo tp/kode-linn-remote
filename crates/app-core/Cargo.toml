@@ -7,5 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 embedded-graphics.workspace = true
+embedded-graphics-framebuf.workspace = true
 heapless.workspace = true
 mplusfonts.workspace = true

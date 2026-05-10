@@ -1,8 +1,12 @@
 mod components;
 mod geometry;
+mod painter;
 mod render;
 pub(crate) mod screens;
 mod style;
+mod widget;
+
+pub use painter::RECOMMENDED_SCRATCH_PIXELS;
 
 use embedded_graphics::primitives::Rectangle;
 pub(crate) use geometry::SCREEN_BOUNDS;

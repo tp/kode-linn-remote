@@ -5,6 +5,7 @@ use heapless::{String, Vec};
 
 mod ui;
 
+pub use ui::RECOMMENDED_SCRATCH_PIXELS;
 pub use ui::screens::hifi::Command as HifiCommand;
 
 pub const DISPLAY_SIZE: Size = Size::new(466, 466);
@@ -159,6 +160,7 @@ pub struct App {
     interaction_count: u32,
     ui_layouts: ui::ScreenLayouts,
     active_screen: ActiveScreen,
+    pub(crate) last_rendered_screen: Option<Screen>,
 }
 
 #[derive(Debug)]
@@ -198,6 +200,7 @@ impl App {
             interaction_count: 0,
             ui_layouts: ui::ScreenLayouts::new(ui::SCREEN_BOUNDS),
             active_screen: ActiveScreen::new(screen, 0),
+            last_rendered_screen: None,
         }
     }
 
@@ -441,12 +444,13 @@ mod tests {
 
     #[test]
     fn render_draws_to_rgb565_display() {
-        let app = App::new();
+        let mut app = App::new();
         let mut display = MockDisplay::<Rgb565>::new();
         display.set_allow_overdraw(true);
         display.set_allow_out_of_bounds_drawing(true);
+        let mut scratch = test_scratch();
 
-        app.render(&mut display).unwrap();
+        app.render(&mut display, &mut scratch).unwrap();
     }
 
     #[test]
@@ -634,20 +638,26 @@ mod tests {
             let mut display = MockDisplay::<Rgb565>::new();
             display.set_allow_overdraw(true);
             display.set_allow_out_of_bounds_drawing(true);
+            let mut scratch = test_scratch();
 
-            app.render(&mut display).unwrap();
+            app.render(&mut display, &mut scratch).unwrap();
         }
     }
 
     #[test]
     fn render_draws_all_screens() {
         for screen in [Screen::Launcher, Screen::Stopwatch, Screen::HifiControl] {
-            let app = App::new_on_screen(screen);
+            let mut app = App::new_on_screen(screen);
             let mut display = MockDisplay::<Rgb565>::new();
             display.set_allow_overdraw(true);
             display.set_allow_out_of_bounds_drawing(true);
+            let mut scratch = test_scratch();
 
-            app.render(&mut display).unwrap();
+            app.render(&mut display, &mut scratch).unwrap();
         }
+    }
+
+    fn test_scratch() -> std::vec::Vec<Rgb565> {
+        std::vec![Rgb565::BLACK; RECOMMENDED_SCRATCH_PIXELS]
     }
 }

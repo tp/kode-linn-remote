@@ -5,9 +5,15 @@ mod display;
 mod net;
 mod touch;
 
+extern crate alloc;
+
+use alloc::vec;
+use alloc::vec::Vec;
+
 use app_config::{AppConfig, WifiConfig};
 use app_core::{
-    App, Command, Event, HIFI_URI_LEN, HifiStatus, NetworkStatus, PlaybackState, Screen,
+    App, Command, Event, HIFI_URI_LEN, HifiStatus, NetworkStatus, PlaybackState,
+    RECOMMENDED_SCRATCH_PIXELS, Screen,
 };
 use app_runtime::lpec::{Error as LpecError, LpecSession, load_artwork};
 use app_runtime::net::Endpoint;
@@ -125,7 +131,16 @@ fn main() -> ! {
         println!("display: initial clear failed: {}", error);
     }
 
-    match app.render(&mut display) {
+    // Scratch buffer for the painter's text-band fast path. Lives on the heap
+    // — vec! goes straight to the allocator, avoiding a 30+ KB stack alloc.
+    let mut scratch: Vec<Rgb565> = vec![Rgb565::BLACK; RECOMMENDED_SCRATCH_PIXELS];
+    println!(
+        "display: scratch buffer {} px ({} bytes)",
+        scratch.len(),
+        scratch.len() * 2
+    );
+
+    match app.render(&mut display, &mut scratch) {
         Ok(()) => {
             println!("display: initial frame rendered");
             match display.set_brightness(0xff) {
@@ -154,6 +169,7 @@ fn main() -> ! {
         let _ = render_app(
             &mut app,
             &mut display,
+            &mut scratch,
             &mut rendered_screen,
             render_requested,
         );
@@ -170,6 +186,7 @@ fn main() -> ! {
             let _ = render_app(
                 &mut app,
                 &mut display,
+                &mut scratch,
                 &mut rendered_screen,
                 render_requested,
             );
@@ -201,6 +218,7 @@ fn main() -> ! {
             let _ = render_app(
                 &mut app,
                 &mut display,
+                &mut scratch,
                 &mut rendered_screen,
                 render_requested,
             );
@@ -249,6 +267,7 @@ fn main() -> ! {
         frame_rendered |= render_app(
             &mut app,
             &mut display,
+            &mut scratch,
             &mut rendered_screen,
             render_requested,
         );
@@ -280,6 +299,7 @@ fn main() -> ! {
         frame_rendered |= render_app(
             &mut app,
             &mut display,
+            &mut scratch,
             &mut rendered_screen,
             render_requested,
         );
@@ -293,6 +313,7 @@ fn main() -> ! {
         frame_rendered |= render_app(
             &mut app,
             &mut display,
+            &mut scratch,
             &mut rendered_screen,
             artwork_render_requested,
         );
@@ -384,6 +405,7 @@ enum WifiConnection<'d> {
 fn render_app<D>(
     app: &mut App,
     display: &mut D,
+    scratch: &mut [Rgb565],
     rendered_screen: &mut Screen,
     render_requested: bool,
 ) -> bool
@@ -394,16 +416,10 @@ where
         return false;
     }
 
-    let current_screen = app.screen();
-    if current_screen != *rendered_screen {
-        if display.clear(Rgb565::BLACK).is_err() {
-            println!("display: screen clear failed");
-        }
-    }
-
-    match app.render(display) {
+    // Screen-change clear is handled inside App::render now.
+    match app.render(display, scratch) {
         Ok(()) => {
-            *rendered_screen = current_screen;
+            *rendered_screen = app.screen();
             println!("display: frame rendered");
             true
         }

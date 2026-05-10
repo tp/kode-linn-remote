@@ -211,9 +211,10 @@ fn network_row(bounds: Rectangle) -> NetworkRowLayout {
 }
 
 pub(crate) fn render<D>(
-    state: &State,
+    state: &mut State,
     context: AppContext,
     display: &mut D,
+    _scratch: &mut [Rgb565],
     ui_layout: &Layout,
 ) -> Result<(), RenderError<D::Error>>
 where

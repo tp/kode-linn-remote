@@ -8,7 +8,8 @@ use std::{
 
 use app_config::AppConfig;
 use app_core::{
-    App, Command, DISPLAY_SIZE, Event, NetworkStatus, PlaybackState, Screen, TouchPoint,
+    App, Command, DISPLAY_SIZE, Event, NetworkStatus, PlaybackState, RECOMMENDED_SCRATCH_PIXELS,
+    Screen, TouchPoint,
 };
 use app_runtime::{AppRuntime, host_tcp::HostTcpConnector, lpec::LpecHifi};
 use embedded_graphics::{
@@ -181,6 +182,7 @@ struct NativeSimulator {
     app: App,
     app_framebuffer: Framebuffer,
     output_framebuffer: Framebuffer,
+    scratch: Vec<Rgb565>,
     app_frame_dirty: bool,
     output_frame_dirty: bool,
     display_shape: DisplayShape,
@@ -202,6 +204,7 @@ impl NativeSimulator {
             app,
             app_framebuffer: Framebuffer::new(DISPLAY_SIZE),
             output_framebuffer: Framebuffer::new(DISPLAY_SIZE),
+            scratch: vec![Rgb565::BLACK; RECOMMENDED_SCRATCH_PIXELS],
             app_frame_dirty: true,
             output_frame_dirty: true,
             display_shape: DisplayShape::Circle,
@@ -318,7 +321,7 @@ impl NativeSimulator {
 
         if self.app_frame_dirty {
             self.app
-                .render(&mut self.app_framebuffer)
+                .render(&mut self.app_framebuffer, &mut self.scratch)
                 .expect("app rendering should succeed");
             self.app_frame_dirty = false;
             self.render_stats.record_core_frame_rendered();

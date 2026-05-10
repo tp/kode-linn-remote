@@ -77,9 +77,10 @@ fn hit_test(layout: &Layout, point: Point) -> Option<Screen> {
 }
 
 pub(crate) fn render<D>(
-    _state: &State,
+    _state: &mut State,
     context: AppContext,
     display: &mut D,
+    _scratch: &mut [Rgb565],
     ui_layout: &Layout,
 ) -> Result<(), RenderError<D::Error>>
 where

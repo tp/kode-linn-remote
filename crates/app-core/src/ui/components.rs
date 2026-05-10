@@ -203,7 +203,16 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     clear_spinner(display, center)?;
+    draw_spinner_dots(display, center, phase).map_err(RenderError::Draw)
+}
 
+/// Paints just the eight dots — no clear. Each dot covers the same pixels as
+/// the previous frame's dot at the same position, so for a continuously
+/// animated spinner the clear is unnecessary work and visible flicker.
+pub(super) fn draw_spinner_dots<D>(display: &mut D, center: Point, phase: u8) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
     const OFFSETS: [Point; SPINNER_DOT_COUNT as usize] = [
         Point::new(0, -32),
         Point::new(23, -23),
@@ -230,8 +239,7 @@ where
         let color = COLORS[(index + phase) % COLORS.len()];
         Circle::with_center(center + OFFSETS[index], 18)
             .into_styled(PrimitiveStyle::with_fill(color))
-            .draw(display)
-            .map_err(RenderError::Draw)?;
+            .draw(display)?;
     }
 
     Ok(())
