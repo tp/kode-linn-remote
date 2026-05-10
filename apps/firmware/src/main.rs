@@ -85,7 +85,13 @@ fn main() -> ! {
     };
 
     match app.render(&mut display) {
-        Ok(()) => println!("display: initial frame rendered"),
+        Ok(()) => {
+            println!("display: initial frame rendered");
+            match display.set_brightness(0xff) {
+                Ok(()) => println!("display: brightness enabled"),
+                Err(error) => println!("display: brightness enable failed: {}", error),
+            }
+        }
         Err(_) => println!("display: initial render failed"),
     }
 

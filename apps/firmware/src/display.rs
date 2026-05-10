@@ -23,12 +23,17 @@ use crate::wait_millis;
 const WIDTH: usize = DISPLAY_SIZE.width as usize;
 const HEIGHT: usize = DISPLAY_SIZE.height as usize;
 
-const LCD_SPI_MHZ: u32 = 20;
+const LCD_SPI_MHZ: u32 = 40;
 const LCD_X_GAP: u16 = 6;
 const LCD_Y_GAP: u16 = 0;
+
+// The CO5300 path on this board only behaves reliably when color writes use
+// even-aligned windows with two scanlines. Keep the transfer buffer at 64 bytes,
+// which fits the non-DMA SPI FIFO while still batching text/glyph spans.
 const MAX_PIXELS_PER_WRITE: usize = 16;
 const MIN_WRITE_ROWS: usize = 2;
 const WRITE_BUFFER_BYTES: usize = MAX_PIXELS_PER_WRITE * MIN_WRITE_ROWS * 2;
+const ROW_BUFFER_PIXELS: usize = WIDTH * MIN_WRITE_ROWS;
 
 const OPCODE_WRITE_COMMAND: u16 = 0x02;
 const OPCODE_WRITE_COLOR: u16 = 0x32;
@@ -74,25 +79,6 @@ pub struct AmoledDisplay<'d> {
     spi: Spi<'d, Blocking>,
     cs: Output<'d>,
     reset: Output<'d>,
-    pending: PendingRun,
-}
-
-struct PendingRun {
-    x: u16,
-    y: u16,
-    len: usize,
-    bytes: [u8; WRITE_BUFFER_BYTES],
-}
-
-impl PendingRun {
-    const fn new() -> Self {
-        Self {
-            x: 0,
-            y: 0,
-            len: 0,
-            bytes: [0; WRITE_BUFFER_BYTES],
-        }
-    }
 }
 
 impl<'d> AmoledDisplay<'d> {
@@ -120,23 +106,20 @@ impl<'d> AmoledDisplay<'d> {
 
         let cs = Output::new(cs, Level::High, OutputConfig::default());
         let reset = Output::new(reset, Level::High, OutputConfig::default());
-        let mut display = Self {
-            spi,
-            cs,
-            reset,
-            pending: PendingRun::new(),
-        };
+        let mut display = Self { spi, cs, reset };
         display.reset_panel();
         display.init_panel()?;
         Ok(display)
+    }
+
+    pub fn set_brightness(&mut self, brightness: u8) -> Result<(), DisplayError> {
+        self.write_command(CMD_WRITE_DISPLAY_BRIGHTNESS, &[brightness])
     }
 
     fn draw_pixel(&mut self, point: Point, color: Rgb565) -> Result<(), DisplayError> {
         if point.x < 0 || point.y < 0 || point.x >= WIDTH as i32 || point.y >= HEIGHT as i32 {
             return Ok(());
         }
-
-        self.flush_pending()?;
 
         let x = ((point.x as u16) & !1).min((WIDTH - 2) as u16);
         let y = ((point.y as u16) & !1).min((HEIGHT - 2) as u16);
@@ -152,36 +135,98 @@ impl<'d> AmoledDisplay<'d> {
         self.write_color(CMD_MEMORY_WRITE, &bytes)
     }
 
-    #[allow(dead_code)]
-    fn push_pending_color(&mut self, color: Rgb565) {
-        let offset = self.pending.len * 2;
-        let [high, low] = color.into_storage().to_be_bytes();
-        self.pending.bytes[offset] = high;
-        self.pending.bytes[offset + 1] = low;
-        self.pending.len += 1;
-    }
-
-    fn flush_pending(&mut self) -> Result<(), DisplayError> {
-        if self.pending.len == 0 {
+    fn fill_contiguous_pixels<I>(&mut self, area: &Rectangle, colors: I) -> Result<(), DisplayError>
+    where
+        I: IntoIterator<Item = Rgb565>,
+    {
+        let visible = area.intersection(&self.bounding_box());
+        if visible.is_zero_sized() || area.size.width == 0 || area.size.height == 0 {
             return Ok(());
         }
 
-        let x_start = self.pending.x;
-        let y = self.pending.y;
-        let x_end = x_start + self.pending.len as u16 - 1;
-        let byte_count = self.pending.len * 2;
-        let mut bytes = [0_u8; WRITE_BUFFER_BYTES];
-        bytes[..byte_count].copy_from_slice(&self.pending.bytes[..byte_count]);
-        self.pending.len = 0;
+        let source_width = area.size.width as usize;
+        let source_height = area.size.height as usize;
+        let visible_width = visible.size.width as usize;
+        let visible_x_offset = (visible.top_left.x - area.top_left.x) as usize;
+        let skip_after_visible = source_width.saturating_sub(visible_x_offset + visible_width);
+        let visible_top = visible.top_left.y;
+        let visible_bottom = visible.top_left.y + visible.size.height as i32;
+        let mut colors = colors.into_iter();
+        let mut row_pixels = [0_u16; ROW_BUFFER_PIXELS];
+        let mut pending_y = 0_u16;
+        let mut pending_row_mask = 0_u8;
 
-        self.set_window(x_start, y, x_end, y)?;
-        self.write_color(CMD_MEMORY_WRITE, &bytes[..byte_count])?;
+        for source_row in 0..source_height {
+            let y = area.top_left.y + source_row as i32;
+            if y < visible_top || y >= visible_bottom {
+                if !skip_colors(&mut colors, source_width) {
+                    return Ok(());
+                }
+                continue;
+            }
+
+            if !skip_colors(&mut colors, visible_x_offset) {
+                return Ok(());
+            }
+
+            let y = y as u16;
+            let aligned_y = y & !1;
+            let row_index = (y & 1) as usize;
+
+            if pending_row_mask != 0 && pending_y != aligned_y {
+                self.write_color_rows(
+                    visible.top_left.x as u16,
+                    pending_y,
+                    visible_width,
+                    pending_row_mask,
+                    &row_pixels,
+                )?;
+                pending_row_mask = 0;
+            }
+
+            if pending_row_mask == 0 {
+                pending_y = aligned_y;
+            }
+
+            let row_offset = row_index * WIDTH;
+            for x in 0..visible_width {
+                let Some(color) = colors.next() else {
+                    return Ok(());
+                };
+                row_pixels[row_offset + x] = color.into_storage();
+            }
+
+            if !skip_colors(&mut colors, skip_after_visible) {
+                return Ok(());
+            }
+
+            pending_row_mask |= 1 << row_index;
+            if pending_row_mask == 0b11 {
+                self.write_color_rows(
+                    visible.top_left.x as u16,
+                    pending_y,
+                    visible_width,
+                    pending_row_mask,
+                    &row_pixels,
+                )?;
+                pending_row_mask = 0;
+            }
+        }
+
+        if pending_row_mask != 0 {
+            self.write_color_rows(
+                visible.top_left.x as u16,
+                pending_y,
+                visible_width,
+                pending_row_mask,
+                &row_pixels,
+            )?;
+        }
+
         Ok(())
     }
 
     fn fill_rect(&mut self, area: &Rectangle, color: Rgb565) -> Result<(), DisplayError> {
-        self.flush_pending()?;
-
         let x_start = (area.top_left.x.max(0) as usize) & !1;
         let y_start = (area.top_left.y.max(0) as usize) & !1;
         let x_end = align_up_2(
@@ -223,6 +268,58 @@ impl<'d> AmoledDisplay<'d> {
         Ok(())
     }
 
+    fn write_color_rows(
+        &mut self,
+        x_start: u16,
+        y_start: u16,
+        width: usize,
+        row_mask: u8,
+        pixels: &[u16; ROW_BUFFER_PIXELS],
+    ) -> Result<(), DisplayError> {
+        let aligned_x_start = x_start & !1;
+        let x_offset = (x_start - aligned_x_start) as usize;
+        let aligned_width = align_up_2(width + x_offset).min(WIDTH - aligned_x_start as usize);
+        let mut bytes = [0_u8; WRITE_BUFFER_BYTES];
+        let mut x = 0;
+
+        while x < aligned_width {
+            let run_pixels = (aligned_width - x).min(MAX_PIXELS_PER_WRITE);
+            for row in 0..MIN_WRITE_ROWS {
+                // If a glyph span only provides one row of the required two-row
+                // panel window, duplicate it into the missing row. This preserves
+                // panel alignment without inventing unrelated tile contents.
+                let source_row = if (row_mask & (1 << row)) != 0 {
+                    row
+                } else {
+                    usize::from(row_mask.trailing_zeros() as u8)
+                };
+
+                for column in 0..run_pixels {
+                    let source_x = (x + column)
+                        .saturating_sub(x_offset)
+                        .min(width.saturating_sub(1));
+                    let pixel = pixels[source_row * WIDTH + source_x];
+                    let byte_offset = (row * run_pixels + column) * 2;
+                    let [high, low] = pixel.to_be_bytes();
+                    bytes[byte_offset] = high;
+                    bytes[byte_offset + 1] = low;
+                }
+            }
+
+            let byte_count = run_pixels * MIN_WRITE_ROWS * 2;
+            self.set_window(
+                aligned_x_start + x as u16,
+                y_start,
+                aligned_x_start + (x + run_pixels - 1) as u16,
+                y_start + (MIN_WRITE_ROWS - 1) as u16,
+            )?;
+            self.write_color(CMD_MEMORY_WRITE, &bytes[..byte_count])?;
+            x += run_pixels;
+        }
+
+        Ok(())
+    }
+
     fn reset_panel(&mut self) {
         self.reset.set_low();
         wait_millis(10);
@@ -245,8 +342,6 @@ impl<'d> AmoledDisplay<'d> {
         wait_millis(1);
         self.write_command(CMD_DISPLAY_ON, &[])?;
         wait_millis(10);
-        self.write_command(CMD_WRITE_DISPLAY_BRIGHTNESS, &[0xff])?;
-        self.write_command(CMD_DISPLAY_ON, &[])?;
 
         Ok(())
     }
@@ -323,6 +418,19 @@ const fn align_up_2(value: usize) -> usize {
     (value + 1) & !1
 }
 
+fn skip_colors<I>(colors: &mut I, count: usize) -> bool
+where
+    I: Iterator<Item = Rgb565>,
+{
+    for _ in 0..count {
+        if colors.next().is_none() {
+            return false;
+        }
+    }
+
+    true
+}
+
 impl DrawTarget for AmoledDisplay<'_> {
     type Color = Rgb565;
     type Error = DisplayError;
@@ -335,7 +443,14 @@ impl DrawTarget for AmoledDisplay<'_> {
             self.draw_pixel(point, color)?;
         }
 
-        self.flush_pending()
+        Ok(())
+    }
+
+    fn fill_contiguous<I>(&mut self, area: &Rectangle, colors: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Self::Color>,
+    {
+        self.fill_contiguous_pixels(area, colors)
     }
 
     fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
