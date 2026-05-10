@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod artwork_pool;
 mod display;
 mod net;
 mod touch;
@@ -11,17 +12,19 @@ use alloc::vec;
 use alloc::vec::Vec;
 use app_config::{AppConfig, WifiConfig};
 use app_core::{
-    App, ArtworkPixel, Command, Event, HIFI_ARTWORK_PIXELS, HIFI_URI_LEN, HifiArtwork, HifiCommand,
-    HifiStatus, NetworkStatus, PlaybackState, RECOMMENDED_SCRATCH_PIXELS, Screen,
+    App, Command, Event, HIFI_URI_LEN, HifiArtwork, HifiCommand, HifiStatus, NetworkStatus,
+    PlaybackState, RECOMMENDED_SCRATCH_PIXELS, Screen,
 };
 use app_runtime::lpec::{
     ARTWORK_DECODE_BUFFER_BYTES, ARTWORK_HTTP_BUFFER_BYTES, Error as LpecError, LpecSession,
     load_artwork_with_buffers_into,
 };
 use app_runtime::net::Endpoint;
+use artwork_pool::ArtworkPool;
 use board_waveshare_c6::{BOARD_NAME, DISPLAY_SIZE, peripherals};
 use display::AmoledDisplay;
 use embassy_executor::Spawner;
+use embassy_net::StackResources;
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex,
     channel::{Channel, TryReceiveError},
@@ -42,7 +45,11 @@ use esp_radio::wifi::{
     Config as WifiRadioConfig, ControllerConfig, DisconnectReason, Interfaces, WifiController,
     WifiError, ap::AccessPointInfo, scan::ScanConfig, sta::StationConfig,
 };
-use net::{FirmwareNetError, FirmwareNetwork};
+use net::{
+    ARTWORK_RX_BUFFER_BYTES, ARTWORK_TX_BUFFER_BYTES, FirmwareNetError, FirmwareNetwork,
+    NetBuffers, TCP_RX_BUFFER_BYTES, TCP_TX_BUFFER_BYTES,
+};
+use static_cell::StaticCell;
 use touch::{FT6146_ADDRESS, TouchController};
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -351,7 +358,29 @@ async fn firmware_runtime_task(wifi: WIFI<'static>, config: WifiConfig, endpoint
             interfaces,
         } => {
             let _controller = controller;
-            let mut network = FirmwareNetwork::new(interfaces.station);
+            // Statically reserve every long-lived buffer the network stack and
+            // artwork loader need. `StaticCell::init` panics if called twice,
+            // which is fine — `firmware_runtime_task` is spawned exactly once.
+            static NET_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+            static LPEC_RX: StaticCell<[u8; TCP_RX_BUFFER_BYTES]> = StaticCell::new();
+            static LPEC_TX: StaticCell<[u8; TCP_TX_BUFFER_BYTES]> = StaticCell::new();
+            static ARTWORK_RX: StaticCell<[u8; ARTWORK_RX_BUFFER_BYTES]> = StaticCell::new();
+            static ARTWORK_TX: StaticCell<[u8; ARTWORK_TX_BUFFER_BYTES]> = StaticCell::new();
+            static HTTP_BUFFER: StaticCell<[u8; ARTWORK_HTTP_BUFFER_BYTES]> = StaticCell::new();
+            static DECODE_BUFFER: StaticCell<[u8; ARTWORK_DECODE_BUFFER_BYTES]> = StaticCell::new();
+
+            let buffers = NetBuffers {
+                resources: NET_RESOURCES.init(StackResources::new()),
+                lpec_rx: LPEC_RX.init([0; TCP_RX_BUFFER_BYTES]),
+                lpec_tx: LPEC_TX.init([0; TCP_TX_BUFFER_BYTES]),
+                artwork_rx: ARTWORK_RX.init([0; ARTWORK_RX_BUFFER_BYTES]),
+                artwork_tx: ARTWORK_TX.init([0; ARTWORK_TX_BUFFER_BYTES]),
+            };
+            let mut network = FirmwareNetwork::new(interfaces.station, buffers);
+            let http_buffer = HTTP_BUFFER.init([0; ARTWORK_HTTP_BUFFER_BYTES]);
+            let decode_buffer = DECODE_BUFFER.init([0; ARTWORK_DECODE_BUFFER_BYTES]);
+            let mut artwork_pool = ArtworkPool::new();
+
             loop {
                 match network.poll_config_up() {
                     Ok(true) => {
@@ -359,7 +388,14 @@ async fn firmware_runtime_task(wifi: WIFI<'static>, config: WifiConfig, endpoint
                             println!("net: dhcp address {}", config.address);
                         }
                         send_app_event(Event::NetworkStatus(NetworkStatus::Online)).await;
-                        hifi_runtime_loop(&mut network, endpoint).await;
+                        hifi_runtime_loop(
+                            &mut network,
+                            endpoint,
+                            http_buffer,
+                            decode_buffer,
+                            &mut artwork_pool,
+                        )
+                        .await;
                     }
                     Ok(false) => {
                         Timer::after(EmbassyDuration::from_millis(TOUCH_POLL_MS)).await;
@@ -378,13 +414,18 @@ async fn firmware_runtime_task(wifi: WIFI<'static>, config: WifiConfig, endpoint
     }
 }
 
-async fn hifi_runtime_loop(network: &mut FirmwareNetwork, endpoint: Endpoint) -> ! {
+async fn hifi_runtime_loop(
+    network: &mut FirmwareNetwork,
+    endpoint: Endpoint,
+    http_buffer: &mut [u8],
+    decode_buffer: &mut [u8],
+    artwork_pool: &mut ArtworkPool,
+) -> ! {
     let mut hifi_active = false;
     let mut next_lpec_event_poll_at = EmbassyInstant::now();
     let mut lpec_session = LpecSession::new();
     let mut last_hifi_artwork_uri = heapless::String::<HIFI_URI_LEN>::new();
     let mut pending_hifi_artwork_uri = heapless::String::<HIFI_URI_LEN>::new();
-    let mut artwork_buffer_slot = false;
 
     loop {
         let mut commands = heapless::Vec::<HifiCommand, 4>::new();
@@ -435,7 +476,9 @@ async fn hifi_runtime_loop(network: &mut FirmwareNetwork, endpoint: Endpoint) ->
             network,
             &mut last_hifi_artwork_uri,
             &mut pending_hifi_artwork_uri,
-            &mut artwork_buffer_slot,
+            http_buffer,
+            decode_buffer,
+            artwork_pool,
         ) {
             send_app_event(Event::HifiArtwork(artwork)).await;
         }
@@ -608,7 +651,9 @@ fn load_pending_hifi_artwork(
     network: &mut FirmwareNetwork,
     last_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
     pending_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
-    artwork_buffer_slot: &mut bool,
+    http_buffer: &mut [u8],
+    decode_buffer: &mut [u8],
+    artwork_pool: &mut ArtworkPool,
 ) -> Option<HifiArtwork> {
     if pending_artwork_uri.is_empty() {
         return None;
@@ -617,36 +662,29 @@ fn load_pending_hifi_artwork(
     let mut uri = heapless::String::<HIFI_URI_LEN>::new();
     let _ = uri.push_str(pending_artwork_uri.as_str());
     pending_artwork_uri.clear();
-    load_hifi_artwork(network, last_artwork_uri, uri.as_str(), artwork_buffer_slot)
+    load_hifi_artwork(
+        network,
+        last_artwork_uri,
+        uri.as_str(),
+        http_buffer,
+        decode_buffer,
+        artwork_pool,
+    )
 }
 
 fn load_hifi_artwork(
     network: &mut FirmwareNetwork,
     last_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
     uri: &str,
-    artwork_buffer_slot: &mut bool,
+    http_buffer: &mut [u8],
+    decode_buffer: &mut [u8],
+    artwork_pool: &mut ArtworkPool,
 ) -> Option<HifiArtwork> {
-    static mut ARTWORK_HTTP_BUFFER: [u8; ARTWORK_HTTP_BUFFER_BYTES] =
-        [0; ARTWORK_HTTP_BUFFER_BYTES];
-    static mut ARTWORK_DECODE_BUFFER: [u8; ARTWORK_DECODE_BUFFER_BYTES] =
-        [0; ARTWORK_DECODE_BUFFER_BYTES];
-    static mut ARTWORK_PIXELS_A: [ArtworkPixel; HIFI_ARTWORK_PIXELS] =
-        [ArtworkPixel::BLACK; HIFI_ARTWORK_PIXELS];
-    static mut ARTWORK_PIXELS_B: [ArtworkPixel; HIFI_ARTWORK_PIXELS] =
-        [ArtworkPixel::BLACK; HIFI_ARTWORK_PIXELS];
-
     last_artwork_uri.clear();
     let _ = last_artwork_uri.push_str(uri);
     println!("linn: artwork load {}", uri);
 
-    let http_buffer = unsafe { &mut *core::ptr::addr_of_mut!(ARTWORK_HTTP_BUFFER) };
-    let decode_buffer = unsafe { &mut *core::ptr::addr_of_mut!(ARTWORK_DECODE_BUFFER) };
-    let pixels = if *artwork_buffer_slot {
-        unsafe { &mut *core::ptr::addr_of_mut!(ARTWORK_PIXELS_A) }
-    } else {
-        unsafe { &mut *core::ptr::addr_of_mut!(ARTWORK_PIXELS_B) }
-    };
-    *artwork_buffer_slot = !*artwork_buffer_slot;
+    let pixels = artwork_pool.acquire();
 
     match load_artwork_with_buffers_into(network, uri, http_buffer, decode_buffer, pixels) {
         Ok(artwork) => Some(artwork),

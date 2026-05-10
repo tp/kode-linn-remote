@@ -12,10 +12,10 @@ use embassy_net::{
 use embassy_time::{Duration, Instant, Timer};
 use esp_radio::wifi::Interface;
 
-const TCP_RX_BUFFER_BYTES: usize = 2048;
-const TCP_TX_BUFFER_BYTES: usize = 2048;
-const ARTWORK_RX_BUFFER_BYTES: usize = 4096;
-const ARTWORK_TX_BUFFER_BYTES: usize = 1024;
+pub const TCP_RX_BUFFER_BYTES: usize = 2048;
+pub const TCP_TX_BUFFER_BYTES: usize = 2048;
+pub const ARTWORK_RX_BUFFER_BYTES: usize = 4096;
+pub const ARTWORK_TX_BUFFER_BYTES: usize = 1024;
 const DHCP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
@@ -27,11 +27,19 @@ const EVENT_WRITE_TIMEOUT: Duration = Duration::from_millis(20);
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const ABORT_TIMEOUT: Duration = Duration::from_millis(20);
 
+pub struct NetBuffers {
+    pub resources: &'static mut StackResources<4>,
+    pub lpec_rx: &'static mut [u8],
+    pub lpec_tx: &'static mut [u8],
+    pub artwork_rx: &'static mut [u8],
+    pub artwork_tx: &'static mut [u8],
+}
+
 pub struct FirmwareNetwork {
     stack: Stack<'static>,
     runner: Runner<'static, Interface<'static>>,
-    lpec_socket: Option<TcpSocket<'static>>,
-    artwork_socket: Option<TcpSocket<'static>>,
+    lpec_socket: TcpSocket<'static>,
+    artwork_socket: TcpSocket<'static>,
     config_ready: bool,
     config_poll_started_at: Option<Instant>,
 }
@@ -52,21 +60,28 @@ pub enum FirmwareNetError {
 }
 
 impl FirmwareNetwork {
-    pub fn new(station: Interface<'static>) -> Self {
-        static mut NET_RESOURCES: StackResources<4> = StackResources::new();
-        let resources = unsafe { &mut *core::ptr::addr_of_mut!(NET_RESOURCES) };
+    pub fn new(station: Interface<'static>, buffers: NetBuffers) -> Self {
+        let NetBuffers {
+            resources,
+            lpec_rx,
+            lpec_tx,
+            artwork_rx,
+            artwork_tx,
+        } = buffers;
         let (stack, runner) = embassy_net::new(
             station,
             NetConfig::dhcpv4(Default::default()),
             resources,
             0x6c_69_6e_6e,
         );
+        let lpec_socket = TcpSocket::new(stack, lpec_rx, lpec_tx);
+        let artwork_socket = TcpSocket::new(stack, artwork_rx, artwork_tx);
 
         Self {
             stack,
             runner,
-            lpec_socket: None,
-            artwork_socket: None,
+            lpec_socket,
+            artwork_socket,
             config_ready: false,
             config_poll_started_at: None,
         }
@@ -158,11 +173,8 @@ impl FirmwareNetwork {
             lpec_socket,
             ..
         } = self;
-        let socket = lpec_socket
-            .as_mut()
-            .ok_or(FirmwareNetError::ConnectFailed)?;
         Ok(FirmwareTcpStream {
-            socket,
+            socket: lpec_socket,
             runner,
             read_timeout,
             write_timeout,
@@ -170,21 +182,12 @@ impl FirmwareNetwork {
     }
 
     pub fn reset_lpec(&mut self) {
-        let Some(mut socket) = self.lpec_socket.take() else {
-            return;
-        };
-
-        socket.abort();
-        let _ = drive_tcp(socket.flush(), &mut self.runner, ABORT_TIMEOUT);
-    }
-
-    pub fn reset_artwork(&mut self) {
-        let Some(mut socket) = self.artwork_socket.take() else {
-            return;
-        };
-
-        socket.abort();
-        let _ = drive_tcp(socket.flush(), &mut self.runner, ABORT_TIMEOUT);
+        let Self {
+            runner,
+            lpec_socket,
+            ..
+        } = self;
+        close_socket(lpec_socket, runner);
     }
 
     fn ensure_lpec_socket(
@@ -192,21 +195,10 @@ impl FirmwareNetwork {
         endpoint: Endpoint,
         connect_timeout: Duration,
     ) -> Result<(), FirmwareNetError> {
-        if self
-            .lpec_socket
-            .as_ref()
-            .is_some_and(|socket| socket.may_send() || socket.may_recv())
-        {
+        if self.lpec_socket.may_send() || self.lpec_socket.may_recv() {
             return Ok(());
         }
 
-        self.reset_lpec();
-        static mut TCP_RX_BUFFER: [u8; TCP_RX_BUFFER_BYTES] = [0; TCP_RX_BUFFER_BYTES];
-        static mut TCP_TX_BUFFER: [u8; TCP_TX_BUFFER_BYTES] = [0; TCP_TX_BUFFER_BYTES];
-
-        let rx_buffer = unsafe { &mut *core::ptr::addr_of_mut!(TCP_RX_BUFFER) };
-        let tx_buffer = unsafe { &mut *core::ptr::addr_of_mut!(TCP_TX_BUFFER) };
-        let mut socket = TcpSocket::new(self.stack, rx_buffer, tx_buffer);
         let remote = IpEndpoint::new(
             IpAddress::Ipv4(Ipv4Address::new(
                 endpoint.address[0],
@@ -217,27 +209,12 @@ impl FirmwareNetwork {
             endpoint.port,
         );
 
-        match block_on(select3(
-            socket.connect(remote),
-            self.runner.run(),
-            Timer::after(connect_timeout),
-        )) {
-            Either3::First(Ok(())) => {
-                self.lpec_socket = Some(socket);
-                Ok(())
-            }
-            Either3::First(Err(_)) => {
-                socket.abort();
-                let _ = drive_tcp(socket.flush(), &mut self.runner, ABORT_TIMEOUT);
-                Err(FirmwareNetError::ConnectFailed)
-            }
-            Either3::Second(_) => unreachable!(),
-            Either3::Third(()) => {
-                socket.abort();
-                let _ = drive_tcp(socket.flush(), &mut self.runner, ABORT_TIMEOUT);
-                Err(FirmwareNetError::ConnectTimeout)
-            }
-        }
+        let Self {
+            runner,
+            lpec_socket,
+            ..
+        } = self;
+        connect_socket(lpec_socket, runner, remote, connect_timeout)
     }
 
     fn resolve_ipv4(&mut self, host: &str) -> Result<Ipv4Address, FirmwareNetError> {
@@ -264,49 +241,19 @@ impl FirmwareNetwork {
         remote: IpEndpoint,
     ) -> Result<FirmwareTcpStream<'_>, FirmwareNetError> {
         self.wait_config_up()?;
-        self.reset_artwork();
 
-        static mut ARTWORK_RX_BUFFER: [u8; ARTWORK_RX_BUFFER_BYTES] = [0; ARTWORK_RX_BUFFER_BYTES];
-        static mut ARTWORK_TX_BUFFER: [u8; ARTWORK_TX_BUFFER_BYTES] = [0; ARTWORK_TX_BUFFER_BYTES];
-
-        let rx_buffer = unsafe { &mut *core::ptr::addr_of_mut!(ARTWORK_RX_BUFFER) };
-        let tx_buffer = unsafe { &mut *core::ptr::addr_of_mut!(ARTWORK_TX_BUFFER) };
-        let mut socket = TcpSocket::new(self.stack, rx_buffer, tx_buffer);
-
-        match block_on(select3(
-            socket.connect(remote),
-            self.runner.run(),
-            Timer::after(CONNECT_TIMEOUT),
-        )) {
-            Either3::First(Ok(())) => {
-                self.artwork_socket = Some(socket);
-                let Self {
-                    runner,
-                    artwork_socket,
-                    ..
-                } = self;
-                let socket = artwork_socket
-                    .as_mut()
-                    .ok_or(FirmwareNetError::ConnectFailed)?;
-                Ok(FirmwareTcpStream {
-                    socket,
-                    runner,
-                    read_timeout: READ_TIMEOUT,
-                    write_timeout: WRITE_TIMEOUT,
-                })
-            }
-            Either3::First(Err(_)) => {
-                socket.abort();
-                let _ = drive_tcp(socket.flush(), &mut self.runner, ABORT_TIMEOUT);
-                Err(FirmwareNetError::ConnectFailed)
-            }
-            Either3::Second(_) => unreachable!(),
-            Either3::Third(()) => {
-                socket.abort();
-                let _ = drive_tcp(socket.flush(), &mut self.runner, ABORT_TIMEOUT);
-                Err(FirmwareNetError::ConnectTimeout)
-            }
-        }
+        let Self {
+            runner,
+            artwork_socket,
+            ..
+        } = self;
+        connect_socket(artwork_socket, runner, remote, CONNECT_TIMEOUT)?;
+        Ok(FirmwareTcpStream {
+            socket: artwork_socket,
+            runner,
+            read_timeout: READ_TIMEOUT,
+            write_timeout: WRITE_TIMEOUT,
+        })
     }
 }
 
@@ -378,5 +325,33 @@ where
         Either3::First(result) => Ok(result),
         Either3::Second(_) => unreachable!(),
         Either3::Third(()) => Err(Timeout),
+    }
+}
+
+fn close_socket(socket: &mut TcpSocket<'static>, runner: &mut Runner<'static, Interface<'static>>) {
+    socket.abort();
+    let _ = drive_tcp(socket.flush(), runner, ABORT_TIMEOUT);
+}
+
+fn connect_socket(
+    socket: &mut TcpSocket<'static>,
+    runner: &mut Runner<'static, Interface<'static>>,
+    remote: IpEndpoint,
+    connect_timeout: Duration,
+) -> Result<(), FirmwareNetError> {
+    // Drive the socket to Closed (no-op if already there) before reconnecting —
+    // smoltcp's connect() rejects sockets that are not in Closed state.
+    close_socket(socket, runner);
+
+    match drive_tcp(socket.connect(remote), runner, connect_timeout) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => {
+            close_socket(socket, runner);
+            Err(FirmwareNetError::ConnectFailed)
+        }
+        Err(Timeout) => {
+            close_socket(socket, runner);
+            Err(FirmwareNetError::ConnectTimeout)
+        }
     }
 }

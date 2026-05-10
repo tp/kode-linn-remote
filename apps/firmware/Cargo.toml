@@ -25,3 +25,4 @@ esp-radio = { workspace = true, features = ["esp32c6", "wifi", "esp-alloc"] }
 esp-rtos = { workspace = true, features = ["esp32c6", "esp-radio", "esp-alloc", "embassy"] }
 heapless.workspace = true
 linn-lpec.workspace = true
+static_cell = { version = "2.1", default-features = false }
