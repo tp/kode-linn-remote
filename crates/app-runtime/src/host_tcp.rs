@@ -16,9 +16,9 @@ pub struct HostTcpConnector {
 impl HostTcpConnector {
     pub const fn new() -> Self {
         Self {
-            connect_timeout: Duration::from_millis(700),
-            read_timeout: Duration::from_millis(250),
-            write_timeout: Duration::from_millis(500),
+            connect_timeout: Duration::from_millis(2000),
+            read_timeout: Duration::from_millis(2500),
+            write_timeout: Duration::from_millis(2500),
         }
     }
 
