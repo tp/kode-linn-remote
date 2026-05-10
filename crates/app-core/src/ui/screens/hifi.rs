@@ -15,8 +15,8 @@ use crate::{
 
 use super::super::{
     components::{
-        ButtonTone, DURATION_WIDTH, draw_button, draw_duration, draw_progress_bar, draw_spinner,
-        ui_font,
+        ButtonTone, DURATION_WIDTH, clear_rect, draw_button, draw_duration, draw_progress_bar,
+        draw_spinner, ui_font,
     },
     geometry::centered_square,
     style::*,
@@ -334,6 +334,13 @@ where
         state.status.duration_seconds as u64,
     )?;
 
+    clear_rect(
+        display,
+        Rectangle::new(
+            Point::new(ui_layout.safe_square.top_left.x, ui_layout.song_origin.y),
+            Size::new(ui_layout.safe_square.size.width, 40),
+        ),
+    )?;
     Text::with_text_style(
         non_empty_or(&state.status.title, "No track"),
         ui_layout.song_origin,
@@ -342,6 +349,14 @@ where
     )
     .draw(display)
     .map_err(RenderError::Draw)?;
+
+    clear_rect(
+        display,
+        Rectangle::new(
+            Point::new(ui_layout.safe_square.top_left.x, ui_layout.artist_origin.y),
+            Size::new(ui_layout.safe_square.size.width, 40),
+        ),
+    )?;
     Text::with_text_style(
         non_empty_or(&state.status.artist, "Not playing"),
         ui_layout.artist_origin,
@@ -570,6 +585,8 @@ fn draw_play_pause_button<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    clear_rect(display, rect)?;
+
     let center = rect_visual_center(rect);
 
     match playback {

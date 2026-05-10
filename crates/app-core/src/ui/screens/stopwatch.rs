@@ -13,7 +13,7 @@ use crate::{NetworkStatus, RenderError};
 
 use super::super::{
     AppContext,
-    components::{ButtonTone, draw_button, draw_duration, draw_panel, ui_font},
+    components::{ButtonTone, clear_rect, draw_button, draw_duration, draw_panel, ui_font},
     geometry::{Column, horizontal_pair},
     style::*,
 };
@@ -266,6 +266,7 @@ where
         .font(&body_font)
         .build();
 
+    clear_rect(display, ui_layout.info.ideal.bounds)?;
     Text::with_text_style(
         "ideal",
         ui_layout.info.ideal.label.top_left,
@@ -283,6 +284,7 @@ where
 
     let mut stopwatch = heapless::String::<32>::new();
     write!(stopwatch, "stopwatch: {}s", state.seconds).map_err(|_| RenderError::TextFormat)?;
+    clear_rect(display, ui_layout.info.stopwatch)?;
     Text::with_text_style(
         &stopwatch,
         ui_layout.info.stopwatch.top_left,
@@ -295,9 +297,12 @@ where
     let network_text_origin = if context.network_status == NetworkStatus::Online {
         ui_layout.info.network.text_without_icon_origin
     } else {
-        draw_network_unavailable_icon(display, ui_layout.info.network.icon_center)?;
         ui_layout.info.network.text_with_icon_origin
     };
+    clear_rect(display, ui_layout.info.network.bounds)?;
+    if context.network_status != NetworkStatus::Online {
+        draw_network_unavailable_icon(display, ui_layout.info.network.icon_center)?;
+    }
     Text::with_text_style(
         network_text(context.network_status),
         network_text_origin,
@@ -310,6 +315,7 @@ where
     let mut interactions = heapless::String::<32>::new();
     write!(interactions, "interactions: {}", context.interaction_count)
         .map_err(|_| RenderError::TextFormat)?;
+    clear_rect(display, ui_layout.info.interactions)?;
     Text::with_text_style(
         &interactions,
         ui_layout.info.interactions.top_left,

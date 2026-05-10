@@ -7,6 +7,7 @@ mod touch;
 use app_core::{App, Event};
 use board_waveshare_c6::{BOARD_NAME, DISPLAY_SIZE, peripherals};
 use display::AmoledDisplay;
+use embedded_graphics::{draw_target::DrawTarget, pixelcolor::Rgb565, prelude::RgbColor};
 use esp_backtrace as _;
 use esp_hal::{
     i2c::master::{Config as I2cConfig, I2c},
@@ -92,6 +93,10 @@ fn main() -> ! {
         }
     };
 
+    if let Err(error) = display.clear(Rgb565::BLACK) {
+        println!("display: initial clear failed: {}", error);
+    }
+
     match app.render(&mut display) {
         Ok(()) => {
             println!("display: initial frame rendered");
@@ -106,6 +111,7 @@ fn main() -> ! {
     let mut uptime_ms = 0;
     let mut next_heartbeat_ms = 0;
     let mut consecutive_touch_errors = 0_u32;
+    let mut rendered_screen = app.screen();
 
     println!("app-core: initialized");
 
@@ -145,8 +151,18 @@ fn main() -> ! {
         render_requested |= outcome.render_requested;
 
         if render_requested {
+            let current_screen = app.screen();
+            if current_screen != rendered_screen {
+                if let Err(error) = display.clear(Rgb565::BLACK) {
+                    println!("display: screen clear failed: {}", error);
+                }
+            }
+
             match app.render(&mut display) {
-                Ok(()) => println!("display: frame rendered"),
+                Ok(()) => {
+                    rendered_screen = current_screen;
+                    println!("display: frame rendered");
+                }
                 Err(_) => println!("display: render failed"),
             }
         }

@@ -17,6 +17,8 @@ const TIME_COLON_GAP: i32 = 4;
 const TIME_COLON_DOT_SIZE: u32 = 3;
 const TIME_COLON_TOP_OFFSET: i32 = 15;
 const TIME_COLON_BOTTOM_OFFSET: i32 = 27;
+const DURATION_HEIGHT: u32 = 40;
+const SPINNER_CLEAR_SIZE: u32 = 96;
 const SPINNER_DOT_COUNT: u32 = 8;
 pub(super) const DURATION_WIDTH: i32 =
     3 * 2 * TIME_DIGIT_CELL_WIDTH + 2 * (2 * TIME_COLON_GAP + TIME_COLON_DOT_SIZE as i32);
@@ -84,6 +86,15 @@ where
     Ok(())
 }
 
+pub(super) fn clear_rect<D>(display: &mut D, rect: Rectangle) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    rect.into_styled(PrimitiveStyle::with_fill(OLED_BLACK))
+        .draw(display)
+        .map_err(RenderError::Draw)
+}
+
 pub(super) fn draw_panel<D>(
     display: &mut D,
     rect: Rectangle,
@@ -94,6 +105,8 @@ pub(super) fn draw_panel<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    clear_rect(display, rect)?;
+
     RoundedRectangle::with_equal_corners(rect, Size::new(radius, radius))
         .into_styled(
             PrimitiveStyleBuilder::new()
@@ -139,6 +152,11 @@ pub(super) fn draw_duration<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    clear_rect(
+        display,
+        Rectangle::new(origin, Size::new(DURATION_WIDTH as u32, DURATION_HEIGHT)),
+    )?;
+
     let (hours, minutes, seconds) = duration_parts(duration);
     let separator_width = 2 * TIME_COLON_GAP + TIME_COLON_DOT_SIZE as i32;
     let group_width = 2 * TIME_DIGIT_CELL_WIDTH;
@@ -180,6 +198,18 @@ pub(super) fn draw_spinner<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    clear_rect(
+        display,
+        Rectangle::new(
+            center
+                - Point::new(
+                    (SPINNER_CLEAR_SIZE / 2) as i32,
+                    (SPINNER_CLEAR_SIZE / 2) as i32,
+                ),
+            Size::new(SPINNER_CLEAR_SIZE, SPINNER_CLEAR_SIZE),
+        ),
+    )?;
+
     const OFFSETS: [Point; SPINNER_DOT_COUNT as usize] = [
         Point::new(0, -32),
         Point::new(23, -23),
