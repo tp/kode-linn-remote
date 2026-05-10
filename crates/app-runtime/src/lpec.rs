@@ -12,7 +12,10 @@ use crate::{
 };
 
 const MAX_ARTWORK_BYTES: usize = 128 * 1024;
+const MAX_HTTP_HEADER_BYTES: usize = 8 * 1024;
 const SESSION_ACTION_LINE_BUDGET: usize = 16;
+pub const ARTWORK_HTTP_BUFFER_BYTES: usize = 32 * 1024;
+pub const ARTWORK_DECODE_BUFFER_BYTES: usize = 36 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error<E> {
@@ -22,10 +25,33 @@ pub enum Error<E> {
     InvalidArtworkUri,
     InvalidHttpResponse,
     HttpError,
-    ArtworkTooLarge,
+    ArtworkTooLarge {
+        reason: ArtworkTooLargeReason,
+        limit: usize,
+        actual: usize,
+    },
+    ArtworkBufferTooSmall {
+        buffer: ArtworkBuffer,
+        required: usize,
+        actual: usize,
+    },
     ArtworkDecode,
     StatusUnavailable,
     Protocol(linn_lpec::Error<core::convert::Infallible>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtworkTooLargeReason {
+    ContentLength,
+    ResponseBuffer,
+    Reserve,
+    LengthOverflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtworkBuffer {
+    HttpResponse,
+    DecodeOutput,
 }
 
 impl Error<core::convert::Infallible> {
@@ -37,7 +63,24 @@ impl Error<core::convert::Infallible> {
             Self::InvalidArtworkUri => Error::InvalidArtworkUri,
             Self::InvalidHttpResponse => Error::InvalidHttpResponse,
             Self::HttpError => Error::HttpError,
-            Self::ArtworkTooLarge => Error::ArtworkTooLarge,
+            Self::ArtworkTooLarge {
+                reason,
+                limit,
+                actual,
+            } => Error::ArtworkTooLarge {
+                reason,
+                limit,
+                actual,
+            },
+            Self::ArtworkBufferTooSmall {
+                buffer,
+                required,
+                actual,
+            } => Error::ArtworkBufferTooSmall {
+                buffer,
+                required,
+                actual,
+            },
             Self::ArtworkDecode => Error::ArtworkDecode,
             Self::StatusUnavailable => Error::StatusUnavailable,
             Self::Protocol(error) => Error::Protocol(error),
@@ -182,6 +225,25 @@ where
     let response = read_http_response(&mut stream)?;
     let body = response_body(&response).map_err(Error::erase_transport)?;
     decode_jpeg_artwork(uri, body).map_err(Error::erase_transport)
+}
+
+pub fn load_artwork_with_buffers<C>(
+    connector: &mut C,
+    uri: &str,
+    http_buffer: &mut [u8],
+    decode_buffer: &mut [u8],
+) -> Result<HifiArtwork, Error<C::Error>>
+where
+    C: TcpConnector,
+{
+    let request = ArtworkRequest::parse(uri).map_err(Error::erase_transport)?;
+    let mut stream = connector
+        .connect_host(request.host, request.port)
+        .map_err(Error::Connect)?;
+    write_http_get(&mut stream, request.host, request.path).map_err(Error::Connect)?;
+    let response_len = read_http_response_into(&mut stream, http_buffer)?;
+    let body = response_body(&http_buffer[..response_len]).map_err(Error::erase_transport)?;
+    decode_jpeg_artwork_into(uri, body, decode_buffer).map_err(Error::erase_transport)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -653,27 +715,135 @@ where
 {
     let mut response = AllocVec::new();
     let mut chunk = [0_u8; 1024];
+    let mut target_len = None;
     loop {
+        if target_len.is_some_and(|target| response.len() >= target) {
+            return Ok(response);
+        }
+
         let count = stream.read(&mut chunk).map_err(Error::Connect)?;
         if count == 0 {
             return Ok(response);
         }
         response
             .try_reserve(count)
-            .map_err(|_| Error::ArtworkTooLarge)?;
-        if response.len().saturating_add(count) > MAX_ARTWORK_BYTES {
-            return Err(Error::ArtworkTooLarge);
+            .map_err(|_| Error::ArtworkTooLarge {
+                reason: ArtworkTooLargeReason::Reserve,
+                limit: MAX_ARTWORK_BYTES + MAX_HTTP_HEADER_BYTES,
+                actual: response.len().saturating_add(count),
+            })?;
+        let next_len = response.len().saturating_add(count);
+        if next_len > MAX_ARTWORK_BYTES + MAX_HTTP_HEADER_BYTES {
+            return Err(Error::ArtworkTooLarge {
+                reason: ArtworkTooLargeReason::ResponseBuffer,
+                limit: MAX_ARTWORK_BYTES + MAX_HTTP_HEADER_BYTES,
+                actual: next_len,
+            });
         }
         response.extend_from_slice(&chunk[..count]);
+
+        let Some(header_end) = http_header_end(&response) else {
+            if response.len() > MAX_HTTP_HEADER_BYTES {
+                return Err(Error::InvalidHttpResponse);
+            }
+            continue;
+        };
+        if target_len.is_none() {
+            target_len = http_content_length(&response[..header_end])
+                .map_err(Error::erase_transport)?
+                .map(|body_len| {
+                    if body_len > MAX_ARTWORK_BYTES {
+                        Err(Error::ArtworkTooLarge {
+                            reason: ArtworkTooLargeReason::ContentLength,
+                            limit: MAX_ARTWORK_BYTES,
+                            actual: body_len,
+                        })
+                    } else {
+                        header_end
+                            .checked_add(body_len)
+                            .ok_or(Error::ArtworkTooLarge {
+                                reason: ArtworkTooLargeReason::LengthOverflow,
+                                limit: MAX_ARTWORK_BYTES + MAX_HTTP_HEADER_BYTES,
+                                actual: usize::MAX,
+                            })
+                    }
+                })
+                .transpose()?;
+        }
+    }
+}
+
+fn read_http_response_into<S>(stream: &mut S, response: &mut [u8]) -> Result<usize, Error<S::Error>>
+where
+    S: ByteStream,
+{
+    let mut response_len = 0;
+    let mut chunk = [0_u8; 1024];
+    let mut target_len = None;
+    loop {
+        if target_len.is_some_and(|target| response_len >= target) {
+            return Ok(response_len);
+        }
+
+        let count = stream.read(&mut chunk).map_err(Error::Connect)?;
+        if count == 0 {
+            return Ok(response_len);
+        }
+
+        let next_len = response_len.saturating_add(count);
+        if next_len > response.len() {
+            return Err(Error::ArtworkBufferTooSmall {
+                buffer: ArtworkBuffer::HttpResponse,
+                required: next_len,
+                actual: response.len(),
+            });
+        }
+        response[response_len..next_len].copy_from_slice(&chunk[..count]);
+        response_len = next_len;
+
+        let Some(header_end) = http_header_end(&response[..response_len]) else {
+            if response_len > MAX_HTTP_HEADER_BYTES {
+                return Err(Error::InvalidHttpResponse);
+            }
+            continue;
+        };
+        if target_len.is_none() {
+            target_len = http_content_length(&response[..header_end])
+                .map_err(Error::erase_transport)?
+                .map(|body_len| {
+                    if body_len > MAX_ARTWORK_BYTES {
+                        Err(Error::ArtworkTooLarge {
+                            reason: ArtworkTooLargeReason::ContentLength,
+                            limit: MAX_ARTWORK_BYTES,
+                            actual: body_len,
+                        })
+                    } else {
+                        let required =
+                            header_end
+                                .checked_add(body_len)
+                                .ok_or(Error::ArtworkTooLarge {
+                                    reason: ArtworkTooLargeReason::LengthOverflow,
+                                    limit: response.len(),
+                                    actual: usize::MAX,
+                                })?;
+                        if required > response.len() {
+                            Err(Error::ArtworkBufferTooSmall {
+                                buffer: ArtworkBuffer::HttpResponse,
+                                required,
+                                actual: response.len(),
+                            })
+                        } else {
+                            Ok(required)
+                        }
+                    }
+                })
+                .transpose()?;
+        }
     }
 }
 
 fn response_body(response: &[u8]) -> Result<&[u8], Error<core::convert::Infallible>> {
-    let Some(header_end) = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| position + 4)
-    else {
+    let Some(header_end) = http_header_end(response) else {
         return Err(Error::InvalidHttpResponse);
     };
     let status_line_end = response[..header_end]
@@ -686,6 +856,27 @@ fn response_body(response: &[u8]) -> Result<&[u8], Error<core::convert::Infallib
         return Err(Error::HttpError);
     }
     Ok(&response[header_end..])
+}
+
+fn http_header_end(response: &[u8]) -> Option<usize> {
+    response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+}
+
+fn http_content_length(headers: &[u8]) -> Result<Option<usize>, Error<core::convert::Infallible>> {
+    let headers = core::str::from_utf8(headers).map_err(|_| Error::InvalidHttpResponse)?;
+    for line in headers.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            let length = parse_usize(value.trim()).ok_or(Error::InvalidHttpResponse)?;
+            return Ok(Some(length));
+        }
+    }
+    Ok(None)
 }
 
 fn decode_jpeg_artwork(
@@ -704,6 +895,49 @@ fn decode_jpeg_artwork(
         .len()
         .checked_div(width.saturating_mul(height))
         .ok_or(Error::ArtworkDecode)?;
+    decoded_jpeg_artwork(uri, &decoded, width, height, components)
+}
+
+fn decode_jpeg_artwork_into(
+    uri: &str,
+    bytes: &[u8],
+    decode_buffer: &mut [u8],
+) -> Result<HifiArtwork, Error<core::convert::Infallible>> {
+    let mut decoder = JpegDecoder::new(ZCursor::new(bytes));
+    decoder.decode_headers().map_err(|_| Error::ArtworkDecode)?;
+    let required = decoder.output_buffer_size().ok_or(Error::ArtworkDecode)?;
+    if required > decode_buffer.len() {
+        return Err(Error::ArtworkBufferTooSmall {
+            buffer: ArtworkBuffer::DecodeOutput,
+            required,
+            actual: decode_buffer.len(),
+        });
+    }
+
+    decoder
+        .decode_into(&mut decode_buffer[..required])
+        .map_err(|_| Error::ArtworkDecode)?;
+    let info = decoder.info().ok_or(Error::ArtworkDecode)?;
+    let width = info.width as usize;
+    let height = info.height as usize;
+    if width == 0 || height == 0 {
+        return Err(Error::ArtworkDecode);
+    }
+    let decoded = &decode_buffer[..required];
+    let components = decoded
+        .len()
+        .checked_div(width.saturating_mul(height))
+        .ok_or(Error::ArtworkDecode)?;
+    decoded_jpeg_artwork(uri, decoded, width, height, components)
+}
+
+fn decoded_jpeg_artwork(
+    uri: &str,
+    decoded: &[u8],
+    width: usize,
+    height: usize,
+    components: usize,
+) -> Result<HifiArtwork, Error<core::convert::Infallible>> {
     if !matches!(components, 1 | 3 | 4) {
         return Err(Error::ArtworkDecode);
     }
@@ -746,6 +980,22 @@ fn parse_u32(value: &str) -> Option<u32> {
         number = number
             .saturating_mul(10)
             .saturating_add((byte - b'0') as u32);
+    }
+    Some(number)
+}
+
+fn parse_usize(value: &str) -> Option<usize> {
+    let mut number = 0_usize;
+    if value.is_empty() {
+        return None;
+    }
+    for byte in value.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        number = number
+            .saturating_mul(10)
+            .saturating_add((byte - b'0') as usize);
     }
     Some(number)
 }
@@ -841,14 +1091,29 @@ fn copy_album_art_uri_for_profile<const N: usize>(
 }
 
 fn prefer_smaller_qobuz_art<const N: usize>(uri: &mut heapless::String<N>) {
-    let Some(marker) = uri.find("_600.") else {
+    if !uri.starts_with("https://static.qobuz.com/") && !uri.starts_with("http://static.qobuz.com/")
+    {
+        return;
+    }
+
+    let Some(extension_start) = uri.rfind('.') else {
         return;
     };
+    let Some(size_start) = uri[..extension_start].rfind('_') else {
+        return;
+    };
+    if uri[size_start + 1..extension_start].is_empty()
+        || !uri[size_start + 1..extension_start]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return;
+    }
 
     let mut smaller = heapless::String::<N>::new();
-    if smaller.push_str(&uri[..marker]).is_err()
-        || smaller.push_str("_230.").is_err()
-        || smaller.push_str(&uri[marker + 5..]).is_err()
+    if smaller.push_str(&uri[..size_start]).is_err()
+        || smaller.push_str("_50").is_err()
+        || smaller.push_str(&uri[extension_start..]).is_err()
     {
         return;
     }
@@ -1074,7 +1339,37 @@ mod tests {
 
         assert_eq!(
             status.album_art_uri.as_str(),
-            "https://static.qobuz.com/images/covers/zl/mi/go7xvf8bnmizl_230.jpg"
+            "https://static.qobuz.com/images/covers/zl/mi/go7xvf8bnmizl_50.jpg"
+        );
+    }
+
+    #[test]
+    fn prefers_tiny_qobuz_artwork_uri_from_existing_thumbnail() {
+        let mut status = HifiStatus::empty();
+
+        apply_metadata(
+            &mut status,
+            r#"<DIDL-Lite><item><upnp:albumArtURI>https://static.qobuz.com/images/covers/52/35/0724357473552_230.jpg</upnp:albumArtURI></item></DIDL-Lite>"#,
+        );
+
+        assert_eq!(
+            status.album_art_uri.as_str(),
+            "https://static.qobuz.com/images/covers/52/35/0724357473552_50.jpg"
+        );
+    }
+
+    #[test]
+    fn leaves_non_qobuz_artwork_uri_unchanged() {
+        let mut status = HifiStatus::empty();
+
+        apply_metadata(
+            &mut status,
+            r#"<DIDL-Lite><item><upnp:albumArtURI>http://192.168.7.218/art/cover_600.jpg</upnp:albumArtURI></item></DIDL-Lite>"#,
+        );
+
+        assert_eq!(
+            status.album_art_uri.as_str(),
+            "http://192.168.7.218/art/cover_600.jpg"
         );
     }
 
@@ -1143,6 +1438,48 @@ mod tests {
         assert_eq!(request.path, "images/covers/mb/x1/cover_230.jpg");
     }
 
+    #[test]
+    fn artwork_response_stops_after_content_length_body() {
+        let mut stream = ScriptedByteStream::from_bytes(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nbody",
+        );
+
+        let response = read_http_response(&mut stream).unwrap();
+
+        assert_eq!(response_body(&response).unwrap(), b"body");
+    }
+
+    #[test]
+    fn fixed_artwork_response_buffer_stops_after_content_length_body() {
+        let mut stream = ScriptedByteStream::from_bytes(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nbody",
+        );
+        let mut response = [0_u8; 96];
+
+        let response_len = read_http_response_into(&mut stream, &mut response).unwrap();
+
+        assert_eq!(response_body(&response[..response_len]).unwrap(), b"body");
+    }
+
+    #[test]
+    fn fixed_artwork_response_buffer_reports_required_size() {
+        let mut stream = ScriptedByteStream::from_bytes(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nbody",
+        );
+        let mut response = [0_u8; 64];
+
+        let error = read_http_response_into(&mut stream, &mut response).unwrap_err();
+
+        assert_eq!(
+            error,
+            Error::ArtworkBufferTooSmall {
+                buffer: ArtworkBuffer::HttpResponse,
+                required: 66,
+                actual: 64
+            }
+        );
+    }
+
     struct ScriptedByteStream {
         reads: VecDeque<u8>,
         writes: AllocVec<u8>,
@@ -1157,6 +1494,13 @@ mod tests {
             }
             Self {
                 reads,
+                writes: AllocVec::new(),
+            }
+        }
+
+        fn from_bytes(bytes: &[u8]) -> Self {
+            Self {
+                reads: bytes.iter().copied().collect(),
                 writes: AllocVec::new(),
             }
         }

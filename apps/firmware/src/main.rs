@@ -15,7 +15,10 @@ use app_core::{
     App, Command, Event, HIFI_URI_LEN, HifiStatus, NetworkStatus, PlaybackState,
     RECOMMENDED_SCRATCH_PIXELS, Screen,
 };
-use app_runtime::lpec::{Error as LpecError, LpecSession, load_artwork};
+use app_runtime::lpec::{
+    ARTWORK_DECODE_BUFFER_BYTES, ARTWORK_HTTP_BUFFER_BYTES, Error as LpecError, LpecSession,
+    load_artwork_with_buffers,
+};
 use app_runtime::net::Endpoint;
 use board_waveshare_c6::{BOARD_NAME, DISPLAY_SIZE, peripherals};
 use display::AmoledDisplay;
@@ -574,11 +577,18 @@ fn load_hifi_artwork(
     last_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
     uri: &str,
 ) -> bool {
+    static mut ARTWORK_HTTP_BUFFER: [u8; ARTWORK_HTTP_BUFFER_BYTES] =
+        [0; ARTWORK_HTTP_BUFFER_BYTES];
+    static mut ARTWORK_DECODE_BUFFER: [u8; ARTWORK_DECODE_BUFFER_BYTES] =
+        [0; ARTWORK_DECODE_BUFFER_BYTES];
+
     last_artwork_uri.clear();
     let _ = last_artwork_uri.push_str(uri);
-    println!("linn: artwork load");
+    println!("linn: artwork load {}", uri);
 
-    match load_artwork(network, uri) {
+    let http_buffer = unsafe { &mut *core::ptr::addr_of_mut!(ARTWORK_HTTP_BUFFER) };
+    let decode_buffer = unsafe { &mut *core::ptr::addr_of_mut!(ARTWORK_DECODE_BUFFER) };
+    match load_artwork_with_buffers(network, uri, http_buffer, decode_buffer) {
         Ok(artwork) => app.update(Event::HifiArtwork(artwork)).render_requested,
         Err(error) => {
             println!("linn: artwork failed: {:?}", error);
