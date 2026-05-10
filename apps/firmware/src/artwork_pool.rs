@@ -1,60 +1,77 @@
-//! Two-slot ping-pong pool for decoded album-artwork pixels.
+//! Three-slot pool for decoded album-artwork pixels.
 //!
-//! The decoded artwork (96×96 Rgb565 = 18 KiB) lives in two statically
-//! allocated buffers and is handed to the renderer as a `&'static` view via
+//! The decoded artwork (96×96 Rgb565 = 18 KiB) lives in statically allocated
+//! buffers and is handed to the renderer as a `&'static` view via
 //! `HifiArtwork::from_static_pixels`. We cannot allocate a fresh `Box` per
 //! load — the device has run out of heap doing exactly that — so the buffers
 //! must be statically reserved.
 //!
 //! ## Soundness invariant
 //!
-//! Each call to [`ArtworkPool::acquire`] hands out a `&'static mut` to the
-//! next slot, alternating slot 0 → 1 → 0 → 1 → … The previous shared view of
-//! that slot (held inside an `Event::HifiArtwork(_)` and ultimately the
-//! `App`'s screen state) must already have been dropped before we return
-//! here.
+//! At any instant, three distinct live `&'static` views of slots are
+//! possible:
 //!
-//! This is upheld by construction in the firmware:
+//! 1. **App-held**: the artwork currently displayed, owned by
+//!    `App.hifi_screen.artwork`.
+//! 2. **Channel-queued**: at most one `Event::HifiArtwork(_)` sitting in
+//!    `FIRMWARE_EVENTS` (capacity 1) waiting for the main loop to receive it.
+//! 3. **In-flight**: the producer task's future state between
+//!    `HifiArtwork::from_static_pixels` and `Channel::send().await`
+//!    returning. Backpressure on a full channel makes this window real.
 //!
-//! * Slots alternate every load, so two same-slot acquires are at least one
-//!   load apart.
-//! * The single in-flight `Event::HifiArtwork` is consumed and replaces the
-//!   `App`'s previous artwork during `App::update`, dropping the prior
-//!   `&'static` view.
-//! * `firmware_runtime_task` runs on a single executor task; there are no
-//!   concurrent acquires.
+//! With 3 slots and strict round-robin acquisition, the slot we're about to
+//! overwrite is at least 3 acquires old — older than any of the three
+//! holders above could possibly reference. The `&'static mut` produced by
+//! [`ArtworkPool::acquire`] therefore aliases nothing.
 //!
-//! If those properties ever change (e.g. an event queue depth >1, an
-//! artwork cache that retains old views, multi-task acquires), the
-//! `ArtworkPool` needs to be replaced with a real reference-counted or
-//! drop-guarded pool.
+//! ## When this assumption breaks
+//!
+//! Increase [`POOL_SIZE`] if any of the following changes:
+//!
+//! * `FIRMWARE_EVENTS` capacity grows beyond 1 → add one slot per extra
+//!   queue position.
+//! * The app caches more than one prior artwork (e.g. fade transitions,
+//!   history) → add one slot per retained artwork.
+//! * A second producer task is added that can also acquire → the round-robin
+//!   counter is no longer a sufficient invariant; replace this whole module
+//!   with an explicit free/ack pool (drop-guarded) backed by an atomic
+//!   bitmask.
 
 use app_core::{ArtworkPixel, HIFI_ARTWORK_PIXELS};
 use embedded_graphics::{pixelcolor::Rgb565, prelude::RgbColor};
 
-static mut SLOT_A: [ArtworkPixel; HIFI_ARTWORK_PIXELS] = [Rgb565::BLACK; HIFI_ARTWORK_PIXELS];
-static mut SLOT_B: [ArtworkPixel; HIFI_ARTWORK_PIXELS] = [Rgb565::BLACK; HIFI_ARTWORK_PIXELS];
+/// Live-view holders that pin a `&'static` to a slot:
+/// App (1) + `FIRMWARE_EVENTS` capacity (1) + in-flight producer frame (1).
+const POOL_SIZE: usize = 3;
+
+static mut SLOT_0: [ArtworkPixel; HIFI_ARTWORK_PIXELS] = [Rgb565::BLACK; HIFI_ARTWORK_PIXELS];
+static mut SLOT_1: [ArtworkPixel; HIFI_ARTWORK_PIXELS] = [Rgb565::BLACK; HIFI_ARTWORK_PIXELS];
+static mut SLOT_2: [ArtworkPixel; HIFI_ARTWORK_PIXELS] = [Rgb565::BLACK; HIFI_ARTWORK_PIXELS];
 
 pub struct ArtworkPool {
-    next_is_b: bool,
+    next_index: usize,
 }
 
 impl ArtworkPool {
     pub const fn new() -> Self {
-        Self { next_is_b: false }
+        Self { next_index: 0 }
     }
 
     pub fn acquire(&mut self) -> &'static mut [ArtworkPixel; HIFI_ARTWORK_PIXELS] {
-        let slot_b = self.next_is_b;
-        self.next_is_b = !self.next_is_b;
-        // SAFETY: see module-level invariant. Slots strictly alternate, and
-        // any prior `&'static` view of this slot has been dropped by the time
-        // we wrap back around.
+        let index = self.next_index;
+        self.next_index = (self.next_index + 1) % POOL_SIZE;
+        // SAFETY: see module-level invariant. With POOL_SIZE = 3 (matching
+        // App + channel-queued + in-flight) and strict round-robin, the slot
+        // we are about to mutate cannot be referenced by any live `&'static`
+        // view: it was last handed out at least POOL_SIZE acquires ago, and
+        // by then every slot's prior view has been displaced from each of
+        // those three holders.
         unsafe {
-            if slot_b {
-                &mut *core::ptr::addr_of_mut!(SLOT_B)
-            } else {
-                &mut *core::ptr::addr_of_mut!(SLOT_A)
+            match index {
+                0 => &mut *core::ptr::addr_of_mut!(SLOT_0),
+                1 => &mut *core::ptr::addr_of_mut!(SLOT_1),
+                2 => &mut *core::ptr::addr_of_mut!(SLOT_2),
+                _ => unreachable!(),
             }
         }
     }
