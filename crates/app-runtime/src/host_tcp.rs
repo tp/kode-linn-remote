@@ -42,10 +42,10 @@ impl Default for HostTcpConnector {
 }
 
 impl TcpConnector for HostTcpConnector {
-    type Stream = HostTcpStream;
+    type Stream<'a> = HostTcpStream;
     type Error = io::Error;
 
-    fn connect(&mut self, endpoint: Endpoint) -> Result<Self::Stream, Self::Error> {
+    fn connect(&mut self, endpoint: Endpoint) -> Result<Self::Stream<'_>, Self::Error> {
         HostTcpStream::connect(
             SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::new(
@@ -62,7 +62,7 @@ impl TcpConnector for HostTcpConnector {
         )
     }
 
-    fn connect_host(&mut self, host: &str, port: u16) -> Result<Self::Stream, Self::Error> {
+    fn connect_host(&mut self, host: &str, port: u16) -> Result<Self::Stream<'_>, Self::Error> {
         let mut last_error = None;
         for addr in (host, port).to_socket_addrs()? {
             match HostTcpStream::connect(

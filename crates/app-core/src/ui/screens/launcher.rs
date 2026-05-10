@@ -2,16 +2,20 @@ use embedded_graphics::{
     pixelcolor::Rgb565,
     prelude::*,
     primitives::Rectangle,
-    text::{Baseline, Text, TextStyleBuilder},
+    text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
 use mplusfonts::{mplus, style::BitmapFontStyleBuilder};
 
-use crate::{RenderError, Screen};
+use crate::{NetworkStatus, RenderError, Screen};
 
 use super::super::{
-    components::{ButtonTone, draw_button, ui_font},
+    AppContext,
+    components::{
+        ButtonTone, clear_rect, draw_button, draw_network_blocked_icon, draw_spinner,
+        draw_wifi_icon, ui_font,
+    },
     geometry::horizontal_pair,
-    style::{OLED_BLACK, TEXT_PRIMARY},
+    style::{OLED_BLACK, TEXT_PRIMARY, TEXT_SECONDARY},
 };
 
 const CONTENT_INSET: i32 = 44;
@@ -19,6 +23,9 @@ const TITLE_Y: i32 = 64;
 const BUTTON_Y: i32 = 154;
 const BUTTON_HEIGHT: u32 = 150;
 const BUTTON_GAP: i32 = 22;
+const NETWORK_STATUS_Y: i32 = 386;
+const NETWORK_STATUS_WIDTH: u32 = 180;
+const NETWORK_STATUS_HEIGHT: u32 = 96;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Layout {
@@ -71,6 +78,7 @@ fn hit_test(layout: &Layout, point: Point) -> Option<Screen> {
 
 pub(crate) fn render<D>(
     _state: &State,
+    context: AppContext,
     display: &mut D,
     ui_layout: &Layout,
 ) -> Result<(), RenderError<D::Error>>
@@ -107,7 +115,57 @@ where
         "HIFI",
         true,
         ButtonTone::Stop,
-    )
+    )?;
+
+    let status_center = Point::new(ui_layout.title_origin.x + 189, NETWORK_STATUS_Y);
+    clear_rect(
+        display,
+        Rectangle::new(
+            status_center
+                - Point::new(
+                    (NETWORK_STATUS_WIDTH / 2) as i32,
+                    (NETWORK_STATUS_HEIGHT / 2) as i32,
+                ),
+            Size::new(NETWORK_STATUS_WIDTH, NETWORK_STATUS_HEIGHT),
+        ),
+    )?;
+
+    match context.network_status {
+        NetworkStatus::Connecting => {
+            draw_spinner(
+                display,
+                status_center,
+                ((context.uptime_ms / 125) % 8) as u8,
+            )?;
+        }
+        NetworkStatus::Online => {
+            draw_wifi_icon(display, status_center + Point::new(0, -19))?;
+        }
+        NetworkStatus::Offline => {
+            draw_network_blocked_icon(display, status_center + Point::new(-39, 0))?;
+            let offline_font = ui_font!(BOLD);
+            let offline_style = BitmapFontStyleBuilder::new()
+                .text_color(TEXT_SECONDARY)
+                .background_color(OLED_BLACK)
+                .font(&offline_font)
+                .build();
+            let offline_text_style = TextStyleBuilder::new()
+                .alignment(Alignment::Left)
+                .baseline(Baseline::Middle)
+                .build();
+
+            Text::with_text_style(
+                "offline",
+                status_center + Point::new(-9, 1),
+                offline_style,
+                offline_text_style,
+            )
+            .draw(display)
+            .map_err(RenderError::Draw)?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

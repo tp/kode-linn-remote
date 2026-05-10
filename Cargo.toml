@@ -30,11 +30,17 @@ app-config = { path = "crates/app-config", default-features = false }
 app-core = { path = "crates/app-core" }
 app-runtime = { path = "crates/app-runtime", default-features = false }
 board-waveshare-c6 = { path = "crates/board-waveshare-c6" }
+embassy-futures = { version = "0.1.2", default-features = false }
+embassy-net = { version = "0.9.1", default-features = false }
+embassy-time = { version = "0.5.1", default-features = false }
 embedded-graphics = { version = "0.8.2", default-features = false }
+esp-alloc = { version = "0.10.0", default-features = false }
 esp-backtrace = { version = "0.19.0", default-features = false }
 esp-bootloader-esp-idf = { version = "0.5.0", default-features = false }
 esp-hal = "1.0.0"
 esp-println = { version = "0.17.0", default-features = false }
+esp-radio = { version = "0.18.0", default-features = false }
+esp-rtos = { version = "0.3.0", default-features = false }
 heapless = { version = "0.9", default-features = false }
 image = { version = "0.25.9", default-features = false, features = ["png"] }
 linn-ci-gateway = { path = "crates/linn-ci-gateway" }

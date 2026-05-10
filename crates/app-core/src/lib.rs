@@ -299,6 +299,7 @@ impl App {
         ui::AppContext {
             network_status: self.network_status,
             interaction_count: self.interaction_count,
+            uptime_ms: self.uptime_ms,
         }
     }
 }

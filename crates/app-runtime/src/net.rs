@@ -18,10 +18,31 @@ pub trait ByteStream {
     fn flush(&mut self) -> Result<(), Self::Error>;
 }
 
+impl<T> ByteStream for &mut T
+where
+    T: ByteStream + ?Sized,
+{
+    type Error = T::Error;
+
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
+        (**self).read(buffer)
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        (**self).write_all(bytes)
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        (**self).flush()
+    }
+}
+
 pub trait TcpConnector {
-    type Stream: ByteStream<Error = Self::Error>;
+    type Stream<'a>: ByteStream<Error = Self::Error>
+    where
+        Self: 'a;
     type Error;
 
-    fn connect(&mut self, endpoint: Endpoint) -> Result<Self::Stream, Self::Error>;
-    fn connect_host(&mut self, host: &str, port: u16) -> Result<Self::Stream, Self::Error>;
+    fn connect(&mut self, endpoint: Endpoint) -> Result<Self::Stream<'_>, Self::Error>;
+    fn connect_host(&mut self, host: &str, port: u16) -> Result<Self::Stream<'_>, Self::Error>;
 }

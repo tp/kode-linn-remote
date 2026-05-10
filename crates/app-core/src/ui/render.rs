@@ -12,7 +12,7 @@ impl App {
 
         match &self.active_screen {
             ActiveScreen::Launcher(state) => {
-                screens::launcher::render(state, display, self.ui_layouts.launcher())
+                screens::launcher::render(state, context, display, self.ui_layouts.launcher())
             }
             ActiveScreen::Stopwatch(state) => {
                 screens::stopwatch::render(state, context, display, self.ui_layouts.stopwatch())

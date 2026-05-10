@@ -3,7 +3,9 @@ use core::time::Duration;
 use embedded_graphics::{
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{Circle, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle},
+    primitives::{
+        Arc, Circle, Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle,
+    },
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
 use mplusfonts::{mplus, style::BitmapFontStyleBuilder};
@@ -20,6 +22,8 @@ const TIME_COLON_BOTTOM_OFFSET: i32 = 27;
 const DURATION_HEIGHT: u32 = 40;
 const SPINNER_CLEAR_SIZE: u32 = 96;
 const SPINNER_DOT_COUNT: u32 = 8;
+const WIFI_ICON_STROKE: u32 = 4;
+const NETWORK_BLOCKED_ICON_DIAMETER: u32 = 24;
 pub(super) const DURATION_WIDTH: i32 =
     3 * 2 * TIME_DIGIT_CELL_WIDTH + 2 * (2 * TIME_COLON_GAP + TIME_COLON_DOT_SIZE as i32);
 
@@ -198,17 +202,7 @@ pub(super) fn draw_spinner<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    clear_rect(
-        display,
-        Rectangle::new(
-            center
-                - Point::new(
-                    (SPINNER_CLEAR_SIZE / 2) as i32,
-                    (SPINNER_CLEAR_SIZE / 2) as i32,
-                ),
-            Size::new(SPINNER_CLEAR_SIZE, SPINNER_CLEAR_SIZE),
-        ),
-    )?;
+    clear_spinner(display, center)?;
 
     const OFFSETS: [Point; SPINNER_DOT_COUNT as usize] = [
         Point::new(0, -32),
@@ -241,6 +235,64 @@ where
     }
 
     Ok(())
+}
+
+pub(super) fn clear_spinner<D>(display: &mut D, center: Point) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    clear_rect(
+        display,
+        Rectangle::new(
+            center
+                - Point::new(
+                    (SPINNER_CLEAR_SIZE / 2) as i32,
+                    (SPINNER_CLEAR_SIZE / 2) as i32,
+                ),
+            Size::new(SPINNER_CLEAR_SIZE, SPINNER_CLEAR_SIZE),
+        ),
+    )
+}
+
+pub(super) fn draw_wifi_icon<D>(display: &mut D, center: Point) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let style = PrimitiveStyle::with_stroke(TEXT_PRIMARY, WIFI_ICON_STROKE);
+    Arc::with_center(center + Point::new(0, 19), 72, 215.0.deg(), 110.0.deg())
+        .into_styled(style)
+        .draw(display)
+        .map_err(RenderError::Draw)?;
+    Arc::with_center(center + Point::new(0, 19), 48, 220.0.deg(), 100.0.deg())
+        .into_styled(style)
+        .draw(display)
+        .map_err(RenderError::Draw)?;
+    Arc::with_center(center + Point::new(0, 19), 24, 228.0.deg(), 84.0.deg())
+        .into_styled(style)
+        .draw(display)
+        .map_err(RenderError::Draw)?;
+    Circle::with_center(center + Point::new(0, 31), 8)
+        .into_styled(PrimitiveStyle::with_fill(TEXT_PRIMARY))
+        .draw(display)
+        .map_err(RenderError::Draw)
+}
+
+pub(super) fn draw_network_blocked_icon<D>(
+    display: &mut D,
+    center: Point,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    Circle::with_center(center, NETWORK_BLOCKED_ICON_DIAMETER)
+        .into_styled(PrimitiveStyle::with_stroke(TEXT_SECONDARY, 2))
+        .draw(display)
+        .map_err(RenderError::Draw)?;
+
+    Line::new(center + Point::new(-8, 8), center + Point::new(8, -8))
+        .into_styled(PrimitiveStyle::with_stroke(TEXT_SECONDARY, 2))
+        .draw(display)
+        .map_err(RenderError::Draw)
 }
 
 fn duration_parts(duration: Duration) -> (u8, u8, u8) {

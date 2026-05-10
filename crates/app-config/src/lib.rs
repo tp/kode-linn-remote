@@ -75,6 +75,20 @@ impl AppConfig {
         Ok(config)
     }
 
+    pub fn apply_wifi_env(
+        &mut self,
+        ssid: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<(), ParseError> {
+        if let Some(ssid) = ssid {
+            self.wifi.ssid = non_empty_string(unquote(ssid.trim()))?;
+        }
+        if let Some(password) = password {
+            self.wifi.password = non_empty_string(unquote(password.trim()))?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "std")]
     pub fn load_local_or_default() -> Self {
         let path =
@@ -189,6 +203,24 @@ mod tests {
         );
         assert_eq!(config.wifi.ssid.unwrap().as_str(), "Home WiFi");
         assert_eq!(config.wifi.password.unwrap().as_str(), "secret");
+    }
+
+    #[test]
+    fn applies_wifi_env_overrides() {
+        let mut config = AppConfig::parse_env(
+            r#"
+            WIFI_SSID="old"
+            WIFI_PASSWORD="old-secret"
+            "#,
+        )
+        .unwrap();
+
+        config
+            .apply_wifi_env(Some("new"), Some("\"new-secret\""))
+            .unwrap();
+
+        assert_eq!(config.wifi.ssid.unwrap().as_str(), "new");
+        assert_eq!(config.wifi.password.unwrap().as_str(), "new-secret");
     }
 
     #[test]

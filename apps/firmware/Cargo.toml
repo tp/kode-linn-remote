@@ -6,10 +6,20 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+app-config.workspace = true
 app-core.workspace = true
+app-runtime.workspace = true
 board-waveshare-c6.workspace = true
+embassy-futures.workspace = true
+embassy-net = { workspace = true, features = ["dhcpv4", "dns", "medium-ethernet", "tcp"] }
+embassy-time = { workspace = true, features = ["generic-queue-8"] }
 embedded-graphics.workspace = true
+esp-alloc = { workspace = true, features = ["esp32c6", "global-allocator", "compat"] }
 esp-backtrace = { workspace = true, features = ["esp32c6", "panic-handler", "println"] }
 esp-bootloader-esp-idf = { workspace = true, features = ["esp32c6"] }
 esp-hal = { workspace = true, features = ["esp32c6", "unstable"] }
 esp-println = { workspace = true, features = ["esp32c6", "jtag-serial"] }
+esp-radio = { workspace = true, features = ["esp32c6", "wifi", "esp-alloc"] }
+esp-rtos = { workspace = true, features = ["esp32c6", "esp-radio", "esp-alloc", "embassy"] }
+heapless.workspace = true
+linn-lpec.workspace = true

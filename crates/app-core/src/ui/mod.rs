@@ -13,6 +13,7 @@ use crate::NetworkStatus;
 pub(crate) struct AppContext {
     pub(crate) network_status: NetworkStatus,
     pub(crate) interaction_count: u32,
+    pub(crate) uptime_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

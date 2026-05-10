@@ -1,3 +1,5 @@
+use alloc::vec::Vec as AllocVec;
+
 use app_core::{HIFI_ARTWORK_SIZE, HifiArtwork, HifiCommand, HifiStatus, PlaybackState};
 use heapless::Vec;
 use linn_lpec::{Client as LinnClient, Line, Transport};
@@ -10,6 +12,7 @@ use crate::{
 };
 
 const MAX_ARTWORK_BYTES: usize = 128 * 1024;
+const SESSION_ACTION_LINE_BUDGET: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error<E> {
@@ -21,6 +24,7 @@ pub enum Error<E> {
     HttpError,
     ArtworkTooLarge,
     ArtworkDecode,
+    StatusUnavailable,
     Protocol(linn_lpec::Error<core::convert::Infallible>),
 }
 
@@ -35,6 +39,7 @@ impl Error<core::convert::Infallible> {
             Self::HttpError => Error::HttpError,
             Self::ArtworkTooLarge => Error::ArtworkTooLarge,
             Self::ArtworkDecode => Error::ArtworkDecode,
+            Self::StatusUnavailable => Error::StatusUnavailable,
             Self::Protocol(error) => Error::Protocol(error),
         }
     }
@@ -64,7 +69,7 @@ where
         self.connector
     }
 
-    fn client(&mut self) -> Result<LinnClient<LpecTransport<C::Stream>>, Error<C::Error>> {
+    fn client(&mut self) -> Result<LinnClient<LpecTransport<C::Stream<'_>>>, Error<C::Error>> {
         let stream = self
             .connector
             .connect(self.endpoint)
@@ -78,15 +83,7 @@ where
     }
 
     fn load_artwork(&mut self, uri: &str) -> Result<HifiArtwork, Error<C::Error>> {
-        let request = ArtworkRequest::parse(uri).map_err(Error::erase_transport)?;
-        let mut stream = self
-            .connector
-            .connect_host(request.host, request.port)
-            .map_err(Error::Connect)?;
-        write_http_get(&mut stream, request.host, request.path).map_err(Error::Connect)?;
-        let response = read_http_response(&mut stream)?;
-        let body = response_body(&response).map_err(Error::erase_transport)?;
-        decode_jpeg_artwork(uri, body).map_err(Error::erase_transport)
+        load_artwork(&mut self.connector, uri)
     }
 
     fn toggle_playback(&mut self) -> Result<(), Error<C::Error>> {
@@ -115,56 +112,447 @@ where
     }
 
     fn status(&mut self) -> Result<HifiStatus, Self::Error> {
-        let mut client = self.client()?;
-        let mut status = HifiStatus::empty();
-
-        if let Ok(playback) = read_playback_state(&mut client) {
-            status.playback = playback;
-        }
-
-        if let Ok(args) = client.action(linn_lpec::time()).map_err(map_client_error) {
-            if args.len() >= 3 {
-                status.duration_seconds = parse_u32(&args[1]).unwrap_or(0);
-                status.elapsed_seconds = parse_u32(&args[2])
-                    .unwrap_or(0)
-                    .min(status.duration_seconds);
-            }
-        }
-
-        if let Ok(volume) = client.volume().map_err(map_client_error) {
-            status.volume_percent = volume.min(100);
-        } else if let Ok(args) = client
-            .action(linn_lpec::get_ds_volume())
-            .map_err(map_client_error)
-            && let Some(value) = args.first()
-            && let Some(volume) = parse_u32(value)
-        {
-            status.volume_percent = volume.min(100) as u8;
-        }
-
-        if let Ok(args) = client
-            .action(linn_lpec::info_metatext())
-            .map_err(map_client_error)
-        {
-            if let Some(metadata) = args.first() {
-                apply_metadata(&mut status, metadata);
-            }
-        }
-        if status.title.is_empty()
-            && let Ok(args) = client
-                .action(linn_lpec::info_track())
-                .map_err(map_client_error)
-            && let Some(metadata) = args.get(1)
-        {
-            apply_metadata(&mut status, metadata);
-        }
-
-        Ok(status)
+        read_status(&mut self.client()?)
     }
 
     fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error> {
         self.load_artwork(uri)
     }
+}
+
+pub fn handle_command_with_stream<S>(stream: S, command: HifiCommand) -> Result<(), Error<S::Error>>
+where
+    S: ByteStream,
+{
+    let mut client = LinnClient::new(LpecTransport::new(stream).sync()?);
+    match command {
+        HifiCommand::ActivatePreset { preset } => invoke_pin(&mut client, preset),
+        HifiCommand::TogglePlayback => {
+            let playback = read_playback_state(&mut client)?;
+            if playback_can_pause(playback) {
+                action_with_retry(&mut client, linn_lpec::playlist_pause()).map(|_| ())
+            } else {
+                action_with_retry(&mut client, linn_lpec::playlist_play()).map(|_| ())
+            }
+        }
+    }
+}
+
+pub fn status_from_stream<S>(stream: S) -> Result<HifiStatus, Error<S::Error>>
+where
+    S: ByteStream,
+{
+    read_status(&mut LinnClient::new(LpecTransport::new(stream).sync()?))
+}
+
+pub fn quick_status_from_stream<S>(stream: S) -> Result<HifiStatus, Error<S::Error>>
+where
+    S: ByteStream,
+{
+    let mut client = LinnClient::new(LpecTransport::new(stream).sync()?);
+    let mut status = HifiStatus::empty();
+
+    if let Ok(args) = action_with_retry(&mut client, linn_lpec::info_metatext())
+        && let Some(metadata) = args.first()
+    {
+        apply_metadata(&mut status, metadata);
+    }
+    if status.title.is_empty()
+        && let Ok(args) = action_with_retry(&mut client, linn_lpec::info_track())
+        && let Some(metadata) = args.get(1)
+    {
+        apply_metadata(&mut status, metadata);
+    }
+    if !status_has_live_content(&status) {
+        return Err(Error::StatusUnavailable);
+    }
+
+    Ok(status)
+}
+
+pub fn load_artwork<C>(connector: &mut C, uri: &str) -> Result<HifiArtwork, Error<C::Error>>
+where
+    C: TcpConnector,
+{
+    let request = ArtworkRequest::parse(uri).map_err(Error::erase_transport)?;
+    let mut stream = connector
+        .connect_host(request.host, request.port)
+        .map_err(Error::Connect)?;
+    write_http_get(&mut stream, request.host, request.path).map_err(Error::Connect)?;
+    let response = read_http_response(&mut stream)?;
+    let body = response_body(&response).map_err(Error::erase_transport)?;
+    decode_jpeg_artwork(uri, body).map_err(Error::erase_transport)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpecSession {
+    subscribed: bool,
+    status: HifiStatus,
+}
+
+impl LpecSession {
+    pub fn new() -> Self {
+        Self {
+            subscribed: false,
+            status: HifiStatus::empty(),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.subscribed = false;
+    }
+
+    pub fn poll<S>(&mut self, stream: &mut S) -> Result<Option<HifiStatus>, Error<S::Error>>
+    where
+        S: ByteStream,
+    {
+        self.ensure_subscribed(stream)?;
+
+        let line = read_lpec_line(stream)?;
+        let message = linn_lpec::parse_message(line.as_str()).map_err(Error::Protocol)?;
+        let changed = self.handle_message(message);
+        Ok(self.changed_status(changed))
+    }
+
+    pub fn handle_command<S>(
+        &mut self,
+        stream: &mut S,
+        command: HifiCommand,
+    ) -> Result<Option<HifiStatus>, Error<S::Error>>
+    where
+        S: ByteStream,
+    {
+        self.ensure_subscribed(stream)?;
+        let mut changed = false;
+
+        match command {
+            HifiCommand::ActivatePreset { preset } => {
+                let mut pin_arg = heapless::String::<3>::new();
+                core::fmt::write(&mut pin_arg, format_args!("{preset}"))
+                    .map_err(|_| Error::LineTooLong)?;
+                changed |= self
+                    .action(stream, linn_lpec::invoke_pin_arg(&pin_arg))?
+                    .changed;
+            }
+            HifiCommand::TogglePlayback => {
+                let playback = if self.status.playback == PlaybackState::Unknown {
+                    let response = self.action(stream, linn_lpec::playlist_transport_state())?;
+                    changed |= response.changed;
+                    let playback = response
+                        .args
+                        .first()
+                        .map(|value| parse_playback_state(value))
+                        .unwrap_or(PlaybackState::Unknown);
+                    if self.status.playback != playback {
+                        self.status.playback = playback;
+                        changed = true;
+                    }
+                    playback
+                } else {
+                    self.status.playback
+                };
+
+                let (action, next_playback) = if playback_can_pause(playback) {
+                    (linn_lpec::playlist_pause(), PlaybackState::Paused)
+                } else {
+                    (linn_lpec::playlist_play(), PlaybackState::Playing)
+                };
+                changed |= self.action(stream, action)?.changed;
+                if self.status.playback != next_playback {
+                    self.status.playback = next_playback;
+                    changed = true;
+                }
+            }
+        }
+
+        Ok(self.changed_status(changed))
+    }
+
+    fn ensure_subscribed<S>(&mut self, stream: &mut S) -> Result<(), Error<S::Error>>
+    where
+        S: ByteStream,
+    {
+        if self.subscribed {
+            return Ok(());
+        }
+
+        write_lpec_line(stream, "")?;
+        for service in [
+            linn_lpec::Service::Time,
+            linn_lpec::Service::Info,
+            linn_lpec::Service::Volume,
+        ] {
+            let line = linn_lpec::format_subscribe(service).map_err(Error::Protocol)?;
+            write_lpec_line(stream, line.as_str())?;
+        }
+        self.subscribed = true;
+        Ok(())
+    }
+
+    fn action<S>(
+        &mut self,
+        stream: &mut S,
+        action: linn_lpec::Action<'_>,
+    ) -> Result<SessionActionResponse, Error<S::Error>>
+    where
+        S: ByteStream,
+    {
+        let line = linn_lpec::format_action(action).map_err(Error::Protocol)?;
+        write_lpec_line(stream, line.as_str())?;
+
+        let mut changed = false;
+        for _ in 0..SESSION_ACTION_LINE_BUDGET {
+            let line = read_lpec_line(stream)?;
+            match linn_lpec::parse_message(line.as_str()).map_err(Error::Protocol)? {
+                linn_lpec::Message::Response { args } => {
+                    let args = copy_session_response_args(&args).map_err(Error::erase_transport)?;
+                    return Ok(SessionActionResponse { args, changed });
+                }
+                linn_lpec::Message::Error { code, description } => {
+                    let description =
+                        copy_remote_description(description).map_err(Error::erase_transport)?;
+                    return Err(Error::Protocol(linn_lpec::Error::Remote {
+                        code,
+                        description,
+                    }));
+                }
+                message => changed |= self.handle_message(message),
+            }
+        }
+
+        Err(Error::Protocol(linn_lpec::Error::UnexpectedMessage))
+    }
+
+    fn handle_message(&mut self, message: linn_lpec::Message<'_>) -> bool {
+        match message {
+            linn_lpec::Message::Event { variables, .. } => {
+                let mut changed = false;
+                for variable in variables {
+                    changed |=
+                        apply_event_variable(&mut self.status, variable.name, variable.value);
+                }
+                changed
+            }
+            linn_lpec::Message::ByeBye { .. } | linn_lpec::Message::Unsubscribe { .. } => {
+                self.reset();
+                false
+            }
+            linn_lpec::Message::Subscribe { .. }
+            | linn_lpec::Message::Alive { .. }
+            | linn_lpec::Message::Response { .. }
+            | linn_lpec::Message::Error { .. } => false,
+        }
+    }
+
+    fn changed_status(&self, changed: bool) -> Option<HifiStatus> {
+        if changed && status_has_live_content(&self.status) {
+            Some(self.status.clone())
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for LpecSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct SessionActionResponse {
+    args: heapless::Vec<linn_lpec::ResponseArg, { linn_lpec::MAX_ARGS }>,
+    changed: bool,
+}
+
+pub fn apply_event_variable(status: &mut HifiStatus, name: &str, value: &str) -> bool {
+    match name {
+        "TransportState" => {
+            status.playback = parse_playback_state(value);
+            true
+        }
+        "Duration" | "TrackDuration" => {
+            if let Some(duration) = parse_u32(value) {
+                status.duration_seconds = duration;
+                status.elapsed_seconds = status.elapsed_seconds.min(duration);
+                true
+            } else {
+                false
+            }
+        }
+        "Seconds" | "TrackSeconds" | "Elapsed" | "ElapsedSeconds" => {
+            if let Some(elapsed) = parse_u32(value) {
+                let previous = status.elapsed_seconds;
+                status.elapsed_seconds = elapsed.min(status.duration_seconds);
+                if status.elapsed_seconds != previous
+                    && matches!(
+                        status.playback,
+                        PlaybackState::Unknown | PlaybackState::Paused | PlaybackState::Stopped
+                    )
+                {
+                    status.playback = PlaybackState::Playing;
+                }
+                true
+            } else {
+                false
+            }
+        }
+        "Volume" => {
+            if let Some(volume) = parse_u32(value) {
+                status.volume_percent = volume.min(100) as u8;
+                true
+            } else {
+                false
+            }
+        }
+        "Metatext" | "Track" | "Metadata" => {
+            apply_metadata(status, value);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn read_status<S>(client: &mut LinnClient<LpecTransport<S>>) -> Result<HifiStatus, Error<S::Error>>
+where
+    S: ByteStream,
+{
+    let mut status = HifiStatus::empty();
+
+    if let Ok(playback) = read_playback_state(client) {
+        status.playback = playback;
+    }
+
+    if let Ok(args) = client.action(linn_lpec::time()).map_err(map_client_error) {
+        if args.len() >= 3 {
+            status.duration_seconds = parse_u32(&args[1]).unwrap_or(0);
+            status.elapsed_seconds = parse_u32(&args[2])
+                .unwrap_or(0)
+                .min(status.duration_seconds);
+        }
+    }
+
+    if let Ok(volume) = client.volume().map_err(map_client_error) {
+        status.volume_percent = volume.min(100);
+    } else if let Ok(args) = client
+        .action(linn_lpec::get_ds_volume())
+        .map_err(map_client_error)
+        && let Some(value) = args.first()
+        && let Some(volume) = parse_u32(value)
+    {
+        status.volume_percent = volume.min(100) as u8;
+    }
+
+    if let Ok(args) = client
+        .action(linn_lpec::info_metatext())
+        .map_err(map_client_error)
+        && let Some(metadata) = args.first()
+    {
+        apply_metadata(&mut status, metadata);
+    }
+    if status.title.is_empty()
+        && let Ok(args) = client
+            .action(linn_lpec::info_track())
+            .map_err(map_client_error)
+        && let Some(metadata) = args.get(1)
+    {
+        apply_metadata(&mut status, metadata);
+    }
+
+    if !status_has_live_content(&status) {
+        return Err(Error::StatusUnavailable);
+    }
+
+    Ok(status)
+}
+
+fn action_with_retry<S>(
+    client: &mut LinnClient<LpecTransport<S>>,
+    action: linn_lpec::Action<'_>,
+) -> Result<heapless::Vec<linn_lpec::ResponseArg, { linn_lpec::MAX_ARGS }>, Error<S::Error>>
+where
+    S: ByteStream,
+{
+    match client.action(action).map_err(map_client_error) {
+        Ok(args) => Ok(args),
+        Err(_) => client.action(action).map_err(map_client_error),
+    }
+}
+
+fn invoke_pin<S>(client: &mut LinnClient<LpecTransport<S>>, pin: u8) -> Result<(), Error<S::Error>>
+where
+    S: ByteStream,
+{
+    let mut pin_arg = heapless::String::<3>::new();
+    core::fmt::write(&mut pin_arg, format_args!("{pin}")).map_err(|_| Error::LineTooLong)?;
+    action_with_retry(client, linn_lpec::invoke_pin_arg(&pin_arg)).map(|_| ())
+}
+
+fn write_lpec_line<S>(stream: &mut S, line: &str) -> Result<(), Error<S::Error>>
+where
+    S: ByteStream,
+{
+    stream.write_all(line.as_bytes()).map_err(Error::Connect)?;
+    stream.write_all(b"\r\n").map_err(Error::Connect)?;
+    stream.flush().map_err(Error::Connect)
+}
+
+fn read_lpec_line<S>(stream: &mut S) -> Result<Line, Error<S::Error>>
+where
+    S: ByteStream,
+{
+    let mut buffer = [0_u8; linn_lpec::MAX_LINE_LEN];
+    let mut length = 0;
+    let mut byte = [0; 1];
+
+    loop {
+        let count = stream.read(&mut byte).map_err(Error::Connect)?;
+        if count == 0 {
+            return Err(Error::UnexpectedEof);
+        }
+
+        match byte[0] {
+            b'\n' => {
+                let value = core::str::from_utf8(&buffer[..length])
+                    .map_err(|_| Error::Protocol(linn_lpec::Error::InvalidUtf8))?;
+                let mut line = Line::new();
+                line.push_str(value).map_err(|_| Error::LineTooLong)?;
+                return Ok(line);
+            }
+            b'\r' => {}
+            value => {
+                if length == buffer.len() {
+                    return Err(Error::LineTooLong);
+                }
+                buffer[length] = value;
+                length += 1;
+            }
+        }
+    }
+}
+
+fn copy_session_response_args(
+    args: &Vec<&str, { linn_lpec::MAX_ARGS }>,
+) -> Result<Vec<linn_lpec::ResponseArg, { linn_lpec::MAX_ARGS }>, Error<core::convert::Infallible>>
+{
+    let mut copied = Vec::new();
+    for arg in args {
+        let mut value = linn_lpec::ResponseArg::new();
+        copy_xml_text(arg, &mut value);
+        copied
+            .push(value)
+            .map_err(|_| Error::Protocol(linn_lpec::Error::TooManyArgs))?;
+    }
+    Ok(copied)
+}
+
+fn copy_remote_description(
+    description: &str,
+) -> Result<linn_lpec::RemoteDescription, Error<core::convert::Infallible>> {
+    let mut copied = linn_lpec::RemoteDescription::new();
+    copied
+        .push_str(description)
+        .map_err(|_| Error::LineTooLong)?;
+    Ok(copied)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,6 +627,14 @@ fn playback_can_pause(playback: PlaybackState) -> bool {
     matches!(playback, PlaybackState::Playing | PlaybackState::Buffering)
 }
 
+fn status_has_live_content(status: &HifiStatus) -> bool {
+    !status.title.is_empty()
+        || !status.artist.is_empty()
+        || status.duration_seconds > 0
+        || status.elapsed_seconds > 0
+        || status.playback != PlaybackState::Unknown
+}
+
 fn write_http_get<S>(stream: &mut S, host: &str, path: &str) -> Result<(), S::Error>
 where
     S: ByteStream,
@@ -251,11 +647,11 @@ where
     stream.flush()
 }
 
-fn read_http_response<S>(stream: &mut S) -> Result<Vec<u8, MAX_ARTWORK_BYTES>, Error<S::Error>>
+fn read_http_response<S>(stream: &mut S) -> Result<AllocVec<u8>, Error<S::Error>>
 where
     S: ByteStream,
 {
-    let mut response = Vec::new();
+    let mut response = AllocVec::new();
     let mut chunk = [0_u8; 1024];
     loop {
         let count = stream.read(&mut chunk).map_err(Error::Connect)?;
@@ -263,8 +659,12 @@ where
             return Ok(response);
         }
         response
-            .extend_from_slice(&chunk[..count])
+            .try_reserve(count)
             .map_err(|_| Error::ArtworkTooLarge)?;
+        if response.len().saturating_add(count) > MAX_ARTWORK_BYTES {
+            return Err(Error::ArtworkTooLarge);
+        }
+        response.extend_from_slice(&chunk[..count]);
     }
 }
 
@@ -370,19 +770,8 @@ fn apply_metadata(status: &mut HifiStatus, metadata: &str) {
 }
 
 fn copy_tag<const N: usize>(xml: &str, tag: &str, output: &mut heapless::String<N>) {
-    let Some(start_tag) = find_tag_start(xml, tag) else {
-        return;
-    };
-    let Some(content_start) = xml[start_tag..]
-        .find('>')
-        .map(|offset| start_tag + offset + 1)
-    else {
-        return;
-    };
-    let close = closing_tag(tag);
-    let Some(content_end) = xml[content_start..]
-        .find(close.as_str())
-        .map(|offset| content_start + offset)
+    let Some((content_start, content_end)) =
+        find_tag_content(xml, tag).or_else(|| find_escaped_tag_content(xml, tag))
     else {
         return;
     };
@@ -393,9 +782,12 @@ fn copy_tag<const N: usize>(xml: &str, tag: &str, output: &mut heapless::String<
 
 fn copy_album_art_uri<const N: usize>(xml: &str, output: &mut heapless::String<N>) {
     if copy_album_art_uri_for_profile(xml, "JPEG_TN", output) {
+        prefer_smaller_qobuz_art(output);
         return;
     }
-    let _ = copy_album_art_uri_for_profile(xml, "", output);
+    if copy_album_art_uri_for_profile(xml, "", output) {
+        prefer_smaller_qobuz_art(output);
+    }
 }
 
 fn copy_album_art_uri_for_profile<const N: usize>(
@@ -405,20 +797,34 @@ fn copy_album_art_uri_for_profile<const N: usize>(
 ) -> bool {
     let mut offset = 0;
     while offset < xml.len() {
-        let Some(relative_start) = xml[offset..].find("<upnp:albumArtURI") else {
+        let escaped = xml[offset..].contains("&lt;upnp:albumArtURI")
+            && !xml[offset..].contains("<upnp:albumArtURI");
+        let start_needle = if escaped {
+            "&lt;upnp:albumArtURI"
+        } else {
+            "<upnp:albumArtURI"
+        };
+        let end_needle = if escaped { "&gt;" } else { ">" };
+        let close_needle = if escaped {
+            "&lt;/upnp:albumArtURI&gt;"
+        } else {
+            "</upnp:albumArtURI>"
+        };
+
+        let Some(relative_start) = xml[offset..].find(start_needle) else {
             return false;
         };
         let tag_start = offset + relative_start;
         let Some(content_start) = xml[tag_start..]
-            .find('>')
-            .map(|relative| tag_start + relative + 1)
+            .find(end_needle)
+            .map(|relative| tag_start + relative + end_needle.len())
         else {
             return false;
         };
         let open_tag = &xml[tag_start..content_start];
         if profile.is_empty() || open_tag.contains(profile) {
             let Some(content_end) = xml[content_start..]
-                .find("</upnp:albumArtURI>")
+                .find(close_needle)
                 .map(|relative| content_start + relative)
             else {
                 return false;
@@ -434,9 +840,56 @@ fn copy_album_art_uri_for_profile<const N: usize>(
     false
 }
 
+fn prefer_smaller_qobuz_art<const N: usize>(uri: &mut heapless::String<N>) {
+    let Some(marker) = uri.find("_600.") else {
+        return;
+    };
+
+    let mut smaller = heapless::String::<N>::new();
+    if smaller.push_str(&uri[..marker]).is_err()
+        || smaller.push_str("_230.").is_err()
+        || smaller.push_str(&uri[marker + 5..]).is_err()
+    {
+        return;
+    }
+
+    *uri = smaller;
+}
+
+fn find_tag_content(xml: &str, tag: &str) -> Option<(usize, usize)> {
+    let start_tag = find_tag_start(xml, tag)?;
+    let content_start = xml[start_tag..]
+        .find('>')
+        .map(|offset| start_tag + offset + 1)?;
+    let close = closing_tag(tag);
+    let content_end = xml[content_start..]
+        .find(close.as_str())
+        .map(|offset| content_start + offset)?;
+    Some((content_start, content_end))
+}
+
+fn find_escaped_tag_content(xml: &str, tag: &str) -> Option<(usize, usize)> {
+    let start_tag = find_escaped_tag_start(xml, tag)?;
+    let content_start = xml[start_tag..]
+        .find("&gt;")
+        .map(|offset| start_tag + offset + 4)?;
+    let close = escaped_closing_tag(tag);
+    let content_end = xml[content_start..]
+        .find(close.as_str())
+        .map(|offset| content_start + offset)?;
+    Some((content_start, content_end))
+}
+
 fn find_tag_start(xml: &str, tag: &str) -> Option<usize> {
     let mut needle = heapless::String::<32>::new();
     needle.push('<').ok()?;
+    needle.push_str(tag).ok()?;
+    xml.find(needle.as_str())
+}
+
+fn find_escaped_tag_start(xml: &str, tag: &str) -> Option<usize> {
+    let mut needle = heapless::String::<40>::new();
+    needle.push_str("&lt;").ok()?;
     needle.push_str(tag).ok()?;
     xml.find(needle.as_str())
 }
@@ -446,6 +899,14 @@ fn closing_tag(tag: &str) -> heapless::String<40> {
     let _ = close.push_str("</");
     let _ = close.push_str(tag);
     let _ = close.push('>');
+    close
+}
+
+fn escaped_closing_tag(tag: &str) -> heapless::String<48> {
+    let mut close = heapless::String::new();
+    let _ = close.push_str("&lt;/");
+    let _ = close.push_str(tag);
+    let _ = close.push_str("&gt;");
     close
 }
 
@@ -564,6 +1025,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::{collections::VecDeque, vec::Vec as AllocVec};
 
     #[test]
     fn parses_didl_track_metadata() {
@@ -580,6 +1042,84 @@ mod tests {
         assert_eq!(
             status.album_art_uri.as_str(),
             "http://192.168.7.218/art/thumb.jpg"
+        );
+    }
+
+    #[test]
+    fn parses_lpec_escaped_didl_track_metadata() {
+        let mut status = HifiStatus::empty();
+
+        apply_metadata(
+            &mut status,
+            r#"&lt;DIDL-Lite xmlns:upnp=&quot;urn:schemas-upnp-org:metadata-1-0/upnp/&quot; xmlns:dc=&quot;http://purl.org/dc/elements/1.1/&quot;&gt;&lt;item&gt;&lt;dc:title&gt;Chips n Queso&lt;/dc:title&gt;&lt;upnp:album&gt;Five Star Michelin&lt;/upnp:album&gt;&lt;upnp:artist&gt;Lorde&lt;/upnp:artist&gt;&lt;upnp:albumArtURI dlna:profileID=&quot;JPEG_TN&quot;&gt;https://static.qobuz.com/images/covers/thumb.jpg&lt;/upnp:albumArtURI&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"#,
+        );
+
+        assert_eq!(status.title.as_str(), "Chips n Queso");
+        assert_eq!(status.artist.as_str(), "Lorde");
+        assert_eq!(status.album.as_str(), "Five Star Michelin");
+        assert_eq!(
+            status.album_art_uri.as_str(),
+            "https://static.qobuz.com/images/covers/thumb.jpg"
+        );
+    }
+
+    #[test]
+    fn prefers_smaller_qobuz_artwork_uri() {
+        let mut status = HifiStatus::empty();
+
+        apply_metadata(
+            &mut status,
+            r#"<DIDL-Lite><item><upnp:albumArtURI>https://static.qobuz.com/images/covers/zl/mi/go7xvf8bnmizl_600.jpg</upnp:albumArtURI></item></DIDL-Lite>"#,
+        );
+
+        assert_eq!(
+            status.album_art_uri.as_str(),
+            "https://static.qobuz.com/images/covers/zl/mi/go7xvf8bnmizl_230.jpg"
+        );
+    }
+
+    #[test]
+    fn session_subscribes_and_applies_info_event_metadata() {
+        let mut session = LpecSession::new();
+        let mut stream = ScriptedByteStream::new(&[
+            r#"EVENT 2 0 Metatext "&lt;DIDL-Lite&gt;&lt;item&gt;&lt;dc:title&gt;Chips n Queso&lt;/dc:title&gt;&lt;upnp:artist&gt;Lorde&lt;/upnp:artist&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;""#,
+        ]);
+
+        let status = session.poll(&mut stream).unwrap().unwrap();
+
+        assert_eq!(status.title.as_str(), "Chips n Queso");
+        assert_eq!(status.artist.as_str(), "Lorde");
+        assert!(stream.writes_as_str().contains("SUBSCRIBE Ds/Info"));
+    }
+
+    #[test]
+    fn session_inferrs_playing_from_advancing_seconds() {
+        let mut session = LpecSession::new();
+        let mut stream =
+            ScriptedByteStream::new(&[r#"EVENT 1 0 Duration "180""#, r#"EVENT 1 1 Seconds "2""#]);
+
+        assert!(session.poll(&mut stream).unwrap().is_some());
+        let status = session.poll(&mut stream).unwrap().unwrap();
+
+        assert_eq!(status.elapsed_seconds, 2);
+        assert_eq!(status.playback, PlaybackState::Playing);
+    }
+
+    #[test]
+    fn session_updates_playback_after_toggle_command() {
+        let mut session = LpecSession::new();
+        let mut stream = ScriptedByteStream::new(&[r#"RESPONSE "Playing""#, "RESPONSE"]);
+
+        let status = session
+            .handle_command(&mut stream, HifiCommand::TogglePlayback)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(status.playback, PlaybackState::Paused);
+        assert!(
+            stream
+                .writes_as_str()
+                .contains("ACTION Ds/Playlist 1 Pause")
         );
     }
 
@@ -601,5 +1141,49 @@ mod tests {
         assert_eq!(request.host, "static.qobuz.com");
         assert_eq!(request.port, 80);
         assert_eq!(request.path, "images/covers/mb/x1/cover_230.jpg");
+    }
+
+    struct ScriptedByteStream {
+        reads: VecDeque<u8>,
+        writes: AllocVec<u8>,
+    }
+
+    impl ScriptedByteStream {
+        fn new(lines: &[&str]) -> Self {
+            let mut reads = VecDeque::new();
+            for line in lines {
+                reads.extend(line.as_bytes());
+                reads.extend(b"\r\n");
+            }
+            Self {
+                reads,
+                writes: AllocVec::new(),
+            }
+        }
+
+        fn writes_as_str(&self) -> &str {
+            core::str::from_utf8(&self.writes).unwrap()
+        }
+    }
+
+    impl ByteStream for ScriptedByteStream {
+        type Error = ();
+
+        fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
+            let Some(byte) = self.reads.pop_front() else {
+                return Err(());
+            };
+            buffer[0] = byte;
+            Ok(1)
+        }
+
+        fn write_all(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+            self.writes.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
     }
 }
