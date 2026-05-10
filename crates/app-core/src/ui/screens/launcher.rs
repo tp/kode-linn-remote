@@ -15,7 +15,9 @@ use super::super::{
         draw_wifi_icon, ui_font,
     },
     geometry::horizontal_pair,
+    painter::Painter,
     style::{OLED_BLACK, TEXT_PRIMARY, TEXT_SECONDARY},
+    widget::Widget,
 };
 
 const CONTENT_INSET: i32 = 44;
@@ -35,11 +37,24 @@ pub(crate) struct Layout {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct State;
+pub(crate) struct State {
+    static_drawn: bool,
+    network_status_drawn: Option<NetworkStatus>,
+    spinner_phase_drawn: Option<u8>,
+}
 
 impl State {
     pub(crate) const fn new() -> Self {
-        Self
+        Self {
+            static_drawn: false,
+            network_status_drawn: None,
+            spinner_phase_drawn: None,
+        }
+    }
+
+    pub(crate) fn on_tick(&self, context: AppContext) -> bool {
+        matches!(context.network_status, NetworkStatus::Connecting)
+            && self.spinner_phase_drawn != Some(spinner_phase(context.uptime_ms))
     }
 }
 
@@ -77,96 +92,175 @@ fn hit_test(layout: &Layout, point: Point) -> Option<Screen> {
 }
 
 pub(crate) fn render<D>(
-    _state: &mut State,
+    state: &mut State,
     context: AppContext,
     display: &mut D,
-    _scratch: &mut [Rgb565],
+    scratch: &mut [Rgb565],
     ui_layout: &Layout,
 ) -> Result<(), RenderError<D::Error>>
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    let title_font = ui_font!(BOLD);
-    let title_style = BitmapFontStyleBuilder::new()
-        .text_color(TEXT_PRIMARY)
-        .background_color(OLED_BLACK)
-        .font(&title_font)
-        .build();
-    let top_text_style = TextStyleBuilder::new().baseline(Baseline::Top).build();
-
-    Text::with_text_style(
-        "Launcher",
-        ui_layout.title_origin,
-        title_style,
-        top_text_style,
-    )
-    .draw(display)
-    .map_err(RenderError::Draw)?;
-
-    draw_button(
-        display,
-        ui_layout.stopwatch_button,
-        "STOP WATCH",
-        true,
-        ButtonTone::Start,
-    )?;
-    draw_button(
-        display,
-        ui_layout.hifi_button,
-        "HIFI",
-        true,
-        ButtonTone::Stop,
-    )?;
+    let mut painter = Painter::new(display, scratch);
+    let static_chrome = StaticChrome {
+        layout: *ui_layout,
+        already_drawn: state.static_drawn,
+    };
+    painter.draw(&static_chrome).map_err(RenderError::Draw)?;
+    state.static_drawn = true;
 
     let status_center = Point::new(ui_layout.title_origin.x + 189, NETWORK_STATUS_Y);
-    clear_rect(
-        display,
+    let spinner_phase = spinner_phase(context.uptime_ms);
+    let network_status = NetworkStatusWidget {
+        center: status_center,
+        status: context.network_status,
+        spinner_phase,
+        previous_status: state.network_status_drawn,
+        previous_spinner_phase: state.spinner_phase_drawn,
+    };
+    painter.draw(&network_status).map_err(RenderError::Draw)?;
+    state.network_status_drawn = Some(context.network_status);
+    state.spinner_phase_drawn = match context.network_status {
+        NetworkStatus::Connecting => Some(spinner_phase),
+        NetworkStatus::Online | NetworkStatus::Offline => None,
+    };
+
+    Ok(())
+}
+
+fn spinner_phase(uptime_ms: u64) -> u8 {
+    ((uptime_ms / 125) % 8) as u8
+}
+
+struct StaticChrome {
+    layout: Layout,
+    already_drawn: bool,
+}
+
+impl Widget<()> for StaticChrome {
+    fn bounds(&self) -> Rectangle {
+        Rectangle::new(Point::zero(), Size::zero())
+    }
+
+    fn should_draw(&self) -> bool {
+        !self.already_drawn
+    }
+
+    fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
+    where
+        D: DrawTarget<Color = Rgb565>,
+    {
+        let title_font = ui_font!(BOLD);
+        let title_style = BitmapFontStyleBuilder::new()
+            .text_color(TEXT_PRIMARY)
+            .background_color(OLED_BLACK)
+            .font(&title_font)
+            .build();
+        let top_text_style = TextStyleBuilder::new().baseline(Baseline::Top).build();
+
+        Text::with_text_style(
+            "Launcher",
+            self.layout.title_origin,
+            title_style,
+            top_text_style,
+        )
+        .draw(target)?;
+
+        draw_button(
+            target,
+            self.layout.stopwatch_button,
+            "STOP WATCH",
+            true,
+            ButtonTone::Start,
+        )
+        .map_err(render_error_into_draw)?;
+        draw_button(
+            target,
+            self.layout.hifi_button,
+            "HIFI",
+            true,
+            ButtonTone::Stop,
+        )
+        .map_err(render_error_into_draw)?;
+
+        Ok(())
+    }
+}
+
+struct NetworkStatusWidget {
+    center: Point,
+    status: NetworkStatus,
+    spinner_phase: u8,
+    previous_status: Option<NetworkStatus>,
+    previous_spinner_phase: Option<u8>,
+}
+
+impl Widget<()> for NetworkStatusWidget {
+    fn bounds(&self) -> Rectangle {
         Rectangle::new(
-            status_center
+            self.center
                 - Point::new(
                     (NETWORK_STATUS_WIDTH / 2) as i32,
                     (NETWORK_STATUS_HEIGHT / 2) as i32,
                 ),
             Size::new(NETWORK_STATUS_WIDTH, NETWORK_STATUS_HEIGHT),
-        ),
-    )?;
-
-    match context.network_status {
-        NetworkStatus::Connecting => {
-            draw_spinner(
-                display,
-                status_center,
-                ((context.uptime_ms / 125) % 8) as u8,
-            )?;
-        }
-        NetworkStatus::Online => {
-            draw_wifi_icon(display, status_center + Point::new(0, -19))?;
-        }
-        NetworkStatus::Offline => {
-            draw_network_blocked_icon(display, status_center + Point::new(-39, 0))?;
-            let offline_font = ui_font!(BOLD);
-            let offline_style = BitmapFontStyleBuilder::new()
-                .text_color(TEXT_SECONDARY)
-                .background_color(OLED_BLACK)
-                .font(&offline_font)
-                .build();
-            let offline_text_style = TextStyleBuilder::new()
-                .alignment(Alignment::Left)
-                .baseline(Baseline::Middle)
-                .build();
-
-            Text::with_text_style(
-                "offline",
-                status_center + Point::new(-9, 1),
-                offline_style,
-                offline_text_style,
-            )
-            .draw(display)
-            .map_err(RenderError::Draw)?;
-        }
+        )
     }
 
-    Ok(())
+    fn should_draw(&self) -> bool {
+        self.previous_status != Some(self.status)
+            || (matches!(self.status, NetworkStatus::Connecting)
+                && self.previous_spinner_phase != Some(self.spinner_phase))
+    }
+
+    fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
+    where
+        D: DrawTarget<Color = Rgb565>,
+    {
+        clear_rect(target, self.bounds()).map_err(render_error_into_draw)?;
+
+        match self.status {
+            NetworkStatus::Connecting => {
+                draw_spinner(target, self.center, self.spinner_phase)
+                    .map_err(render_error_into_draw)?;
+            }
+            NetworkStatus::Online => {
+                draw_wifi_icon(target, self.center + Point::new(0, -19))
+                    .map_err(render_error_into_draw)?;
+            }
+            NetworkStatus::Offline => {
+                draw_network_blocked_icon(target, self.center + Point::new(-39, 0))
+                    .map_err(render_error_into_draw)?;
+                let offline_font = ui_font!(BOLD);
+                let offline_style = BitmapFontStyleBuilder::new()
+                    .text_color(TEXT_SECONDARY)
+                    .background_color(OLED_BLACK)
+                    .font(&offline_font)
+                    .build();
+                let offline_text_style = TextStyleBuilder::new()
+                    .alignment(Alignment::Left)
+                    .baseline(Baseline::Middle)
+                    .build();
+
+                Text::with_text_style(
+                    "offline",
+                    self.center + Point::new(-9, 1),
+                    offline_style,
+                    offline_text_style,
+                )
+                .draw(target)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn render_error_into_draw<E>(error: RenderError<E>) -> E {
+    match error {
+        RenderError::Draw(error) => error,
+        RenderError::TextFormat => unreachable!("launcher text uses fixed literals"),
+    }
 }
 
 #[cfg(test)]

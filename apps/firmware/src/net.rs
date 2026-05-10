@@ -1,13 +1,15 @@
+use core::task::Poll;
+
 use app_runtime::net::{ByteStream, Endpoint, TcpConnector};
 use embassy_futures::{
-    block_on,
-    select::{Either3, select3},
+    block_on, poll_once,
+    select::{Either, Either3, select, select3},
 };
 use embassy_net::{
     Config as NetConfig, IpAddress, IpEndpoint, Ipv4Address, Runner, Stack, StackResources,
     dns::DnsQueryType, tcp::TcpSocket,
 };
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_radio::wifi::Interface;
 
 const TCP_RX_BUFFER_BYTES: usize = 2048;
@@ -16,12 +18,14 @@ const ARTWORK_RX_BUFFER_BYTES: usize = 4096;
 const ARTWORK_TX_BUFFER_BYTES: usize = 1024;
 const DHCP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const EVENT_CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
-const EVENT_READ_TIMEOUT: Duration = Duration::from_millis(50);
+const EVENT_READ_TIMEOUT: Duration = Duration::from_millis(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const EVENT_WRITE_TIMEOUT: Duration = Duration::from_millis(20);
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
-const ABORT_TIMEOUT: Duration = Duration::from_millis(250);
+const ABORT_TIMEOUT: Duration = Duration::from_millis(20);
 
 pub struct FirmwareNetwork {
     stack: Stack<'static>,
@@ -29,6 +33,7 @@ pub struct FirmwareNetwork {
     lpec_socket: Option<TcpSocket<'static>>,
     artwork_socket: Option<TcpSocket<'static>>,
     config_ready: bool,
+    config_poll_started_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,25 +68,55 @@ impl FirmwareNetwork {
             lpec_socket: None,
             artwork_socket: None,
             config_ready: false,
+            config_poll_started_at: None,
         }
     }
 
     pub fn wait_config_up(&mut self) -> Result<(), FirmwareNetError> {
+        block_on(self.wait_config_up_async())
+    }
+
+    pub async fn wait_config_up_async(&mut self) -> Result<(), FirmwareNetError> {
         if self.config_ready {
             return Ok(());
         }
 
-        match block_on(select3(
+        match select3(
             self.stack.wait_config_up(),
             self.runner.run(),
             Timer::after(DHCP_TIMEOUT),
-        )) {
+        )
+        .await
+        {
             Either3::First(()) => {
                 self.config_ready = true;
+                self.config_poll_started_at = None;
                 Ok(())
             }
             Either3::Second(_) => unreachable!(),
             Either3::Third(()) => Err(FirmwareNetError::DhcpTimeout),
+        }
+    }
+
+    pub fn poll_config_up(&mut self) -> Result<bool, FirmwareNetError> {
+        if self.config_ready {
+            return Ok(true);
+        }
+
+        let started_at = *self.config_poll_started_at.get_or_insert_with(Instant::now);
+        if started_at.elapsed() >= DHCP_TIMEOUT {
+            self.config_poll_started_at = None;
+            return Err(FirmwareNetError::DhcpTimeout);
+        }
+
+        match poll_once(select(self.stack.wait_config_up(), self.runner.run())) {
+            Poll::Ready(Either::First(())) => {
+                self.config_ready = true;
+                self.config_poll_started_at = None;
+                Ok(true)
+            }
+            Poll::Ready(Either::Second(_)) => unreachable!(),
+            Poll::Pending => Ok(false),
         }
     }
 
@@ -93,23 +128,30 @@ impl FirmwareNetwork {
         &mut self,
         endpoint: Endpoint,
     ) -> Result<FirmwareTcpStream<'_>, FirmwareNetError> {
-        self.connect_with_read_timeout(endpoint, READ_TIMEOUT)
+        self.connect_with_timeouts(endpoint, CONNECT_TIMEOUT, READ_TIMEOUT, WRITE_TIMEOUT)
     }
 
     pub fn connect_events(
         &mut self,
         endpoint: Endpoint,
     ) -> Result<FirmwareTcpStream<'_>, FirmwareNetError> {
-        self.connect_with_read_timeout(endpoint, EVENT_READ_TIMEOUT)
+        self.connect_with_timeouts(
+            endpoint,
+            EVENT_CONNECT_TIMEOUT,
+            EVENT_READ_TIMEOUT,
+            EVENT_WRITE_TIMEOUT,
+        )
     }
 
-    fn connect_with_read_timeout(
+    fn connect_with_timeouts(
         &mut self,
         endpoint: Endpoint,
+        connect_timeout: Duration,
         read_timeout: Duration,
+        write_timeout: Duration,
     ) -> Result<FirmwareTcpStream<'_>, FirmwareNetError> {
         self.wait_config_up()?;
-        self.ensure_lpec_socket(endpoint)?;
+        self.ensure_lpec_socket(endpoint, connect_timeout)?;
 
         let Self {
             runner,
@@ -123,6 +165,7 @@ impl FirmwareNetwork {
             socket,
             runner,
             read_timeout,
+            write_timeout,
         })
     }
 
@@ -144,7 +187,11 @@ impl FirmwareNetwork {
         let _ = drive_tcp(socket.flush(), &mut self.runner, ABORT_TIMEOUT);
     }
 
-    fn ensure_lpec_socket(&mut self, endpoint: Endpoint) -> Result<(), FirmwareNetError> {
+    fn ensure_lpec_socket(
+        &mut self,
+        endpoint: Endpoint,
+        connect_timeout: Duration,
+    ) -> Result<(), FirmwareNetError> {
         if self
             .lpec_socket
             .as_ref()
@@ -173,7 +220,7 @@ impl FirmwareNetwork {
         match block_on(select3(
             socket.connect(remote),
             self.runner.run(),
-            Timer::after(CONNECT_TIMEOUT),
+            Timer::after(connect_timeout),
         )) {
             Either3::First(Ok(())) => {
                 self.lpec_socket = Some(socket);
@@ -245,6 +292,7 @@ impl FirmwareNetwork {
                     socket,
                     runner,
                     read_timeout: READ_TIMEOUT,
+                    write_timeout: WRITE_TIMEOUT,
                 })
             }
             Either3::First(Err(_)) => {
@@ -281,6 +329,7 @@ pub struct FirmwareTcpStream<'a> {
     socket: &'a mut TcpSocket<'static>,
     runner: &'a mut Runner<'static, Interface<'static>>,
     read_timeout: Duration,
+    write_timeout: Duration,
 }
 
 impl ByteStream for FirmwareTcpStream<'_> {
@@ -296,7 +345,7 @@ impl ByteStream for FirmwareTcpStream<'_> {
 
     fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), Self::Error> {
         while !bytes.is_empty() {
-            match drive_tcp(self.socket.write(bytes), self.runner, WRITE_TIMEOUT) {
+            match drive_tcp(self.socket.write(bytes), self.runner, self.write_timeout) {
                 Ok(Ok(0)) => return Err(FirmwareNetError::WriteFailed),
                 Ok(Ok(count)) => bytes = &bytes[count..],
                 Ok(Err(_)) => return Err(FirmwareNetError::WriteFailed),

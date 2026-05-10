@@ -209,8 +209,9 @@ impl App {
         let render_requested = match event {
             Event::Tick { uptime_ms } => {
                 self.uptime_ms = uptime_ms;
+                let context = self.ui_context();
                 match &mut self.active_screen {
-                    ActiveScreen::Launcher(_) => false,
+                    ActiveScreen::Launcher(state) => state.on_tick(context),
                     ActiveScreen::Stopwatch(state) => state.on_tick(uptime_ms),
                     ActiveScreen::HifiControl(state) => state.on_tick(uptime_ms),
                 }
@@ -623,6 +624,16 @@ mod tests {
 
         assert_eq!(app.network_status(), NetworkStatus::Offline);
         assert!(!outcome.render_requested);
+    }
+
+    #[test]
+    fn launcher_connecting_network_status_animates_on_tick() {
+        let mut app = App::new();
+
+        app.update(Event::NetworkStatus(NetworkStatus::Connecting));
+        let outcome = app.update(Event::Tick { uptime_ms: 120 });
+
+        assert!(outcome.render_requested);
     }
 
     #[test]

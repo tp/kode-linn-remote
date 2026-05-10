@@ -9,7 +9,6 @@ extern crate alloc;
 
 use alloc::vec;
 use alloc::vec::Vec;
-
 use app_config::{AppConfig, WifiConfig};
 use app_core::{
     App, Command, Event, HIFI_URI_LEN, HifiStatus, NetworkStatus, PlaybackState,
@@ -22,7 +21,12 @@ use app_runtime::lpec::{
 use app_runtime::net::Endpoint;
 use board_waveshare_c6::{BOARD_NAME, DISPLAY_SIZE, peripherals};
 use display::AmoledDisplay;
-use embassy_futures::block_on;
+use embassy_executor::Spawner;
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex,
+    channel::{Channel, TryReceiveError},
+};
+use embassy_time::{Duration as EmbassyDuration, Timer};
 use embedded_graphics::{draw_target::DrawTarget, pixelcolor::Rgb565, prelude::RgbColor};
 use esp_backtrace as _;
 use esp_hal::{
@@ -47,11 +51,20 @@ const TOUCH_POLL_MS: u64 = 50;
 const HEARTBEAT_MS: u64 = 1_000;
 const LPEC_EVENT_POLL_MS: u64 = 100;
 const WIFI_CONNECT_ATTEMPTS: u8 = 5;
-const WIFI_SCAN_RETRIES: u8 = 3;
 const LOCAL_CONFIG: &str = include_str!("../../../config/local.env");
 
-#[esp_hal::main]
-fn main() -> ! {
+static WIFI_EVENTS: Channel<CriticalSectionRawMutex, WifiEvent, 2> = Channel::new();
+
+enum WifiEvent {
+    Connected {
+        controller: WifiController<'static>,
+        interfaces: Interfaces<'static>,
+    },
+    Offline,
+}
+
+#[esp_rtos::main]
+async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default();
     let peripherals = esp_hal::init(config);
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
@@ -154,7 +167,7 @@ fn main() -> ! {
         Err(_) => println!("display: initial render failed"),
     }
 
-    let mut uptime_ms = 0;
+    let booted_at = Instant::now();
     let mut next_heartbeat_ms = 0;
     let mut next_lpec_event_poll_ms = 0;
     let mut consecutive_touch_errors = 0_u32;
@@ -176,63 +189,70 @@ fn main() -> ! {
             &mut rendered_screen,
             render_requested,
         );
+        spawner.spawn(
+            wifi_task(peripherals.WIFI, app_config.wifi.clone())
+                .expect("wifi task should allocate once"),
+        );
+    } else {
+        println!("wifi: missing WIFI_SSID/WIFI_PASSWORD");
     }
 
-    let (mut network, _wifi_controller) = match connect_wifi(peripherals.WIFI, &app_config.wifi) {
-        WifiConnection::Connected {
-            controller,
-            interfaces,
-        } => {
-            let render_requested = app
-                .update(Event::NetworkStatus(NetworkStatus::Online))
-                .render_requested;
-            let _ = render_app(
-                &mut app,
-                &mut display,
-                &mut scratch,
-                &mut rendered_screen,
-                render_requested,
-            );
-
-            let mut network = FirmwareNetwork::new(interfaces.station);
-            println!(
-                "net: starting DHCP for Linn endpoint {}.{}.{}.{}:{}",
-                app_config.linn_lpec_endpoint.address[0],
-                app_config.linn_lpec_endpoint.address[1],
-                app_config.linn_lpec_endpoint.address[2],
-                app_config.linn_lpec_endpoint.address[3],
-                app_config.linn_lpec_endpoint.port
-            );
-            match network.wait_config_up() {
-                Ok(()) => {
-                    if let Some(config) = network.config_v4() {
-                        println!("net: dhcp address {}", config.address);
-                    }
-                }
-                Err(error) => println!("net: dhcp failed: {:?}", error),
-            }
-
-            (Some(network), Some(controller))
-        }
-        WifiConnection::MissingCredentials | WifiConnection::Failed => {
-            let render_requested = app
-                .update(Event::NetworkStatus(NetworkStatus::Offline))
-                .render_requested;
-            let _ = render_app(
-                &mut app,
-                &mut display,
-                &mut scratch,
-                &mut rendered_screen,
-                render_requested,
-            );
-            (None, None)
-        }
-    };
+    let mut network = None;
+    let mut _wifi_controller = None;
+    let mut network_ready = false;
 
     loop {
+        let uptime_ms = booted_at.elapsed().as_millis() as u64;
         let mut render_requested = false;
         let mut frame_rendered = false;
         let mut pending_command = None;
+
+        loop {
+            match WIFI_EVENTS.try_receive() {
+                Ok(WifiEvent::Connected {
+                    controller,
+                    interfaces,
+                }) => {
+                    let next_network = FirmwareNetwork::new(interfaces.station);
+                    _wifi_controller = Some(controller);
+                    network = Some(next_network);
+                    network_ready = false;
+                }
+                Ok(WifiEvent::Offline) => {
+                    render_requested |= app
+                        .update(Event::NetworkStatus(NetworkStatus::Offline))
+                        .render_requested;
+                    network = None;
+                    _wifi_controller = None;
+                    network_ready = false;
+                }
+                Err(TryReceiveError::Empty) => break,
+            }
+        }
+
+        if !network_ready && let Some(active_network) = network.as_mut() {
+            match active_network.poll_config_up() {
+                Ok(true) => {
+                    if let Some(config) = active_network.config_v4() {
+                        println!("net: dhcp address {}", config.address);
+                    }
+                    network_ready = true;
+                    render_requested |= app
+                        .update(Event::NetworkStatus(NetworkStatus::Online))
+                        .render_requested;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    println!("net: dhcp failed: {:?}", error);
+                    network = None;
+                    _wifi_controller = None;
+                    network_ready = false;
+                    render_requested |= app
+                        .update(Event::NetworkStatus(NetworkStatus::Offline))
+                        .render_requested;
+                }
+            }
+        }
 
         match touch.poll(&mut i2c) {
             Ok(Some(event)) => {
@@ -277,17 +297,24 @@ fn main() -> ! {
         render_requested = false;
 
         if let Some(command) = pending_command {
-            render_requested |= handle_linn_command(
-                &mut network,
-                app_config.linn_lpec_endpoint,
-                &mut app,
-                &mut lpec_session,
-                command,
-            );
+            if network_ready {
+                render_requested |= handle_linn_command(
+                    &mut network,
+                    app_config.linn_lpec_endpoint,
+                    &mut app,
+                    &mut lpec_session,
+                    command,
+                );
+            } else {
+                println!("linn: command ignored while network is connecting");
+            }
             next_lpec_event_poll_ms = 0;
         }
 
-        if app.screen() == Screen::HifiControl && uptime_ms >= next_lpec_event_poll_ms {
+        if network_ready
+            && app.screen() == Screen::HifiControl
+            && uptime_ms >= next_lpec_event_poll_ms
+        {
             render_requested |= poll_linn_events(
                 &mut network,
                 app_config.linn_lpec_endpoint,
@@ -331,12 +358,11 @@ fn main() -> ! {
             next_heartbeat_ms = next_heartbeat_ms.saturating_add(HEARTBEAT_MS);
         }
 
-        wait_millis(TOUCH_POLL_MS);
-        uptime_ms += TOUCH_POLL_MS;
+        Timer::after(EmbassyDuration::from_millis(TOUCH_POLL_MS)).await;
     }
 }
 
-fn connect_wifi<'d>(wifi: WIFI<'d>, config: &WifiConfig) -> WifiConnection<'d> {
+async fn connect_wifi<'d>(wifi: WIFI<'d>, config: &WifiConfig) -> WifiConnection<'d> {
     let (Some(ssid), Some(password)) = (&config.ssid, &config.password) else {
         println!("wifi: missing WIFI_SSID/WIFI_PASSWORD");
         return WifiConnection::MissingCredentials;
@@ -361,13 +387,12 @@ fn connect_wifi<'d>(wifi: WIFI<'d>, config: &WifiConfig) -> WifiConnection<'d> {
         }
     };
 
-    let target_seen = scan_configured_network(&mut controller, target_ssid);
-    if !target_seen {
-        println!("wifi: configured SSID not visible before connect; trying station connect anyway");
-    }
-
     for attempt in 1..=WIFI_CONNECT_ATTEMPTS {
-        match block_on(controller.connect_async()) {
+        if let Err(error) = controller.set_config(&station_config) {
+            println!("wifi: station reconfigure failed: {:?}", error);
+        }
+
+        match controller.connect_async().await {
             Ok(info) => {
                 println!(
                     "wifi: connected: channel={} auth={:?}",
@@ -380,19 +405,16 @@ fn connect_wifi<'d>(wifi: WIFI<'d>, config: &WifiConfig) -> WifiConnection<'d> {
             }
             Err(error) => {
                 log_wifi_error("connect failed", attempt, error);
-                let _ = block_on(controller.disconnect_async());
-                if let Err(error) = controller.set_config(&station_config) {
-                    println!("wifi: station reconfigure failed: {:?}", error);
-                }
+                let _ = controller.disconnect_async().await;
                 if attempt < WIFI_CONNECT_ATTEMPTS && attempt % 2 == 0 {
-                    let _ = scan_configured_network(&mut controller, target_ssid);
+                    log_visible_networks(&mut controller, target_ssid).await;
                 }
-                wait_millis(1_000);
+                Timer::after(EmbassyDuration::from_millis(1_000)).await;
             }
         }
     }
 
-    let _ = scan_configured_network(&mut controller, target_ssid);
+    log_visible_networks(&mut controller, target_ssid).await;
     WifiConnection::Failed
 }
 
@@ -403,6 +425,26 @@ enum WifiConnection<'d> {
     },
     MissingCredentials,
     Failed,
+}
+
+#[embassy_executor::task]
+async fn wifi_task(wifi: WIFI<'static>, config: WifiConfig) {
+    match connect_wifi(wifi, &config).await {
+        WifiConnection::Connected {
+            controller,
+            interfaces,
+        } => {
+            WIFI_EVENTS
+                .send(WifiEvent::Connected {
+                    controller,
+                    interfaces,
+                })
+                .await;
+        }
+        WifiConnection::MissingCredentials | WifiConnection::Failed => {
+            WIFI_EVENTS.send(WifiEvent::Offline).await;
+        }
+    }
 }
 
 fn render_app<D>(
@@ -459,6 +501,7 @@ fn poll_linn_events(
     let result = {
         let mut stream = match network.connect_events(endpoint) {
             Ok(stream) => stream,
+            Err(FirmwareNetError::ConnectTimeout | FirmwareNetError::ReadTimeout) => return false,
             Err(error) => {
                 println!(
                     "linn: event tcp connect failed after {}ms: {:?}",
@@ -597,48 +640,29 @@ fn load_hifi_artwork(
     }
 }
 
-fn scan_configured_network(controller: &mut WifiController<'_>, target_ssid: &str) -> bool {
-    println!("wifi: scanning visible SSIDs");
+async fn log_visible_networks(controller: &mut WifiController<'_>, target_ssid: &str) {
+    println!("wifi: scanning visible SSIDs for diagnostics");
     let scan_config = ScanConfig::default().with_show_hidden(true).with_max(32);
 
-    for attempt in 1..=WIFI_SCAN_RETRIES {
-        match block_on(controller.scan_async(&scan_config)) {
-            Ok(access_points) => {
-                let target = access_points
-                    .iter()
-                    .find(|access_point| access_point.ssid.as_str() == target_ssid);
+    match controller.scan_async(&scan_config).await {
+        Ok(access_points) => {
+            let target = access_points
+                .iter()
+                .find(|access_point| access_point.ssid.as_str() == target_ssid);
+            println!(
+                "wifi: scan saw {} network(s), configured SSID exact={}",
+                access_points.len(),
+                target.is_some()
+            );
+            if let Some(access_point) = target {
                 println!(
-                    "wifi: scan saw {} network(s), configured SSID exact={}",
-                    access_points.len(),
-                    target.is_some()
+                    "wifi: configured SSID channel={} rssi={} auth={:?}",
+                    access_point.channel, access_point.signal_strength, access_point.auth_method
                 );
-                if let Some(access_point) = target {
-                    println!(
-                        "wifi: configured SSID channel={} rssi={} auth={:?}",
-                        access_point.channel,
-                        access_point.signal_strength,
-                        access_point.auth_method
-                    );
-                    return true;
-                }
-                if !access_points.is_empty() || attempt == WIFI_SCAN_RETRIES {
-                    return false;
-                }
-            }
-            Err(error) => {
-                println!(
-                    "wifi: scan failed attempt {attempt}/{WIFI_SCAN_RETRIES}: {:?}",
-                    error
-                );
-                if attempt == WIFI_SCAN_RETRIES {
-                    return false;
-                }
             }
         }
-        wait_millis(500);
+        Err(error) => println!("wifi: diagnostic scan failed: {:?}", error),
     }
-
-    false
 }
 
 fn log_wifi_error(context: &str, attempt: u8, error: WifiError) {

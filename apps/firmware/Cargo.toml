@@ -10,8 +10,10 @@ app-config.workspace = true
 app-core.workspace = true
 app-runtime.workspace = true
 board-waveshare-c6.workspace = true
+embassy-executor.workspace = true
 embassy-futures.workspace = true
 embassy-net = { workspace = true, features = ["dhcpv4", "dns", "medium-ethernet", "tcp"] }
+embassy-sync.workspace = true
 embassy-time = { workspace = true, features = ["generic-queue-8"] }
 embedded-graphics.workspace = true
 esp-alloc = { workspace = true, features = ["esp32c6", "global-allocator", "compat"] }
