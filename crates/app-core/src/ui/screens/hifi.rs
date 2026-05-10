@@ -45,6 +45,11 @@ const VOLUME_SWEEP_DEGREES: f32 = 270.0;
 const VOLUME_STROKE_WIDTH: u32 = 8;
 const LOADING_TIMEOUT_MS: u64 = 5_000;
 
+// Marquee bounce: hold at start, scroll to end, brief hold, scroll back.
+const MARQUEE_HOLD_START_MS: u64 = 1_000;
+const MARQUEE_HOLD_END_MS: u64 = 500;
+const MARQUEE_SCROLL_PX_PER_SEC: u64 = 30;
+
 // Slot kinds for the play / spinner / artwork center area.
 const PLAY_SLOT_SPINNER: u8 = 1;
 const PLAY_SLOT_PLAY_ICON: u8 = 2;
@@ -98,6 +103,12 @@ struct LastRendered {
     artwork_uri: String<HIFI_URI_LEN>,
     pin_buttons_drawn: bool,
     loading_visible: bool,
+    title_overflow_px: u32,
+    title_anim_base_ms: u64,
+    title_marquee_offset_px: Option<i32>,
+    artist_overflow_px: u32,
+    artist_anim_base_ms: u64,
+    artist_marquee_offset_px: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,12 +154,15 @@ impl State {
             return true;
         }
 
+        let marquee_active =
+            self.last_rendered.title_overflow_px > 0 || self.last_rendered.artist_overflow_px > 0;
+
         if self.status.playback == PlaybackState::Buffering {
             return true;
         }
 
         if self.status.playback != PlaybackState::Playing || self.status.duration_seconds == 0 {
-            return false;
+            return marquee_active;
         }
 
         let current_second = uptime_ms / 1000;
@@ -156,7 +170,7 @@ impl State {
 
         let elapsed = current_second.saturating_sub(self.last_second);
         if elapsed == 0 {
-            return false;
+            return marquee_active;
         }
 
         self.status.elapsed_seconds = self
@@ -382,6 +396,8 @@ where
         // skipped during the spinner-only phase get a fresh first frame.
         state.last_rendered.title.clear();
         state.last_rendered.artist.clear();
+        state.last_rendered.title_marquee_offset_px = None;
+        state.last_rendered.artist_marquee_offset_px = None;
         state.last_rendered.elapsed_seconds = None;
         state.last_rendered.duration_seconds = None;
         state.last_rendered.progress_filled_px = None;
@@ -473,32 +489,68 @@ where
     state.last_rendered.duration_seconds = Some(state.status.duration_seconds);
 
     let song_text = non_empty_or(&state.status.title, "No track");
-    let song_unchanged =
-        state.last_rendered.has_rendered && state.last_rendered.title.as_str() == song_text;
-    let song = CenteredTextBand {
-        clear_band: ui_layout.song_band,
-        text_origin: ui_layout.song_origin,
+    let song_text_changed = state.last_rendered.title.as_str() != song_text;
+    if song_text_changed {
+        state.last_rendered.title_anim_base_ms = state.current_ms;
+        state.last_rendered.title_marquee_offset_px = None;
+    }
+    let song_text_width = measure_band_text_width(song_text);
+    let song_overflow_px = song_text_width.saturating_sub(ui_layout.song_band.size.width);
+    let song_offset_px = compute_marquee_offset(
+        state
+            .current_ms
+            .saturating_sub(state.last_rendered.title_anim_base_ms),
+        song_overflow_px,
+    );
+    let song_unchanged = state.last_rendered.has_rendered
+        && !song_text_changed
+        && state.last_rendered.title_marquee_offset_px == Some(song_offset_px);
+    let song = MarqueeBand {
+        band: ui_layout.song_band,
+        centered_origin: ui_layout.song_origin,
         text: song_text,
         unchanged: song_unchanged,
         primary: true,
+        overflow_px: song_overflow_px,
+        offset_px: song_offset_px,
     };
     painter.draw(&song).map_err(RenderError::Draw)?;
     state.last_rendered.title.clear();
     let _ = state.last_rendered.title.push_str(song_text);
+    state.last_rendered.title_overflow_px = song_overflow_px;
+    state.last_rendered.title_marquee_offset_px = Some(song_offset_px);
 
     let artist_text = non_empty_or(&state.status.artist, "Not playing");
-    let artist_unchanged =
-        state.last_rendered.has_rendered && state.last_rendered.artist.as_str() == artist_text;
-    let artist = CenteredTextBand {
-        clear_band: ui_layout.artist_band,
-        text_origin: ui_layout.artist_origin,
+    let artist_text_changed = state.last_rendered.artist.as_str() != artist_text;
+    if artist_text_changed {
+        state.last_rendered.artist_anim_base_ms = state.current_ms;
+        state.last_rendered.artist_marquee_offset_px = None;
+    }
+    let artist_text_width = measure_band_text_width(artist_text);
+    let artist_overflow_px = artist_text_width.saturating_sub(ui_layout.artist_band.size.width);
+    let artist_offset_px = compute_marquee_offset(
+        state
+            .current_ms
+            .saturating_sub(state.last_rendered.artist_anim_base_ms),
+        artist_overflow_px,
+    );
+    let artist_unchanged = state.last_rendered.has_rendered
+        && !artist_text_changed
+        && state.last_rendered.artist_marquee_offset_px == Some(artist_offset_px);
+    let artist = MarqueeBand {
+        band: ui_layout.artist_band,
+        centered_origin: ui_layout.artist_origin,
         text: artist_text,
         unchanged: artist_unchanged,
         primary: false,
+        overflow_px: artist_overflow_px,
+        offset_px: artist_offset_px,
     };
     painter.draw(&artist).map_err(RenderError::Draw)?;
     state.last_rendered.artist.clear();
     let _ = state.last_rendered.artist.push_str(artist_text);
+    state.last_rendered.artist_overflow_px = artist_overflow_px;
+    state.last_rendered.artist_marquee_offset_px = Some(artist_offset_px);
 
     state.last_rendered.has_rendered = true;
     Ok(())
@@ -878,6 +930,117 @@ impl Widget<Action> for ProgressBarWidget {
     }
 }
 
+/// Width in pixels that `text` would occupy when rendered with the band font.
+fn measure_band_text_width(text: &str) -> u32 {
+    let body_font = ui_font!(500);
+    let style = BitmapFontStyleBuilder::new()
+        .text_color(TEXT_PRIMARY)
+        .background_color(OLED_BLACK)
+        .font(&body_font)
+        .build();
+    Text::new(text, Point::zero(), style)
+        .bounding_box()
+        .size
+        .width
+}
+
+/// Bounce-marquee offset, in pixels, for `elapsed_ms` since the cycle started.
+/// `overflow_px` is `text_width - band_width`; `0` means the text fits.
+fn compute_marquee_offset(elapsed_ms: u64, overflow_px: u32) -> i32 {
+    if overflow_px == 0 {
+        return 0;
+    }
+    let scroll_dur_ms = (overflow_px as u64 * 1000) / MARQUEE_SCROLL_PX_PER_SEC;
+    let p1 = MARQUEE_HOLD_START_MS;
+    let p2 = p1 + scroll_dur_ms;
+    let p3 = p2 + MARQUEE_HOLD_END_MS;
+    let cycle = p3 + scroll_dur_ms;
+    if cycle == 0 {
+        return 0;
+    }
+    let t = elapsed_ms % cycle;
+    let overflow = overflow_px as i32;
+    if t < p1 {
+        0
+    } else if t < p2 {
+        let scrolled = ((t - p1) * MARQUEE_SCROLL_PX_PER_SEC) / 1000;
+        (scrolled as i32).min(overflow)
+    } else if t < p3 {
+        overflow
+    } else {
+        let scrolled = ((t - p3) * MARQUEE_SCROLL_PX_PER_SEC) / 1000;
+        (overflow - scrolled as i32).max(0)
+    }
+}
+
+/// Centered text that scrolls horizontally inside `band` when the text would
+/// otherwise overflow. Uses the painter's scratch buffer so out-of-band glyph
+/// pixels are clipped naturally and the visible region is blitted in one go.
+struct MarqueeBand<'a> {
+    band: Rectangle,
+    centered_origin: Point,
+    text: &'a str,
+    unchanged: bool,
+    primary: bool,
+    overflow_px: u32,
+    offset_px: i32,
+}
+
+impl Widget<Action> for MarqueeBand<'_> {
+    fn bounds(&self) -> Rectangle {
+        self.band
+    }
+
+    fn use_scratch(&self) -> bool {
+        true
+    }
+
+    fn should_draw(&self) -> bool {
+        !self.unchanged
+    }
+
+    fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
+    where
+        D: DrawTarget<Color = Rgb565>,
+    {
+        let body_font = ui_font!(500);
+        let color = if self.primary {
+            TEXT_PRIMARY
+        } else {
+            TEXT_SECONDARY
+        };
+        let style = BitmapFontStyleBuilder::new()
+            .text_color(color)
+            .background_color(OLED_BLACK)
+            .font(&body_font)
+            .build();
+        // No-op against an already-black scratch; correctness fallback for the
+        // non-scratch test path.
+        if let Err(RenderError::Draw(e)) = clear_rect(target, self.band) {
+            return Err(e);
+        }
+        if self.overflow_px == 0 {
+            let text_style = TextStyleBuilder::new()
+                .alignment(Alignment::Center)
+                .baseline(Baseline::Top)
+                .build();
+            Text::with_text_style(self.text, self.centered_origin, style, text_style)
+                .draw(target)?;
+        } else {
+            // Left-align and shift by offset; framebuf clipping in the painter
+            // discards the glyph pixels that fall outside the band.
+            let text_style = TextStyleBuilder::new()
+                .alignment(Alignment::Left)
+                .baseline(Baseline::Top)
+                .build();
+            let origin = Point::new(self.band.top_left.x - self.offset_px, self.band.top_left.y);
+            Text::with_text_style(self.text, origin, style, text_style).draw(target)?;
+        }
+        Ok(())
+    }
+}
+
+#[allow(dead_code)]
 struct CenteredTextBand<'a> {
     clear_band: Rectangle,
     text_origin: Point,
