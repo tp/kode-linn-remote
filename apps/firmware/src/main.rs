@@ -11,12 +11,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use app_config::{AppConfig, WifiConfig};
 use app_core::{
-    App, Command, Event, HIFI_URI_LEN, HifiStatus, NetworkStatus, PlaybackState,
-    RECOMMENDED_SCRATCH_PIXELS, Screen,
+    App, ArtworkPixel, Command, Event, HIFI_ARTWORK_PIXELS, HIFI_URI_LEN, HifiArtwork, HifiCommand,
+    HifiStatus, NetworkStatus, PlaybackState, RECOMMENDED_SCRATCH_PIXELS, Screen,
 };
 use app_runtime::lpec::{
     ARTWORK_DECODE_BUFFER_BYTES, ARTWORK_HTTP_BUFFER_BYTES, Error as LpecError, LpecSession,
-    load_artwork_with_buffers,
+    load_artwork_with_buffers_into,
 };
 use app_runtime::net::Endpoint;
 use board_waveshare_c6::{BOARD_NAME, DISPLAY_SIZE, peripherals};
@@ -26,7 +26,7 @@ use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex,
     channel::{Channel, TryReceiveError},
 };
-use embassy_time::{Duration as EmbassyDuration, Timer};
+use embassy_time::{Duration as EmbassyDuration, Instant as EmbassyInstant, Timer};
 use embedded_graphics::{draw_target::DrawTarget, pixelcolor::Rgb565, prelude::RgbColor};
 use esp_backtrace as _;
 use esp_hal::{
@@ -39,8 +39,8 @@ use esp_hal::{
 };
 use esp_println::println;
 use esp_radio::wifi::{
-    Config as WifiRadioConfig, ControllerConfig, Interfaces, WifiController, WifiError,
-    scan::ScanConfig, sta::StationConfig,
+    Config as WifiRadioConfig, ControllerConfig, DisconnectReason, Interfaces, WifiController,
+    WifiError, ap::AccessPointInfo, scan::ScanConfig, sta::StationConfig,
 };
 use net::{FirmwareNetError, FirmwareNetwork};
 use touch::{FT6146_ADDRESS, TouchController};
@@ -53,14 +53,17 @@ const LPEC_EVENT_POLL_MS: u64 = 100;
 const WIFI_CONNECT_ATTEMPTS: u8 = 5;
 const LOCAL_CONFIG: &str = include_str!("../../../config/local.env");
 
-static WIFI_EVENTS: Channel<CriticalSectionRawMutex, WifiEvent, 2> = Channel::new();
+static FIRMWARE_EVENTS: Channel<CriticalSectionRawMutex, FirmwareEvent, 1> = Channel::new();
+static HIFI_REQUESTS: Channel<CriticalSectionRawMutex, HifiRequest, 4> = Channel::new();
 
-enum WifiEvent {
-    Connected {
-        controller: WifiController<'static>,
-        interfaces: Interfaces<'static>,
-    },
-    Offline,
+enum FirmwareEvent {
+    App(Event),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HifiRequest {
+    SetActive(bool),
+    Command(HifiCommand),
 }
 
 #[esp_rtos::main]
@@ -169,12 +172,8 @@ async fn main(spawner: Spawner) -> ! {
 
     let booted_at = Instant::now();
     let mut next_heartbeat_ms = 0;
-    let mut next_lpec_event_poll_ms = 0;
     let mut consecutive_touch_errors = 0_u32;
-    let mut rendered_screen = app.screen();
-    let mut lpec_session = LpecSession::new();
-    let mut last_hifi_artwork_uri = heapless::String::<HIFI_URI_LEN>::new();
-    let mut pending_hifi_artwork_uri = heapless::String::<HIFI_URI_LEN>::new();
+    let mut hifi_screen_active = app.screen() == Screen::HifiControl;
 
     println!("app-core: initialized");
 
@@ -182,24 +181,18 @@ async fn main(spawner: Spawner) -> ! {
         let render_requested = app
             .update(Event::NetworkStatus(NetworkStatus::Connecting))
             .render_requested;
-        let _ = render_app(
-            &mut app,
-            &mut display,
-            &mut scratch,
-            &mut rendered_screen,
-            render_requested,
-        );
+        let _ = render_app(&mut app, &mut display, &mut scratch, render_requested);
         spawner.spawn(
-            wifi_task(peripherals.WIFI, app_config.wifi.clone())
-                .expect("wifi task should allocate once"),
+            firmware_runtime_task(
+                peripherals.WIFI,
+                app_config.wifi.clone(),
+                app_config.linn_lpec_endpoint,
+            )
+            .expect("wifi task should allocate once"),
         );
     } else {
         println!("wifi: missing WIFI_SSID/WIFI_PASSWORD");
     }
-
-    let mut network = None;
-    let mut _wifi_controller = None;
-    let mut network_ready = false;
 
     loop {
         let uptime_ms = booted_at.elapsed().as_millis() as u64;
@@ -208,49 +201,11 @@ async fn main(spawner: Spawner) -> ! {
         let mut pending_command = None;
 
         loop {
-            match WIFI_EVENTS.try_receive() {
-                Ok(WifiEvent::Connected {
-                    controller,
-                    interfaces,
-                }) => {
-                    let next_network = FirmwareNetwork::new(interfaces.station);
-                    _wifi_controller = Some(controller);
-                    network = Some(next_network);
-                    network_ready = false;
-                }
-                Ok(WifiEvent::Offline) => {
-                    render_requested |= app
-                        .update(Event::NetworkStatus(NetworkStatus::Offline))
-                        .render_requested;
-                    network = None;
-                    _wifi_controller = None;
-                    network_ready = false;
+            match FIRMWARE_EVENTS.try_receive() {
+                Ok(FirmwareEvent::App(event)) => {
+                    render_requested |= app.update(event).render_requested;
                 }
                 Err(TryReceiveError::Empty) => break,
-            }
-        }
-
-        if !network_ready && let Some(active_network) = network.as_mut() {
-            match active_network.poll_config_up() {
-                Ok(true) => {
-                    if let Some(config) = active_network.config_v4() {
-                        println!("net: dhcp address {}", config.address);
-                    }
-                    network_ready = true;
-                    render_requested |= app
-                        .update(Event::NetworkStatus(NetworkStatus::Online))
-                        .render_requested;
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    println!("net: dhcp failed: {:?}", error);
-                    network = None;
-                    _wifi_controller = None;
-                    network_ready = false;
-                    render_requested |= app
-                        .update(Event::NetworkStatus(NetworkStatus::Offline))
-                        .render_requested;
-                }
             }
         }
 
@@ -286,67 +241,13 @@ async fn main(spawner: Spawner) -> ! {
 
         let outcome = app.update(Event::Tick { uptime_ms });
         render_requested |= outcome.render_requested;
+        sync_hifi_screen_focus(&app, &mut hifi_screen_active);
 
-        frame_rendered |= render_app(
-            &mut app,
-            &mut display,
-            &mut scratch,
-            &mut rendered_screen,
-            render_requested,
-        );
-        render_requested = false;
+        frame_rendered |= render_app(&mut app, &mut display, &mut scratch, render_requested);
 
         if let Some(command) = pending_command {
-            if network_ready {
-                render_requested |= handle_linn_command(
-                    &mut network,
-                    app_config.linn_lpec_endpoint,
-                    &mut app,
-                    &mut lpec_session,
-                    command,
-                );
-            } else {
-                println!("linn: command ignored while network is connecting");
-            }
-            next_lpec_event_poll_ms = 0;
+            send_hifi_command(command);
         }
-
-        if network_ready
-            && app.screen() == Screen::HifiControl
-            && uptime_ms >= next_lpec_event_poll_ms
-        {
-            render_requested |= poll_linn_events(
-                &mut network,
-                app_config.linn_lpec_endpoint,
-                &mut app,
-                &mut lpec_session,
-                &mut last_hifi_artwork_uri,
-                &mut pending_hifi_artwork_uri,
-            );
-            next_lpec_event_poll_ms = uptime_ms.saturating_add(LPEC_EVENT_POLL_MS);
-        }
-
-        frame_rendered |= render_app(
-            &mut app,
-            &mut display,
-            &mut scratch,
-            &mut rendered_screen,
-            render_requested,
-        );
-
-        let artwork_render_requested = load_pending_hifi_artwork(
-            &mut network,
-            &mut app,
-            &mut last_hifi_artwork_uri,
-            &mut pending_hifi_artwork_uri,
-        );
-        frame_rendered |= render_app(
-            &mut app,
-            &mut display,
-            &mut scratch,
-            &mut rendered_screen,
-            artwork_render_requested,
-        );
 
         if uptime_ms >= next_heartbeat_ms {
             println!(
@@ -370,15 +271,15 @@ async fn connect_wifi<'d>(wifi: WIFI<'d>, config: &WifiConfig) -> WifiConnection
 
     println!("wifi: connecting to configured SSID");
     let target_ssid = ssid.as_str();
-    let station_config = WifiRadioConfig::Station(
-        StationConfig::default()
-            .with_ssid(target_ssid)
-            .with_password(password.as_str().into()),
-    );
+    let base_station_config = StationConfig::default()
+        .with_ssid(target_ssid)
+        .with_password(password.as_str().into());
+    let mut station_config = base_station_config.clone();
 
     let (mut controller, interfaces) = match esp_radio::wifi::new(
         wifi,
-        ControllerConfig::default().with_initial_config(station_config.clone()),
+        ControllerConfig::default()
+            .with_initial_config(WifiRadioConfig::Station(station_config.clone())),
     ) {
         Ok(wifi) => wifi,
         Err(error) => {
@@ -387,8 +288,11 @@ async fn connect_wifi<'d>(wifi: WIFI<'d>, config: &WifiConfig) -> WifiConnection
         }
     };
 
+    let mut scan_fallback_used = false;
+
     for attempt in 1..=WIFI_CONNECT_ATTEMPTS {
-        if let Err(error) = controller.set_config(&station_config) {
+        if let Err(error) = controller.set_config(&WifiRadioConfig::Station(station_config.clone()))
+        {
             println!("wifi: station reconfigure failed: {:?}", error);
         }
 
@@ -406,15 +310,27 @@ async fn connect_wifi<'d>(wifi: WIFI<'d>, config: &WifiConfig) -> WifiConnection
             Err(error) => {
                 log_wifi_error("connect failed", attempt, error);
                 let _ = controller.disconnect_async().await;
-                if attempt < WIFI_CONNECT_ATTEMPTS && attempt % 2 == 0 {
-                    log_visible_networks(&mut controller, target_ssid).await;
+                if attempt < WIFI_CONNECT_ATTEMPTS
+                    && !scan_fallback_used
+                    && should_scan_for_access_point(error)
+                {
+                    scan_fallback_used = true;
+                    if let Some(access_point) =
+                        scan_configured_access_point(&mut controller, target_ssid).await
+                    {
+                        station_config = station_config_for_access_point(
+                            base_station_config.clone(),
+                            &access_point,
+                        );
+                    } else {
+                        station_config = base_station_config.clone();
+                    }
                 }
-                Timer::after(EmbassyDuration::from_millis(1_000)).await;
+                Timer::after(EmbassyDuration::from_millis(250)).await;
             }
         }
     }
 
-    log_visible_networks(&mut controller, target_ssid).await;
     WifiConnection::Failed
 }
 
@@ -428,22 +344,103 @@ enum WifiConnection<'d> {
 }
 
 #[embassy_executor::task]
-async fn wifi_task(wifi: WIFI<'static>, config: WifiConfig) {
+async fn firmware_runtime_task(wifi: WIFI<'static>, config: WifiConfig, endpoint: Endpoint) {
     match connect_wifi(wifi, &config).await {
         WifiConnection::Connected {
             controller,
             interfaces,
         } => {
-            WIFI_EVENTS
-                .send(WifiEvent::Connected {
-                    controller,
-                    interfaces,
-                })
-                .await;
+            let _controller = controller;
+            let mut network = FirmwareNetwork::new(interfaces.station);
+            loop {
+                match network.poll_config_up() {
+                    Ok(true) => {
+                        if let Some(config) = network.config_v4() {
+                            println!("net: dhcp address {}", config.address);
+                        }
+                        send_app_event(Event::NetworkStatus(NetworkStatus::Online)).await;
+                        hifi_runtime_loop(&mut network, endpoint).await;
+                    }
+                    Ok(false) => {
+                        Timer::after(EmbassyDuration::from_millis(TOUCH_POLL_MS)).await;
+                    }
+                    Err(error) => {
+                        println!("net: dhcp failed: {:?}", error);
+                        send_app_event(Event::NetworkStatus(NetworkStatus::Offline)).await;
+                        break;
+                    }
+                }
+            }
         }
         WifiConnection::MissingCredentials | WifiConnection::Failed => {
-            WIFI_EVENTS.send(WifiEvent::Offline).await;
+            send_app_event(Event::NetworkStatus(NetworkStatus::Offline)).await;
         }
+    }
+}
+
+async fn hifi_runtime_loop(network: &mut FirmwareNetwork, endpoint: Endpoint) -> ! {
+    let mut hifi_active = false;
+    let mut next_lpec_event_poll_at = EmbassyInstant::now();
+    let mut lpec_session = LpecSession::new();
+    let mut last_hifi_artwork_uri = heapless::String::<HIFI_URI_LEN>::new();
+    let mut pending_hifi_artwork_uri = heapless::String::<HIFI_URI_LEN>::new();
+    let mut artwork_buffer_slot = false;
+
+    loop {
+        let mut commands = heapless::Vec::<HifiCommand, 4>::new();
+        while let Ok(request) = HIFI_REQUESTS.try_receive() {
+            match request {
+                HifiRequest::SetActive(active) => {
+                    hifi_active = active;
+                    next_lpec_event_poll_at = EmbassyInstant::now();
+                }
+                HifiRequest::Command(command) => {
+                    let _ = commands.push(command);
+                }
+            }
+        }
+
+        if hifi_active {
+            for command in commands {
+                if let Some(status) =
+                    handle_linn_command(network, endpoint, &mut lpec_session, command)
+                {
+                    send_hifi_status(
+                        &mut last_hifi_artwork_uri,
+                        &mut pending_hifi_artwork_uri,
+                        status,
+                    )
+                    .await;
+                }
+                next_lpec_event_poll_at = EmbassyInstant::now();
+            }
+        } else if !commands.is_empty() {
+            println!("linn: command ignored while HIFI screen is inactive");
+        }
+
+        let now = EmbassyInstant::now();
+        if hifi_active && now >= next_lpec_event_poll_at {
+            if let Some(status) = poll_linn_events(network, endpoint, &mut lpec_session) {
+                send_hifi_status(
+                    &mut last_hifi_artwork_uri,
+                    &mut pending_hifi_artwork_uri,
+                    status,
+                )
+                .await;
+            }
+            next_lpec_event_poll_at = now + EmbassyDuration::from_millis(LPEC_EVENT_POLL_MS);
+        }
+
+        if let Some(artwork) = load_pending_hifi_artwork(
+            network,
+            &mut last_hifi_artwork_uri,
+            &mut pending_hifi_artwork_uri,
+            &mut artwork_buffer_slot,
+        ) {
+            send_app_event(Event::HifiArtwork(artwork)).await;
+        }
+
+        Timer::after(EmbassyDuration::from_millis(TOUCH_POLL_MS)).await;
     }
 }
 
@@ -451,7 +448,6 @@ fn render_app<D>(
     app: &mut App,
     display: &mut D,
     scratch: &mut [Rgb565],
-    rendered_screen: &mut Screen,
     render_requested: bool,
 ) -> bool
 where
@@ -463,16 +459,46 @@ where
 
     // Screen-change clear is handled inside App::render now.
     match app.render(display, scratch) {
-        Ok(()) => {
-            *rendered_screen = app.screen();
-            println!("display: frame rendered");
-            true
-        }
+        Ok(()) => true,
         Err(_) => {
             println!("display: render failed");
             false
         }
     }
+}
+
+fn sync_hifi_screen_focus(app: &App, hifi_screen_active: &mut bool) {
+    let active = app.screen() == Screen::HifiControl;
+    if *hifi_screen_active == active {
+        return;
+    }
+
+    *hifi_screen_active = active;
+    send_hifi_request(HifiRequest::SetActive(active));
+}
+
+fn send_hifi_command(command: Command) {
+    let Command::Hifi(command) = command;
+    send_hifi_request(HifiRequest::Command(command));
+}
+
+fn send_hifi_request(request: HifiRequest) {
+    if HIFI_REQUESTS.try_send(request).is_err() {
+        println!("hifi: request dropped; runtime queue full");
+    }
+}
+
+async fn send_app_event(event: Event) {
+    FIRMWARE_EVENTS.send(FirmwareEvent::App(event)).await;
+}
+
+async fn send_hifi_status(
+    last_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
+    pending_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
+    status: HifiStatus,
+) {
+    let event = hifi_status_event(last_artwork_uri, pending_artwork_uri, status);
+    send_app_event(event).await;
 }
 
 fn firmware_config() -> AppConfig {
@@ -486,66 +512,52 @@ fn firmware_config() -> AppConfig {
 }
 
 fn poll_linn_events(
-    network: &mut Option<FirmwareNetwork>,
+    network: &mut FirmwareNetwork,
     endpoint: Endpoint,
-    app: &mut App,
     session: &mut LpecSession,
-    last_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
-    pending_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
-) -> bool {
+) -> Option<HifiStatus> {
     let started_at = Instant::now();
-    let Some(network) = network.as_mut() else {
-        return false;
-    };
-
     let result = {
         let mut stream = match network.connect_events(endpoint) {
             Ok(stream) => stream,
-            Err(FirmwareNetError::ConnectTimeout | FirmwareNetError::ReadTimeout) => return false,
+            Err(FirmwareNetError::ConnectTimeout | FirmwareNetError::ReadTimeout) => return None,
             Err(error) => {
                 println!(
                     "linn: event tcp connect failed after {}ms: {:?}",
                     started_at.elapsed().as_millis(),
                     error
                 );
-                return false;
+                return None;
             }
         };
         session.poll(&mut stream)
     };
 
     match result {
-        Ok(Some(status)) => apply_hifi_status(app, last_artwork_uri, pending_artwork_uri, status),
-        Ok(None) | Err(LpecError::Connect(FirmwareNetError::ReadTimeout)) => false,
+        Ok(Some(status)) => Some(status),
+        Ok(None) | Err(LpecError::Connect(FirmwareNetError::ReadTimeout)) => None,
         Err(error) => {
             println!("linn: session poll failed: {:?}", error);
             session.reset();
             network.reset_lpec();
-            false
+            None
         }
     }
 }
 
 fn handle_linn_command(
-    network: &mut Option<FirmwareNetwork>,
+    network: &mut FirmwareNetwork,
     endpoint: Endpoint,
-    app: &mut App,
     session: &mut LpecSession,
-    command: Command,
-) -> bool {
-    let Some(network) = network.as_mut() else {
-        println!("linn: command ignored while network is offline");
-        return false;
-    };
-
-    let Command::Hifi(command) = command;
+    command: HifiCommand,
+) -> Option<HifiStatus> {
     println!("linn: command {:?}", command);
     let result = {
         let mut stream = match network.connect(endpoint) {
             Ok(stream) => stream,
             Err(error) => {
                 println!("linn: command tcp connect failed: {:?}", error);
-                return false;
+                return None;
             }
         };
         session.handle_command(&mut stream, command)
@@ -554,31 +566,29 @@ fn handle_linn_command(
     match result {
         Ok(Some(status)) => {
             println!("linn: command sent");
-            app.update(Event::HifiStatus(status)).render_requested
+            Some(status)
         }
         Ok(None) => {
             println!("linn: command sent");
-            false
+            None
         }
         Err(error) => {
             println!("linn: command failed: {:?}", error);
             session.reset();
             network.reset_lpec();
-            false
+            None
         }
     }
 }
 
-fn apply_hifi_status(
-    app: &mut App,
+fn hifi_status_event(
     last_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
     pending_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
     status: HifiStatus,
-) -> bool {
+) -> Event {
     let artwork_uri = status.album_art_uri.clone();
     let should_load_artwork =
         status.playback == PlaybackState::Playing && !artwork_uri.as_str().is_empty();
-    let render_requested = app.update(Event::HifiStatus(status)).render_requested;
 
     if should_load_artwork
         && last_artwork_uri.as_str() != artwork_uri.as_str()
@@ -591,39 +601,39 @@ fn apply_hifi_status(
         pending_artwork_uri.clear();
     }
 
-    render_requested
+    Event::HifiStatus(status)
 }
 
 fn load_pending_hifi_artwork(
-    network: &mut Option<FirmwareNetwork>,
-    app: &mut App,
+    network: &mut FirmwareNetwork,
     last_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
     pending_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
-) -> bool {
+    artwork_buffer_slot: &mut bool,
+) -> Option<HifiArtwork> {
     if pending_artwork_uri.is_empty() {
-        return false;
-    }
-
-    let Some(network) = network.as_mut() else {
-        return false;
+        return None;
     };
 
     let mut uri = heapless::String::<HIFI_URI_LEN>::new();
     let _ = uri.push_str(pending_artwork_uri.as_str());
     pending_artwork_uri.clear();
-    load_hifi_artwork(network, app, last_artwork_uri, uri.as_str())
+    load_hifi_artwork(network, last_artwork_uri, uri.as_str(), artwork_buffer_slot)
 }
 
 fn load_hifi_artwork(
     network: &mut FirmwareNetwork,
-    app: &mut App,
     last_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
     uri: &str,
-) -> bool {
+    artwork_buffer_slot: &mut bool,
+) -> Option<HifiArtwork> {
     static mut ARTWORK_HTTP_BUFFER: [u8; ARTWORK_HTTP_BUFFER_BYTES] =
         [0; ARTWORK_HTTP_BUFFER_BYTES];
     static mut ARTWORK_DECODE_BUFFER: [u8; ARTWORK_DECODE_BUFFER_BYTES] =
         [0; ARTWORK_DECODE_BUFFER_BYTES];
+    static mut ARTWORK_PIXELS_A: [ArtworkPixel; HIFI_ARTWORK_PIXELS] =
+        [ArtworkPixel::BLACK; HIFI_ARTWORK_PIXELS];
+    static mut ARTWORK_PIXELS_B: [ArtworkPixel; HIFI_ARTWORK_PIXELS] =
+        [ArtworkPixel::BLACK; HIFI_ARTWORK_PIXELS];
 
     last_artwork_uri.clear();
     let _ = last_artwork_uri.push_str(uri);
@@ -631,38 +641,80 @@ fn load_hifi_artwork(
 
     let http_buffer = unsafe { &mut *core::ptr::addr_of_mut!(ARTWORK_HTTP_BUFFER) };
     let decode_buffer = unsafe { &mut *core::ptr::addr_of_mut!(ARTWORK_DECODE_BUFFER) };
-    match load_artwork_with_buffers(network, uri, http_buffer, decode_buffer) {
-        Ok(artwork) => app.update(Event::HifiArtwork(artwork)).render_requested,
+    let pixels = if *artwork_buffer_slot {
+        unsafe { &mut *core::ptr::addr_of_mut!(ARTWORK_PIXELS_A) }
+    } else {
+        unsafe { &mut *core::ptr::addr_of_mut!(ARTWORK_PIXELS_B) }
+    };
+    *artwork_buffer_slot = !*artwork_buffer_slot;
+
+    match load_artwork_with_buffers_into(network, uri, http_buffer, decode_buffer, pixels) {
+        Ok(artwork) => Some(artwork),
         Err(error) => {
             println!("linn: artwork failed: {:?}", error);
-            false
+            None
         }
     }
 }
 
-async fn log_visible_networks(controller: &mut WifiController<'_>, target_ssid: &str) {
-    println!("wifi: scanning visible SSIDs for diagnostics");
+async fn scan_configured_access_point(
+    controller: &mut WifiController<'_>,
+    target_ssid: &str,
+) -> Option<AccessPointInfo> {
+    println!("wifi: scanning visible SSIDs");
     let scan_config = ScanConfig::default().with_show_hidden(true).with_max(32);
 
     match controller.scan_async(&scan_config).await {
         Ok(access_points) => {
-            let target = access_points
-                .iter()
-                .find(|access_point| access_point.ssid.as_str() == target_ssid);
+            let mut target = None;
+            for access_point in access_points.iter() {
+                if access_point.ssid.as_str() == target_ssid
+                    && target.as_ref().is_none_or(|current: &AccessPointInfo| {
+                        access_point.signal_strength > current.signal_strength
+                    })
+                {
+                    target = Some(access_point.clone());
+                }
+            }
             println!(
                 "wifi: scan saw {} network(s), configured SSID exact={}",
                 access_points.len(),
                 target.is_some()
             );
-            if let Some(access_point) = target {
+            if let Some(access_point) = &target {
                 println!(
-                    "wifi: configured SSID channel={} rssi={} auth={:?}",
-                    access_point.channel, access_point.signal_strength, access_point.auth_method
+                    "wifi: configured SSID bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} channel={} rssi={} auth={:?}",
+                    access_point.bssid[0],
+                    access_point.bssid[1],
+                    access_point.bssid[2],
+                    access_point.bssid[3],
+                    access_point.bssid[4],
+                    access_point.bssid[5],
+                    access_point.channel,
+                    access_point.signal_strength,
+                    access_point.auth_method
                 );
             }
+            target
         }
-        Err(error) => println!("wifi: diagnostic scan failed: {:?}", error),
+        Err(error) => {
+            println!("wifi: scan failed: {:?}", error);
+            None
+        }
     }
+}
+
+fn station_config_for_access_point(
+    config: StationConfig,
+    access_point: &AccessPointInfo,
+) -> StationConfig {
+    let mut config = config
+        .with_bssid(access_point.bssid)
+        .with_channel(access_point.channel);
+    if let Some(auth_method) = access_point.auth_method {
+        config = config.with_auth_method(auth_method);
+    }
+    config
 }
 
 fn log_wifi_error(context: &str, attempt: u8, error: WifiError) {
@@ -678,6 +730,20 @@ fn log_wifi_error(context: &str, attempt: u8, error: WifiError) {
             error
         ),
     }
+}
+
+fn should_scan_for_access_point(error: WifiError) -> bool {
+    matches!(
+        error,
+        WifiError::Disconnected(info)
+            if matches!(
+                info.reason,
+                DisconnectReason::NoAccessPointFound
+                    | DisconnectReason::NoAccessPointFoundWithCompatibleSecurity
+                    | DisconnectReason::NoAccessPointFoundInAuthmodeThreshold
+                    | DisconnectReason::NoAccessPointFoundInRssiThreshold
+            )
+    )
 }
 
 fn wait_millis(ms: u64) {

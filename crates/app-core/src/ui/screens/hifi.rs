@@ -214,7 +214,7 @@ impl State {
     pub(crate) fn apply_artwork(&mut self, artwork: HifiArtwork) -> bool {
         if artwork.source_uri.is_empty()
             || artwork.source_uri != self.status.album_art_uri
-            || artwork.pixels.len() != HIFI_ARTWORK_PIXELS
+            || artwork.pixels().len() != HIFI_ARTWORK_PIXELS
         {
             return false;
         }
@@ -817,7 +817,7 @@ impl Widget<Action> for ArtworkWidget<'_> {
             (0..size).filter_map(move |x| {
                 let index = (y as usize * HIFI_ARTWORK_SIZE as usize) + x as usize;
                 self.artwork
-                    .pixels
+                    .pixels()
                     .get(index)
                     .copied()
                     .map(|color| Pixel(top_left + Point::new(x, y), color))

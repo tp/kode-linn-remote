@@ -1,6 +1,9 @@
 use alloc::vec::Vec as AllocVec;
 
-use app_core::{HIFI_ARTWORK_SIZE, HifiArtwork, HifiCommand, HifiStatus, PlaybackState};
+use app_core::{
+    ArtworkPixel, HIFI_ARTWORK_PIXELS, HIFI_ARTWORK_SIZE, HifiArtwork, HifiCommand, HifiStatus,
+    PlaybackState,
+};
 use heapless::Vec;
 use linn_lpec::{Client as LinnClient, Line, Transport};
 use zune_core::bytestream::ZCursor;
@@ -244,6 +247,28 @@ where
     let response_len = read_http_response_into(&mut stream, http_buffer)?;
     let body = response_body(&http_buffer[..response_len]).map_err(Error::erase_transport)?;
     decode_jpeg_artwork_into(uri, body, decode_buffer).map_err(Error::erase_transport)
+}
+
+pub fn load_artwork_with_buffers_into<C>(
+    connector: &mut C,
+    uri: &str,
+    http_buffer: &mut [u8],
+    decode_buffer: &mut [u8],
+    artwork_pixels: &'static mut [ArtworkPixel; HIFI_ARTWORK_PIXELS],
+) -> Result<HifiArtwork, Error<C::Error>>
+where
+    C: TcpConnector,
+{
+    let request = ArtworkRequest::parse(uri).map_err(Error::erase_transport)?;
+    let mut stream = connector
+        .connect_host(request.host, request.port)
+        .map_err(Error::Connect)?;
+    write_http_get(&mut stream, request.host, request.path).map_err(Error::Connect)?;
+    let response_len = read_http_response_into(&mut stream, http_buffer)?;
+    let body = response_body(&http_buffer[..response_len]).map_err(Error::erase_transport)?;
+    decode_jpeg_artwork_into_pixels(body, decode_buffer, artwork_pixels)
+        .map_err(Error::erase_transport)?;
+    HifiArtwork::from_static_pixels(uri, artwork_pixels).ok_or(Error::InvalidArtworkUri)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -931,6 +956,39 @@ fn decode_jpeg_artwork_into(
     decoded_jpeg_artwork(uri, decoded, width, height, components)
 }
 
+fn decode_jpeg_artwork_into_pixels(
+    bytes: &[u8],
+    decode_buffer: &mut [u8],
+    artwork_pixels: &mut [ArtworkPixel; HIFI_ARTWORK_PIXELS],
+) -> Result<(), Error<core::convert::Infallible>> {
+    let mut decoder = JpegDecoder::new(ZCursor::new(bytes));
+    decoder.decode_headers().map_err(|_| Error::ArtworkDecode)?;
+    let required = decoder.output_buffer_size().ok_or(Error::ArtworkDecode)?;
+    if required > decode_buffer.len() {
+        return Err(Error::ArtworkBufferTooSmall {
+            buffer: ArtworkBuffer::DecodeOutput,
+            required,
+            actual: decode_buffer.len(),
+        });
+    }
+
+    decoder
+        .decode_into(&mut decode_buffer[..required])
+        .map_err(|_| Error::ArtworkDecode)?;
+    let info = decoder.info().ok_or(Error::ArtworkDecode)?;
+    let width = info.width as usize;
+    let height = info.height as usize;
+    if width == 0 || height == 0 {
+        return Err(Error::ArtworkDecode);
+    }
+    let decoded = &decode_buffer[..required];
+    let components = decoded
+        .len()
+        .checked_div(width.saturating_mul(height))
+        .ok_or(Error::ArtworkDecode)?;
+    decoded_jpeg_artwork_into_pixels(decoded, width, height, components, artwork_pixels)
+}
+
 fn decoded_jpeg_artwork(
     uri: &str,
     decoded: &[u8],
@@ -966,6 +1024,38 @@ fn decoded_jpeg_artwork(
         return Err(Error::ArtworkDecode);
     }
     Ok(artwork)
+}
+
+fn decoded_jpeg_artwork_into_pixels(
+    decoded: &[u8],
+    width: usize,
+    height: usize,
+    components: usize,
+    artwork_pixels: &mut [ArtworkPixel; HIFI_ARTWORK_PIXELS],
+) -> Result<(), Error<core::convert::Infallible>> {
+    if !matches!(components, 1 | 3 | 4) {
+        return Err(Error::ArtworkDecode);
+    }
+
+    let crop_size = width.min(height);
+    let crop_x = (width - crop_size) / 2;
+    let crop_y = (height - crop_size) / 2;
+    for y in 0..HIFI_ARTWORK_SIZE as usize {
+        let source_y = crop_y + (y * crop_size / HIFI_ARTWORK_SIZE as usize);
+        for x in 0..HIFI_ARTWORK_SIZE as usize {
+            let source_x = crop_x + (x * crop_size / HIFI_ARTWORK_SIZE as usize);
+            let source = (source_y * width + source_x) * components;
+            let (r, g, b) = if components == 1 {
+                let luma = decoded[source];
+                (luma, luma, luma)
+            } else {
+                (decoded[source], decoded[source + 1], decoded[source + 2])
+            };
+            artwork_pixels[(y * HIFI_ARTWORK_SIZE as usize) + x] =
+                ArtworkPixel::new(r >> 3, g >> 2, b >> 3);
+        }
+    }
+    Ok(())
 }
 
 fn parse_u32(value: &str) -> Option<u32> {

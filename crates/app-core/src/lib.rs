@@ -1,12 +1,17 @@
 #![no_std]
 
+extern crate alloc;
+
+use alloc::boxed::Box;
 use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
-use heapless::{String, Vec};
+use heapless::String;
 
 mod ui;
 
 pub use ui::RECOMMENDED_SCRATCH_PIXELS;
 pub use ui::screens::hifi::Command as HifiCommand;
+
+pub type ArtworkPixel = Rgb565;
 
 pub const DISPLAY_SIZE: Size = Size::new(466, 466);
 
@@ -115,21 +120,50 @@ pub enum PlaybackState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HifiArtwork {
     pub source_uri: String<HIFI_URI_LEN>,
-    pub pixels: Vec<Rgb565, HIFI_ARTWORK_PIXELS>,
+    pixels: HifiArtworkPixels,
+    pixels_len: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HifiArtworkPixels {
+    Owned(Box<[Rgb565; HIFI_ARTWORK_PIXELS]>),
+    Static(&'static [Rgb565; HIFI_ARTWORK_PIXELS]),
 }
 
 impl HifiArtwork {
     pub fn new(source_uri: &str) -> Option<Self> {
         let mut artwork = Self {
             source_uri: String::new(),
-            pixels: Vec::new(),
+            pixels: HifiArtworkPixels::Owned(Box::new([Rgb565::BLACK; HIFI_ARTWORK_PIXELS])),
+            pixels_len: 0,
         };
         artwork.source_uri.push_str(source_uri).ok()?;
         Some(artwork)
     }
 
+    pub fn from_static_pixels(
+        source_uri: &str,
+        pixels: &'static [Rgb565; HIFI_ARTWORK_PIXELS],
+    ) -> Option<Self> {
+        let mut source = String::new();
+        source.push_str(source_uri).ok()?;
+        Some(Self {
+            source_uri: source,
+            pixels: HifiArtworkPixels::Static(pixels),
+            pixels_len: HIFI_ARTWORK_PIXELS,
+        })
+    }
+
     pub fn push_pixel(&mut self, color: Rgb565) -> bool {
-        self.pixels.push(color).is_ok()
+        if self.pixels_len >= HIFI_ARTWORK_PIXELS {
+            return false;
+        }
+        let HifiArtworkPixels::Owned(pixels) = &mut self.pixels else {
+            return false;
+        };
+        pixels[self.pixels_len] = color;
+        self.pixels_len += 1;
+        true
     }
 
     pub fn push_rgb888(&mut self, red: u8, green: u8, blue: u8) -> bool {
@@ -137,7 +171,14 @@ impl HifiArtwork {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.pixels.len() == HIFI_ARTWORK_PIXELS
+        self.pixels_len == HIFI_ARTWORK_PIXELS
+    }
+
+    pub fn pixels(&self) -> &[Rgb565] {
+        match &self.pixels {
+            HifiArtworkPixels::Owned(pixels) => &pixels[..self.pixels_len],
+            HifiArtworkPixels::Static(pixels) => &pixels[..self.pixels_len],
+        }
     }
 }
 
