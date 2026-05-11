@@ -207,6 +207,7 @@ enum HifiWorkerRequest {
     Command(Command),
     Status,
     Artwork(String),
+    Pins,
 }
 
 #[derive(Debug)]
@@ -217,6 +218,7 @@ enum HifiWorkerResponse {
         uri: String,
         result: Result<app_core::HifiArtwork, String>,
     },
+    Pins(Result<app_core::HifiPins, String>),
 }
 
 #[derive(Debug)]
@@ -231,10 +233,8 @@ impl HifiWorker {
         let (responses_tx, responses_rx) = mpsc::channel();
 
         thread::spawn(move || {
-            let mut runtime = AppRuntime::new(LpecHifi::new(
-                HostTcpConnector::new(),
-                AppConfig::load_local_or_default().linn_lpec_endpoint,
-            ));
+            let endpoint = AppConfig::load_local_or_default().linn_lpec_endpoint;
+            let mut runtime = AppRuntime::new(LpecHifi::new(HostTcpConnector::new(), endpoint));
 
             while let Ok(request) = requests_rx.recv() {
                 match request {
@@ -258,6 +258,15 @@ impl HifiWorker {
                             .hifi_artwork(&uri)
                             .map_err(|error| format!("{error:?}"));
                         let _ = responses_tx.send(HifiWorkerResponse::Artwork { uri, result });
+                    }
+                    HifiWorkerRequest::Pins => {
+                        let responses_tx = responses_tx.clone();
+                        thread::spawn(move || {
+                            let mut runtime =
+                                AppRuntime::new(LpecHifi::new(HostTcpConnector::new(), endpoint));
+                            let result = runtime.hifi_pins().map_err(|error| format!("{error:?}"));
+                            let _ = responses_tx.send(HifiWorkerResponse::Pins(result));
+                        });
                     }
                 }
             }
@@ -286,6 +295,8 @@ struct NativeSimulator {
     last_hifi_artwork_uri: Option<String>,
     hifi_status_in_flight: bool,
     hifi_artwork_in_flight: Option<String>,
+    hifi_pins_loaded: bool,
+    hifi_pins_in_flight: bool,
     tap_highlight: Option<TapHighlight>,
     render_stats: RenderStats,
 }
@@ -310,6 +321,8 @@ impl NativeSimulator {
             last_hifi_artwork_uri: None,
             hifi_status_in_flight: false,
             hifi_artwork_in_flight: None,
+            hifi_pins_loaded: false,
+            hifi_pins_in_flight: false,
             tap_highlight: None,
             render_stats: RenderStats::new(),
         }
@@ -342,7 +355,22 @@ impl NativeSimulator {
         self.drain_hifi_worker();
         self.update(Event::Tick { uptime_ms });
         self.poll_hifi_status_if_needed(uptime_ms);
+        self.fetch_hifi_pins_if_needed();
         self.render_stats.update_sample();
+    }
+
+    fn fetch_hifi_pins_if_needed(&mut self) {
+        if self.app.screen() != Screen::HifiControl
+            || self.hifi_pins_loaded
+            || self.hifi_pins_in_flight
+        {
+            return;
+        }
+        self.hifi_pins_in_flight = true;
+        if let Err(error) = self.hifi_worker.requests.send(HifiWorkerRequest::Pins) {
+            self.hifi_pins_in_flight = false;
+            eprintln!("failed to queue Linn pins fetch: {error:?}");
+        }
     }
 
     fn drain_hifi_worker(&mut self) {
@@ -379,10 +407,21 @@ impl NativeSimulator {
                         Err(error) => eprintln!("failed to load Linn artwork {uri:?}: {error}"),
                     }
                 }
+                Ok(HifiWorkerResponse::Pins(result)) => {
+                    self.hifi_pins_in_flight = false;
+                    match result {
+                        Ok(pins) => {
+                            self.hifi_pins_loaded = true;
+                            self.update(Event::HifiPins(pins));
+                        }
+                        Err(error) => eprintln!("failed to fetch Linn pins: {error}"),
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.hifi_status_in_flight = false;
                     self.hifi_artwork_in_flight = None;
+                    self.hifi_pins_in_flight = false;
                     break;
                 }
             }
@@ -698,33 +737,24 @@ define_class!(
             );
             add_button(
                 &side_panel,
-                "Boot button",
+                "BOOT button",
                 0.0,
                 layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 2.0,
                 sel!(bootButton:),
                 self,
                 mtm,
             );
-            add_button(
-                &side_panel,
-                "User button",
-                0.0,
-                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 3.0,
-                sel!(userButton:),
-                self,
-                mtm,
-            );
             add_network_status_popup(
                 &side_panel,
                 0.0,
-                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 4.4,
+                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 3.4,
                 self,
                 mtm,
             );
             add_display_shape_popup(
                 &side_panel,
                 0.0,
-                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 5.4,
+                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 4.4,
                 self,
                 mtm,
             );
@@ -816,12 +846,9 @@ define_class!(
 
         #[unsafe(method(bootButton:))]
         fn boot_button(&self, _sender: &AnyObject) {
+            // The Waveshare ESP32-C6 Touch AMOLED 1.43 only exposes one
+            // software-readable button (BOOT on GPIO9). The sim mirrors that.
             self.send_event(Event::ButtonPressed(app_core::Button::Boot));
-        }
-
-        #[unsafe(method(userButton:))]
-        fn user_button(&self, _sender: &AnyObject) {
-            self.send_event(Event::ButtonPressed(app_core::Button::User));
         }
 
         #[unsafe(method(displayTapped:))]

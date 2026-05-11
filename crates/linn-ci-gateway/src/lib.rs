@@ -1,4 +1,34 @@
 #![no_std]
+//! # `linn-ci-gateway`
+//!
+//! `no_std` request/response codec for Linn's **CI Gateway** (Control
+//! Interface Gateway) — a higher-level JSON-over-HTTP / WebSocket API that
+//! Linn DS/DSM devices expose alongside the lower-level LPEC text protocol.
+//! CI Gateway is the preferred surface for third-party streaming-service
+//! state (Qobuz, TIDAL, etc.) and account management; LPEC remains the
+//! fallback for things CI Gateway doesn't cover.
+//!
+//! Canonical specification:
+//! <https://docs.linn.co.uk/wiki/index.php/CI-Gateway>
+//!
+//! ## Transports
+//!
+//! - **HTTP** on port [`DEFAULT_HTTP_PORT`] (`4100`). Each request is a
+//!   single JSON-encoded message; the server returns a single JSON
+//!   response.
+//! - **WebSocket** on port [`DEFAULT_WEBSOCKET_PORT`] (`8088`) at path
+//!   [`WEBSOCKET_PATH`] (`/ws`), for streaming session-bound updates.
+//!
+//! Live API documentation is published by the device itself at
+//! [`API_DOC_PATH`] and the OpenAPI spec at [`SWAGGER_PATH`].
+//!
+//! ## What this crate provides
+//!
+//! Only message framing: building outgoing JSON request bodies for the
+//! [`RequestPath`] variants we use, plus the response types they decode
+//! into. Transport plumbing (TCP, TLS, WebSocket upgrade, session
+//! lifecycle, retry policy) lives in `app-runtime` or the firmware/sim
+//! crates that wrap this one.
 
 use core::fmt;
 

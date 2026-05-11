@@ -1,4 +1,46 @@
 #![no_std]
+//! # `linn-lpec`
+//!
+//! `no_std` codec and synchronous client for **LPEC** — Linn's Linn Products
+//! Event Control protocol. LPEC is a small TCP line protocol that exposes
+//! the same UPnP services as the device's standard UPnP/SOAP API, but as
+//! plain text framed by `\r\n`. It is not an industry standard; it's
+//! specific to Linn DS/DSM hardware.
+//!
+//! Canonical specification:
+//! <https://docs.linn.co.uk/wiki/index.php/Developer:LPEC>
+//!
+//! ## Wire format at a glance
+//!
+//! Each line is one message. Arguments are quoted strings with XML entity
+//! escaping (`&quot;`, `&amp;`, `&lt;`, `&gt;`, `&apos;`). Examples:
+//!
+//! ```text
+//! ACTION Ds/Volume 1 SetVolume "50"          (client → device)
+//! RESPONSE "50"                              (device → client)
+//! SUBSCRIBE Ds/Info                          (client → device)
+//! EVENT 7 0 TrackDuration "187" Metatext ".." (device → client, async)
+//! ERROR 801 "JsonCorrupt"                    (device → client, on action failure)
+//! ```
+//!
+//! - Default TCP port is `23` ([`DEFAULT_PORT`]).
+//! - Responses do **not** carry request IDs; pipelining is unsafe — keep one
+//!   in-flight action per connection.
+//! - Subscriptions deliver unsolicited `EVENT` lines on the same connection
+//!   between request/response pairs; clients must tolerate them anywhere.
+//!
+//! ## What this crate provides
+//!
+//! - [`Action`] / [`format_action`] — build and format `ACTION` lines.
+//! - [`Message`] / [`parse_message`] — parse any incoming line.
+//! - [`Transport`] + [`Client`] — synchronous request/response wrapper over
+//!   a user-supplied byte transport. Higher-level state (subscriptions,
+//!   evented variables, retries) lives in `app-runtime`, not here.
+//!
+//! Encodings of individual arguments are service-specific: most actions take
+//! plain numbers or strings, `Ds/Info:Metatext` returns escaped DIDL-Lite
+//! XML, and `Ds/Pins:GetIdArray` / `ReadList` use JSON payloads. This crate
+//! only handles the LPEC framing; payload decoding is the caller's job.
 
 use core::{fmt, str};
 
@@ -93,6 +135,24 @@ pub enum Arguments<'a> {
     One(&'a str),
 }
 
+// ---------------------------------------------------------------------------
+// Action constructors
+//
+// Each function below corresponds to one openhome.org service action.
+// Action names follow the canonical service definitions documented at
+// <https://docs.linn.co.uk/wiki/index.php/Developer:LPEC> (and ultimately
+// the openhome.org service XML files). Two naming styles coexist:
+//
+// - Older `Ds/*` and `Preamp/*` services expose property getters under
+//   the bare property name (e.g. `Ds/Volume:Volume`, `Preamp/Preamp:Mute`).
+// - Newer services like `Ds/Pins` use modern OpenHome conventions with
+//   `Get`-prefixed getters (e.g. `Ds/Pins:GetIdArray`).
+//
+// When adding new actions, cross-check the official service XML rather
+// than guessing — the device rejects unknown action names with a
+// `Remote { code: 401, .. }` style error.
+// ---------------------------------------------------------------------------
+
 pub fn play() -> Action<'static> {
     Action::new(Service::AvTransport, 1, "Play", &["0", "1"])
 }
@@ -149,6 +209,10 @@ pub fn set_volume_arg(volume: &str) -> Action<'_> {
     Action::one(Service::Preamp, 1, "SetVolume", volume)
 }
 
+pub fn set_ds_volume_arg(volume: &str) -> Action<'_> {
+    Action::one(Service::Volume, 1, "SetVolume", volume)
+}
+
 pub fn get_mute() -> Action<'static> {
     Action::new(Service::Preamp, 1, "Mute", &[])
 }
@@ -171,6 +235,22 @@ pub fn set_source_by_system_name_arg(system_name: &str) -> Action<'_> {
 
 pub fn invoke_pin_arg(pin: &str) -> Action<'_> {
     Action::one(Service::Pins, 1, "InvokeId", pin)
+}
+
+pub fn invoke_pin_index_arg(index: &str) -> Action<'_> {
+    Action::one(Service::Pins, 1, "InvokeIndex", index)
+}
+
+pub fn pins_id_array() -> Action<'static> {
+    // OpenHome's Linn-Pins service names this getter `GetIdArray` (modern
+    // service naming convention with a `Get` prefix). Older Ds services
+    // like `Ds/Volume` use the bare property name (`Volume`), so don't
+    // assume the same shape here.
+    Action::new(Service::Pins, 1, "GetIdArray", &[])
+}
+
+pub fn pins_read_list_arg(ids: &str) -> Action<'_> {
+    Action::one(Service::Pins, 1, "ReadList", ids)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -534,6 +614,20 @@ fn push_xml_unescaped(output: &mut ResponseArg, input: &str) -> Result<(), Error
     let mut offset = 0;
 
     while offset < bytes.len() {
+        if bytes[offset] == b'\\' {
+            let Some(ch) = input[offset + 1..].chars().next() else {
+                return Err(Error::InvalidMessage);
+            };
+            match ch {
+                '"' | '\\' => {
+                    output.push(ch).map_err(|_| Error::LineTooLong)?;
+                    offset += 1 + ch.len_utf8();
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
         if bytes[offset] != b'&' {
             let ch = input[offset..]
                 .chars()
@@ -607,7 +701,15 @@ impl<'a> Parser<'a> {
         self.offset += 1;
         let start = self.offset;
         while !self.done() {
-            if self.peek() == Some(b'"') {
+            if self.peek() == Some(b'\\') {
+                self.offset += 1;
+                if self.done() {
+                    return Err(Error::InvalidMessage);
+                }
+                self.offset += 1;
+                continue;
+            }
+            if self.peek() == Some(b'"') && self.quoted_arg_ends_here() {
                 let value = &self.input[start..self.offset];
                 self.offset += 1;
                 return Ok(Some(value));
@@ -654,6 +756,13 @@ impl<'a> Parser<'a> {
 
     fn peek(&self) -> Option<u8> {
         self.input.as_bytes().get(self.offset).copied()
+    }
+
+    fn quoted_arg_ends_here(&self) -> bool {
+        matches!(
+            self.input.as_bytes().get(self.offset + 1).copied(),
+            None | Some(b' ' | b'\t')
+        )
     }
 }
 
@@ -718,6 +827,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_response_arguments_with_backslash_escaped_quotes() {
+        assert_eq!(
+            parse_message(r#"RESPONSE "[{\"Id\":7,\"Title\":\"Radio\"}]""#).unwrap(),
+            Message::Response {
+                args: Vec::from_slice(&[r#"[{\"Id\":7,\"Title\":\"Radio\"}]"#]).unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_response_arguments_with_raw_json_quotes() {
+        assert_eq!(
+            parse_message(r#"RESPONSE "[{"Id":7,"Title":"Radio"}]""#).unwrap(),
+            Message::Response {
+                args: Vec::from_slice(&[r#"[{"Id":7,"Title":"Radio"}]"#]).unwrap()
+            }
+        );
+    }
+
+    #[test]
     fn parses_events() {
         assert_eq!(
             parse_message("EVENT 49 0 ProductName \"Selekt DSM\" ProductStandby \"false\"")
@@ -771,6 +900,16 @@ mod tests {
         let response = client.action(source_arg("3")).unwrap();
 
         assert_eq!(response[0].as_str(), "TV & \"Arc\"");
+    }
+
+    #[test]
+    fn client_unescapes_backslash_quoted_response_arguments() {
+        let transport = ScriptedTransport::new(&[r#"RESPONSE "[{\"Id\":7,\"Title\":\"Radio\"}]""#]);
+        let mut client = Client::new(transport);
+
+        let response = client.action(pins_read_list_arg("[7]")).unwrap();
+
+        assert_eq!(response[0].as_str(), r#"[{"Id":7,"Title":"Radio"}]"#);
     }
 
     #[test]

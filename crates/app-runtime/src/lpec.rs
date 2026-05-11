@@ -1,8 +1,45 @@
+//! LPEC-backed [`HifiController`] implementation plus the persistent session
+//! used by the firmware event loop.
+//!
+//! Background on the wire protocol lives in the [`linn_lpec`] crate; the
+//! Linn-authored spec is at
+//! <https://docs.linn.co.uk/wiki/index.php/Developer:LPEC>. This module is
+//! where we turn LPEC into the app's notion of "hi-fi status / artwork /
+//! pins / commands".
+//!
+//! ## Two clients in one file
+//!
+//! - [`LpecHifi`] is a *connection-per-call* [`HifiController`]: each
+//!   `status()` / `artwork()` / `handle_command()` opens a fresh TCP
+//!   connection. Used by the simulator's worker thread, where polling is
+//!   acceptable.
+//! - [`LpecSession`] holds the **persistent** subscription used by the
+//!   firmware: subscribe once to `Ds/Time` + `Ds/Info` + `Ds/Volume`, then
+//!   stream `EVENT` lines, interleaving the occasional command on the same
+//!   socket. This avoids the connection churn and polling latency that the
+//!   per-call path incurs. See `docs/lpec subscriptions.md` for background.
+//!
+//! ## Argument encoding quirks
+//!
+//! LPEC's framing is text-with-XML-escaping, but the payload format inside
+//! each `ACTION` / `RESPONSE` quoted arg is *service-specific*:
+//!
+//! | Action | Argument format |
+//! | --- | --- |
+//! | `Ds/Volume:SetVolume`, `Ds/Pins:InvokeId` | plain integer |
+//! | `Ds/Info:Metatext` / `Track` events | DIDL-Lite XML (entity-escaped) |
+//! | `Ds/Pins:ReadList` request/response | JSON pin metadata, fetched one ID at a time |
+//! | `Ds/Pins:GetIdArray` response | JSON array of pin IDs, e.g. `"[1,2,3]"` |
+//!
+//! `apply_metadata` decodes the DIDL-Lite case, [`decode_pin_ids`] handles
+//! the `GetIdArray` JSON array used to enable hardware-mapped pins, and
+//! [`parse_pin_list_json`] handles optional titles.
+
 use alloc::vec::Vec as AllocVec;
 
 use app_core::{
-    ArtworkPixel, HIFI_ARTWORK_PIXELS, HIFI_ARTWORK_SIZE, HifiArtwork, HifiCommand, HifiStatus,
-    PlaybackState,
+    ArtworkPixel, HIFI_ARTWORK_PIXELS, HIFI_ARTWORK_SIZE, HIFI_PIN_COUNT, HIFI_PIN_TITLE_LEN,
+    HIFI_VOLUME_MAX, HifiArtwork, HifiCommand, HifiPin, HifiPins, HifiStatus, PlaybackState,
 };
 use heapless::Vec;
 use linn_lpec::{Client as LinnClient, Line, Transport};
@@ -124,8 +161,21 @@ where
         Ok(LinnClient::new(transport))
     }
 
-    fn invoke_pin(&mut self, pin: u8) -> Result<(), Error<C::Error>> {
-        self.client()?.invoke_pin(pin).map_err(map_client_error)
+    fn invoke_pin_id(&mut self, id: u32) -> Result<(), Error<C::Error>> {
+        let mut id_arg = heapless::String::<11>::new();
+        core::fmt::write(&mut id_arg, format_args!("{id}")).map_err(|_| Error::LineTooLong)?;
+        action_with_retry(&mut self.client()?, linn_lpec::invoke_pin_arg(&id_arg)).map(|_| ())
+    }
+
+    fn set_volume(&mut self, volume: u8) -> Result<(), Error<C::Error>> {
+        let clamped = volume.min(HIFI_VOLUME_MAX);
+        let mut volume_arg = heapless::String::<3>::new();
+        core::fmt::write(&mut volume_arg, format_args!("{clamped}"))
+            .map_err(|_| Error::LineTooLong)?;
+        self.client()?
+            .action(linn_lpec::set_ds_volume_arg(&volume_arg))
+            .map(|_| ())
+            .map_err(map_client_error)
     }
 
     fn load_artwork(&mut self, uri: &str) -> Result<HifiArtwork, Error<C::Error>> {
@@ -142,6 +192,11 @@ where
             client.playlist_play().map_err(map_client_error)
         }
     }
+
+    pub fn fetch_pins(&mut self) -> Result<HifiPins, Error<C::Error>> {
+        let mut client = self.client()?;
+        fetch_pins(&mut client)
+    }
 }
 
 impl<C> HifiController for LpecHifi<C>
@@ -152,8 +207,9 @@ where
 
     fn handle_command(&mut self, command: HifiCommand) -> Result<(), Self::Error> {
         match command {
-            HifiCommand::ActivatePreset { preset } => self.invoke_pin(preset),
+            HifiCommand::InvokePinId { id } => self.invoke_pin_id(id),
             HifiCommand::TogglePlayback => self.toggle_playback(),
+            HifiCommand::SetVolume { volume } => self.set_volume(volume),
         }
     }
 
@@ -164,6 +220,10 @@ where
     fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error> {
         self.load_artwork(uri)
     }
+
+    fn pins(&mut self) -> Result<HifiPins, Self::Error> {
+        self.fetch_pins()
+    }
 }
 
 pub fn handle_command_with_stream<S>(stream: S, command: HifiCommand) -> Result<(), Error<S::Error>>
@@ -172,7 +232,7 @@ where
 {
     let mut client = LinnClient::new(LpecTransport::new(stream).sync()?);
     match command {
-        HifiCommand::ActivatePreset { preset } => invoke_pin(&mut client, preset),
+        HifiCommand::InvokePinId { id } => invoke_pin_id(&mut client, id),
         HifiCommand::TogglePlayback => {
             let playback = read_playback_state(&mut client)?;
             if playback_can_pause(playback) {
@@ -180,6 +240,13 @@ where
             } else {
                 action_with_retry(&mut client, linn_lpec::playlist_play()).map(|_| ())
             }
+        }
+        HifiCommand::SetVolume { volume } => {
+            let clamped = volume.min(HIFI_VOLUME_MAX);
+            let mut volume_arg = heapless::String::<3>::new();
+            core::fmt::write(&mut volume_arg, format_args!("{clamped}"))
+                .map_err(|_| Error::LineTooLong)?;
+            action_with_retry(&mut client, linn_lpec::set_ds_volume_arg(&volume_arg)).map(|_| ())
         }
     }
 }
@@ -289,6 +356,10 @@ impl LpecSession {
         self.subscribed = false;
     }
 
+    pub fn live_status(&self) -> Option<HifiStatus> {
+        self.changed_status(true)
+    }
+
     pub fn poll<S>(&mut self, stream: &mut S) -> Result<Option<HifiStatus>, Error<S::Error>>
     where
         S: ByteStream,
@@ -313,13 +384,25 @@ impl LpecSession {
         let mut changed = false;
 
         match command {
-            HifiCommand::ActivatePreset { preset } => {
-                let mut pin_arg = heapless::String::<3>::new();
-                core::fmt::write(&mut pin_arg, format_args!("{preset}"))
+            HifiCommand::InvokePinId { id } => {
+                let mut pin_arg = heapless::String::<11>::new();
+                core::fmt::write(&mut pin_arg, format_args!("{id}"))
                     .map_err(|_| Error::LineTooLong)?;
                 changed |= self
                     .action(stream, linn_lpec::invoke_pin_arg(&pin_arg))?
                     .changed;
+            }
+            HifiCommand::SetVolume { volume } => {
+                let clamped = volume.min(HIFI_VOLUME_MAX);
+                let mut volume_arg = heapless::String::<3>::new();
+                core::fmt::write(&mut volume_arg, format_args!("{clamped}"))
+                    .map_err(|_| Error::LineTooLong)?;
+                let response = self.action(stream, linn_lpec::set_ds_volume_arg(&volume_arg))?;
+                changed |= response.changed;
+                if self.status.volume_percent != clamped {
+                    self.status.volume_percent = clamped;
+                    changed = true;
+                }
             }
             HifiCommand::TogglePlayback => {
                 let playback = if self.status.playback == PlaybackState::Unknown {
@@ -353,6 +436,31 @@ impl LpecSession {
         }
 
         Ok(self.changed_status(changed))
+    }
+
+    /// One-shot fetch of the device pin list. Returns up to `HIFI_PIN_COUNT`
+    /// pin entries with their IDs from `Ds/Pins:GetIdArray`.
+    ///
+    /// Observed Linn DSMs return the hardware pin IDs directly as a JSON
+    /// array (`"[1,2,3,4,5,6]"`). Those IDs are enough to invoke pins; optional
+    /// titles are fetched with one `ReadList "[id]"` request per pin so a
+    /// large or malformed metadata response cannot disable the whole pin list.
+    pub fn fetch_pins<S>(&mut self, stream: &mut S) -> Result<HifiPins, Error<S::Error>>
+    where
+        S: ByteStream,
+    {
+        self.ensure_subscribed(stream)?;
+
+        let id_array_response = self.action(stream, linn_lpec::pins_id_array())?;
+        let device_ids = decode_pin_ids(id_array_response.args.iter().map(|s| s.as_str()))
+            .ok_or(Error::Protocol(linn_lpec::Error::InvalidMessage))?;
+        if device_ids.is_empty() {
+            return Ok(HifiPins::new());
+        }
+
+        let mut pins = pins_from_ids(&device_ids);
+        fetch_pin_titles_with_session(self, stream, &device_ids, &mut pins);
+        Ok(pins)
     }
 
     fn ensure_subscribed<S>(&mut self, stream: &mut S) -> Result<(), Error<S::Error>>
@@ -432,7 +540,7 @@ impl LpecSession {
     }
 
     fn changed_status(&self, changed: bool) -> Option<HifiStatus> {
-        if changed && status_has_live_content(&self.status) {
+        if changed {
             Some(self.status.clone())
         } else {
             None
@@ -518,9 +626,7 @@ where
         }
     }
 
-    if let Ok(volume) = client.volume().map_err(map_client_error) {
-        status.volume_percent = volume.min(100);
-    } else if let Ok(args) = client
+    if let Ok(args) = client
         .action(linn_lpec::get_ds_volume())
         .map_err(map_client_error)
         && let Some(value) = args.first()
@@ -565,13 +671,395 @@ where
     }
 }
 
-fn invoke_pin<S>(client: &mut LinnClient<LpecTransport<S>>, pin: u8) -> Result<(), Error<S::Error>>
+fn invoke_pin_id<S>(
+    client: &mut LinnClient<LpecTransport<S>>,
+    id: u32,
+) -> Result<(), Error<S::Error>>
 where
     S: ByteStream,
 {
-    let mut pin_arg = heapless::String::<3>::new();
-    core::fmt::write(&mut pin_arg, format_args!("{pin}")).map_err(|_| Error::LineTooLong)?;
+    let mut pin_arg = heapless::String::<11>::new();
+    core::fmt::write(&mut pin_arg, format_args!("{id}")).map_err(|_| Error::LineTooLong)?;
     action_with_retry(client, linn_lpec::invoke_pin_arg(&pin_arg)).map(|_| ())
+}
+
+fn fetch_pins<S>(client: &mut LinnClient<LpecTransport<S>>) -> Result<HifiPins, Error<S::Error>>
+where
+    S: ByteStream,
+{
+    let id_array_response = client
+        .action(linn_lpec::pins_id_array())
+        .map_err(map_client_error)?;
+    let device_ids = decode_pin_ids(id_array_response.iter().map(|s| s.as_str()))
+        .ok_or(Error::Protocol(linn_lpec::Error::InvalidMessage))?;
+    if device_ids.is_empty() {
+        return Ok(HifiPins::new());
+    }
+
+    let mut pins = pins_from_ids(&device_ids);
+    fetch_pin_titles_with_client(client, &device_ids, &mut pins);
+    Ok(pins)
+}
+
+fn pins_from_ids(ids: &heapless::Vec<u32, HIFI_PIN_COUNT>) -> HifiPins {
+    let mut pins = HifiPins::new();
+    for (slot, id) in ids.iter().copied().enumerate() {
+        let _ = pins.set(
+            slot,
+            HifiPin {
+                id,
+                title: heapless::String::new(),
+            },
+        );
+    }
+    pins
+}
+
+fn fetch_pin_titles_with_client<S>(
+    client: &mut LinnClient<LpecTransport<S>>,
+    ids: &heapless::Vec<u32, HIFI_PIN_COUNT>,
+    pins: &mut HifiPins,
+) where
+    S: ByteStream,
+{
+    for (slot, id) in ids.iter().copied().enumerate() {
+        let Some(ids_arg) = format_single_id_json(id) else {
+            continue;
+        };
+        let Ok(response) = client
+            .action(linn_lpec::pins_read_list_arg(&ids_arg))
+            .map_err(map_client_error)
+        else {
+            continue;
+        };
+        apply_pin_title(slot, id, response.iter().map(|s| s.as_str()), pins);
+    }
+}
+
+fn fetch_pin_titles_with_session<S>(
+    session: &mut LpecSession,
+    stream: &mut S,
+    ids: &heapless::Vec<u32, HIFI_PIN_COUNT>,
+    pins: &mut HifiPins,
+) where
+    S: ByteStream,
+{
+    for (slot, id) in ids.iter().copied().enumerate() {
+        let Some(ids_arg) = format_single_id_json(id) else {
+            continue;
+        };
+        let Ok(response) = session.action(stream, linn_lpec::pins_read_list_arg(&ids_arg)) else {
+            continue;
+        };
+        apply_pin_title(slot, id, response.args.iter().map(|s| s.as_str()), pins);
+    }
+}
+
+fn format_single_id_json(id: u32) -> Option<heapless::String<13>> {
+    let mut ids_arg = heapless::String::<13>::new();
+    ids_arg.push('[').ok()?;
+    core::fmt::write(&mut ids_arg, format_args!("{id}")).ok()?;
+    ids_arg.push(']').ok()?;
+    Some(ids_arg)
+}
+
+fn apply_pin_title<'a, I>(slot: usize, id: u32, args: I, pins: &mut HifiPins)
+where
+    I: Iterator<Item = &'a str>,
+{
+    let titles = parse_pin_list_json(args);
+    let Some(pin) = titles.get(0) else {
+        return;
+    };
+    if pin.id != id {
+        return;
+    }
+    let _ = pins.set(slot, pin.clone());
+}
+
+/// Decode the response of `Ds/Pins:GetIdArray`.
+///
+/// Returns the non-zero IDs trimmed to at most `HIFI_PIN_COUNT`; `None` means
+/// the response shape is not recognized.
+fn decode_pin_ids<'a>(
+    mut args: impl Iterator<Item = &'a str>,
+) -> Option<heapless::Vec<u32, HIFI_PIN_COUNT>> {
+    let input = args.next()?;
+    if args.next().is_some() {
+        return None;
+    }
+    let bytes = input.as_bytes();
+    let mut pos = 0;
+    skip_json_ws(bytes, &mut pos);
+    if bytes.get(pos) != Some(&b'[') {
+        return None;
+    }
+    pos += 1;
+
+    let mut ids = heapless::Vec::<u32, HIFI_PIN_COUNT>::new();
+    loop {
+        skip_json_ws(bytes, &mut pos);
+        match bytes.get(pos).copied()? {
+            b']' => return Some(ids),
+            b',' => {
+                pos += 1;
+                continue;
+            }
+            b'0'..=b'9' => {}
+            _ => return None,
+        }
+
+        let start = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        let id = parse_u32(&input[start..pos])?;
+        if id != 0 && ids.len() < HIFI_PIN_COUNT {
+            let _ = ids.push(id);
+        }
+
+        skip_json_ws(bytes, &mut pos);
+        match bytes.get(pos).copied()? {
+            b',' => pos += 1,
+            b']' => return Some(ids),
+            _ => return None,
+        }
+    }
+}
+
+fn skip_json_ws(bytes: &[u8], pos: &mut usize) {
+    while *pos < bytes.len() && (bytes[*pos] as char).is_ascii_whitespace() {
+        *pos += 1;
+    }
+}
+
+/// Parse the JSON `List` returned by `Ds/Pins:ReadList`. Linn returns a
+/// flat array of pin objects each with at least `"Id"` (number) and
+/// `"Title"` (string) fields. This is a deliberately small scanner — we
+/// only need those two fields per entry, not full JSON support.
+fn parse_pin_list_json<'a, I>(args: I) -> HifiPins
+where
+    I: Iterator<Item = &'a str>,
+{
+    let mut pins = HifiPins::new();
+    let mut slot = 0;
+    for arg in args {
+        if slot >= HIFI_PIN_COUNT {
+            break;
+        }
+        for entry in JsonPinEntries::new(arg) {
+            if slot >= HIFI_PIN_COUNT {
+                break;
+            }
+            let Some(id) = entry.id else {
+                continue;
+            };
+            if id == 0 {
+                continue;
+            }
+            let mut title_buf = heapless::String::<HIFI_PIN_TITLE_LEN>::new();
+            if let Some(title) = entry.title {
+                for ch in title.chars() {
+                    if title_buf.push(ch).is_err() {
+                        break;
+                    }
+                }
+            }
+            pins.set(
+                slot,
+                HifiPin {
+                    id,
+                    title: title_buf,
+                },
+            );
+            slot += 1;
+        }
+    }
+    pins
+}
+
+#[derive(Default)]
+struct JsonPinEntry<'a> {
+    id: Option<u32>,
+    title: Option<&'a str>,
+}
+
+/// Walk a JSON-ish payload one `{...}` object at a time, pulling out `Id`
+/// and `Title` per object. Tolerates whitespace, balanced braces, and any
+/// other fields we don't care about.
+struct JsonPinEntries<'a> {
+    src: &'a str,
+    pos: usize,
+}
+
+impl<'a> JsonPinEntries<'a> {
+    fn new(src: &'a str) -> Self {
+        Self { src, pos: 0 }
+    }
+}
+
+impl<'a> Iterator for JsonPinEntries<'a> {
+    type Item = JsonPinEntry<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Find the start of the next object.
+        let bytes = self.src.as_bytes();
+        while self.pos < bytes.len() && bytes[self.pos] != b'{' {
+            self.pos += 1;
+        }
+        if self.pos >= bytes.len() {
+            return None;
+        }
+
+        // Consume balanced braces, respecting strings.
+        let start = self.pos;
+        let mut depth = 0_i32;
+        let mut in_string = false;
+        let mut escape = false;
+        while self.pos < bytes.len() {
+            let b = bytes[self.pos];
+            self.pos += 1;
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if b == b'\\' {
+                    escape = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let object = &self.src[start..self.pos];
+                        return Some(parse_json_pin_object(object));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
+fn parse_json_pin_object(object: &str) -> JsonPinEntry<'_> {
+    JsonPinEntry {
+        id: find_json_string_field(object, "Id")
+            .and_then(parse_u32)
+            .or_else(|| find_json_number_field(object, "Id")),
+        title: find_json_string_field(object, "Title"),
+    }
+}
+
+/// Find `"<key>"` followed by `:` and a quoted string value; return the
+/// (un-escaped enough for our needs) inner content. Doesn't handle every
+/// JSON escape — just the common ones we'd get back from Linn.
+fn find_json_string_field<'a>(object: &'a str, key: &str) -> Option<&'a str> {
+    let bytes = object.as_bytes();
+    let mut pos = 0;
+    while let Some(rel) = object[pos..].find('"') {
+        let key_start = pos + rel + 1;
+        // Read the key up to the next unescaped quote.
+        let mut k = key_start;
+        let mut esc = false;
+        while k < bytes.len() {
+            if esc {
+                esc = false;
+                k += 1;
+                continue;
+            }
+            if bytes[k] == b'\\' {
+                esc = true;
+                k += 1;
+                continue;
+            }
+            if bytes[k] == b'"' {
+                break;
+            }
+            k += 1;
+        }
+        if k >= bytes.len() {
+            return None;
+        }
+        let this_key = &object[key_start..k];
+        // Skip whitespace + colon.
+        let mut after = k + 1;
+        while after < bytes.len() && (bytes[after] as char).is_ascii_whitespace() {
+            after += 1;
+        }
+        let is_field = after < bytes.len() && bytes[after] == b':';
+        if !is_field {
+            // Not a key-value position; advance past this string and continue.
+            pos = k + 1;
+            continue;
+        }
+        if this_key != key {
+            pos = after + 1;
+            continue;
+        }
+        // Skip whitespace before value.
+        let mut v = after + 1;
+        while v < bytes.len() && (bytes[v] as char).is_ascii_whitespace() {
+            v += 1;
+        }
+        if v >= bytes.len() || bytes[v] != b'"' {
+            return None;
+        }
+        let value_start = v + 1;
+        let mut q = value_start;
+        let mut esc = false;
+        while q < bytes.len() {
+            if esc {
+                esc = false;
+                q += 1;
+                continue;
+            }
+            if bytes[q] == b'\\' {
+                esc = true;
+                q += 1;
+                continue;
+            }
+            if bytes[q] == b'"' {
+                return Some(&object[value_start..q]);
+            }
+            q += 1;
+        }
+        return None;
+    }
+    None
+}
+
+fn find_json_number_field(object: &str, key: &str) -> Option<u32> {
+    // Fallback: locate `"<key>" :` and then parse digits.
+    let mut needle = heapless::String::<40>::new();
+    needle.push('"').ok()?;
+    needle.push_str(key).ok()?;
+    needle.push('"').ok()?;
+    let mut pos = object.find(needle.as_str())?;
+    pos += needle.len();
+    let bytes = object.as_bytes();
+    while pos < bytes.len() && (bytes[pos] as char).is_ascii_whitespace() {
+        pos += 1;
+    }
+    if pos >= bytes.len() || bytes[pos] != b':' {
+        return None;
+    }
+    pos += 1;
+    while pos < bytes.len() && (bytes[pos] as char).is_ascii_whitespace() {
+        pos += 1;
+    }
+    let start = pos;
+    while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+        pos += 1;
+    }
+    if pos == start {
+        return None;
+    }
+    parse_u32(&object[start..pos])
 }
 
 fn write_lpec_line<S>(stream: &mut S, line: &str) -> Result<(), Error<S::Error>>
@@ -719,6 +1207,7 @@ fn status_has_live_content(status: &HifiStatus) -> bool {
         || !status.artist.is_empty()
         || status.duration_seconds > 0
         || status.elapsed_seconds > 0
+        || status.volume_percent > 0
         || status.playback != PlaybackState::Unknown
 }
 
@@ -1275,6 +1764,20 @@ fn copy_xml_text<const N: usize>(value: &str, output: &mut heapless::String<N>) 
 fn copy_xml_text_once<const N: usize>(value: &str, output: &mut heapless::String<N>) {
     let mut offset = 0;
     while offset < value.len() {
+        if value.as_bytes()[offset] == b'\\' {
+            let Some(ch) = value[offset + 1..].chars().next() else {
+                return;
+            };
+            match ch {
+                '"' | '\\' => {
+                    let _ = output.push(ch);
+                    offset += 1 + ch.len_utf8();
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
         if value.as_bytes()[offset] != b'&' {
             let Some(ch) = value[offset..].chars().next() else {
                 return;
@@ -1499,6 +2002,17 @@ mod tests {
     }
 
     #[test]
+    fn session_emits_volume_only_event() {
+        let mut session = LpecSession::new();
+        let mut stream = ScriptedByteStream::new(&[r#"EVENT 3 0 Volume "42""#]);
+
+        let status = session.poll(&mut stream).unwrap().unwrap();
+
+        assert_eq!(status.volume_percent, 42);
+        assert!(stream.writes_as_str().contains("SUBSCRIBE Ds/Volume"));
+    }
+
+    #[test]
     fn session_inferrs_playing_from_advancing_seconds() {
         let mut session = LpecSession::new();
         let mut stream =
@@ -1640,5 +2154,192 @@ mod tests {
         fn flush(&mut self) -> Result<(), Self::Error> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn decode_pin_ids_accepts_json_array_response() {
+        let args = ["[1,2,3,4,5,6]"];
+        let ids = decode_pin_ids(args.iter().copied()).unwrap();
+        assert_eq!(ids.as_slice(), &[1_u32, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn decode_pin_ids_skips_zero_entries() {
+        let args = ["[0,1,0,2]"];
+        let ids = decode_pin_ids(args.iter().copied()).unwrap();
+        assert_eq!(ids.as_slice(), &[1_u32, 2]);
+    }
+
+    #[test]
+    fn decode_pin_ids_rejects_non_json_array_response() {
+        let args = ["1", "AAAABwAAAAs="];
+        assert!(decode_pin_ids(args.iter().copied()).is_none());
+    }
+
+    #[test]
+    fn decode_pin_ids_accepts_empty_json_array_response() {
+        let args = ["[]"];
+        let ids = decode_pin_ids(args.iter().copied()).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn decode_pin_ids_returns_empty_for_empty_array() {
+        let args = ["[0,0]"];
+        let ids = decode_pin_ids(args.iter().copied()).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn parse_pin_list_json_reads_flat_array() {
+        let payload = r#"[{"Id":7,"Mode":"radio","Title":"Radio"},{"Id":11,"Title":"Spotify"}]"#;
+        let pins = parse_pin_list_json(core::iter::once(payload));
+        assert_eq!(pins.get(0).map(|p| p.id), Some(7));
+        assert_eq!(pins.get(0).map(|p| p.title.as_str()), Some("Radio"));
+        assert_eq!(pins.get(1).map(|p| p.id), Some(11));
+        assert_eq!(pins.get(1).map(|p| p.title.as_str()), Some("Spotify"));
+        assert!(pins.get(2).is_none());
+    }
+
+    #[test]
+    fn parse_pin_list_json_skips_entries_without_id() {
+        // Second object has no Id — skipped; third still populates slot 1.
+        let payload = r#"[{"Id":7,"Title":"A"},{"Title":"missing"},{"Id":9,"Title":"C"}]"#;
+        let pins = parse_pin_list_json(core::iter::once(payload));
+        assert_eq!(pins.get(0).map(|p| p.id), Some(7));
+        assert_eq!(pins.get(1).map(|p| p.id), Some(9));
+    }
+
+    #[test]
+    fn parse_pin_list_json_empty_array_yields_no_pins() {
+        let pins = parse_pin_list_json(core::iter::once("[]"));
+        assert!(pins.slots().iter().all(|s| s.is_none()));
+    }
+
+    #[test]
+    fn fetch_pins_via_session_uses_idarray_then_readlist() {
+        let id_array = r#"RESPONSE "[7,11]""#;
+        let pin_7 = r#"RESPONSE "[{&quot;Id&quot;:7,&quot;Title&quot;:&quot;Radio&quot;}]" "#;
+        let pin_11 = r#"RESPONSE "[{&quot;Id&quot;:11,&quot;Title&quot;:&quot;Spotify&quot;}]" "#;
+        let mut stream = ScriptedByteStream::new(&[id_array, pin_7, pin_11]);
+        let mut session = LpecSession::new();
+
+        let pins = session.fetch_pins(&mut stream).unwrap();
+
+        assert_eq!(pins.get(0).map(|p| p.id), Some(7));
+        assert_eq!(pins.get(0).map(|p| p.title.as_str()), Some("Radio"));
+        assert_eq!(pins.get(1).map(|p| p.id), Some(11));
+        let writes = stream.writes_as_str();
+        assert!(
+            writes.contains("ACTION Ds/Pins 1 GetIdArray"),
+            "writes: {writes}"
+        );
+        assert!(
+            writes.contains("ACTION Ds/Pins 1 ReadList \"[7]\""),
+            "writes: {writes}"
+        );
+        assert!(
+            writes.contains("ACTION Ds/Pins 1 ReadList \"[11]\""),
+            "writes: {writes}"
+        );
+    }
+
+    #[test]
+    fn fetch_pins_accepts_json_idarray_response() {
+        let id_array = r#"RESPONSE "[1,2,3,4,5,6]""#;
+        let pin_1 = "RESPONSE \"[{&quot;Id&quot;:1,&quot;Title&quot;:&quot;Radio&quot;}]\"";
+        let pin_2 = "RESPONSE \"[{&quot;Id&quot;:2,&quot;Title&quot;:&quot;Spotify&quot;}]\"";
+        let mut stream = ScriptedByteStream::new(&[id_array, pin_1, pin_2]);
+        let mut session = LpecSession::new();
+
+        let pins = session.fetch_pins(&mut stream).unwrap();
+
+        assert_eq!(pins.get(0).map(|p| p.id), Some(1));
+        assert_eq!(pins.get(0).map(|p| p.title.as_str()), Some("Radio"));
+        assert_eq!(pins.get(1).map(|p| p.id), Some(2));
+        assert_eq!(pins.get(1).map(|p| p.title.as_str()), Some("Spotify"));
+        assert!(
+            stream
+                .writes_as_str()
+                .contains("ACTION Ds/Pins 1 ReadList \"[1]\"")
+        );
+    }
+
+    #[test]
+    fn fetch_pins_accepts_backslash_escaped_readlist_json() {
+        let id_array = r#"RESPONSE "[7,11]""#;
+        let pin_7 = r#"RESPONSE "[{\"Id\":7,\"Title\":\"Radio\"}]""#;
+        let pin_11 = r#"RESPONSE "[{\"Id\":11,\"Title\":\"Spotify\"}]""#;
+        let mut stream = ScriptedByteStream::new(&[id_array, pin_7, pin_11]);
+        let mut session = LpecSession::new();
+
+        let pins = session.fetch_pins(&mut stream).unwrap();
+
+        assert_eq!(pins.get(0).map(|p| p.id), Some(7));
+        assert_eq!(pins.get(0).map(|p| p.title.as_str()), Some("Radio"));
+        assert_eq!(pins.get(1).map(|p| p.id), Some(11));
+        assert_eq!(pins.get(1).map(|p| p.title.as_str()), Some("Spotify"));
+    }
+
+    #[test]
+    fn fetch_pins_accepts_raw_readlist_json_quotes() {
+        let id_array = r#"RESPONSE "[7,11]""#;
+        let pin_7 = r#"RESPONSE "[{"Id":7,"Title":"Radio"}]""#;
+        let pin_11 = r#"RESPONSE "[{"Id":11,"Title":"Spotify"}]""#;
+        let mut stream = ScriptedByteStream::new(&[id_array, pin_7, pin_11]);
+        let mut session = LpecSession::new();
+
+        let pins = session.fetch_pins(&mut stream).unwrap();
+
+        assert_eq!(pins.get(0).map(|p| p.id), Some(7));
+        assert_eq!(pins.get(0).map(|p| p.title.as_str()), Some("Radio"));
+        assert_eq!(pins.get(1).map(|p| p.id), Some(11));
+        assert_eq!(pins.get(1).map(|p| p.title.as_str()), Some("Spotify"));
+    }
+
+    #[test]
+    fn fetch_pins_keeps_ids_when_title_fetch_fails() {
+        let id_array = r#"RESPONSE "[7,11]""#;
+        let mut stream = ScriptedByteStream::new(&[id_array, r#"ERROR 801 "JsonCorrupt""#]);
+        let mut session = LpecSession::new();
+
+        let pins = session.fetch_pins(&mut stream).unwrap();
+
+        assert_eq!(pins.get(0).map(|p| p.id), Some(7));
+        assert_eq!(pins.get(0).map(|p| p.title.as_str()), Some(""));
+        assert_eq!(pins.get(1).map(|p| p.id), Some(11));
+        assert_eq!(pins.get(1).map(|p| p.title.as_str()), Some(""));
+    }
+
+    #[test]
+    fn fetch_pins_propagates_idarray_remote_error() {
+        // Device rejects IdArray — fetch_pins surfaces the Protocol error,
+        // it does NOT silently fall back to slot indices.
+        let mut stream = ScriptedByteStream::new(&[r#"ERROR 800 "Not supported""#]);
+        let mut session = LpecSession::new();
+
+        let err = session.fetch_pins(&mut stream).unwrap_err();
+        match err {
+            Error::Protocol(linn_lpec::Error::Remote { code, .. }) => assert_eq!(code, 800),
+            other => panic!("expected Protocol(Remote{{..}}), got {other:?}"),
+        }
+        // Crucially, we never sent ReadList — no point guessing IDs.
+        assert!(
+            !stream.writes_as_str().contains("ReadList"),
+            "should not have sent ReadList after IdArray failed"
+        );
+    }
+
+    #[test]
+    fn fetch_pins_returns_empty_when_device_has_no_pins() {
+        let mut stream = ScriptedByteStream::new(&[r#"RESPONSE "[]""#]);
+        let mut session = LpecSession::new();
+
+        let pins = session.fetch_pins(&mut stream).unwrap();
+        assert!(pins.slots().iter().all(|s| s.is_none()));
+        assert!(
+            !stream.writes_as_str().contains("ReadList"),
+            "should skip ReadList when IdArray is empty"
+        );
     }
 }

@@ -2,7 +2,7 @@
 
 extern crate alloc;
 
-use app_core::{Command, HifiArtwork, HifiCommand, HifiStatus};
+use app_core::{Command, HifiArtwork, HifiCommand, HifiPins, HifiStatus};
 
 #[cfg(feature = "std")]
 pub mod host_tcp;
@@ -20,6 +20,7 @@ pub trait HifiController {
     fn handle_command(&mut self, command: HifiCommand) -> Result<(), Self::Error>;
     fn status(&mut self) -> Result<HifiStatus, Self::Error>;
     fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error>;
+    fn pins(&mut self) -> Result<HifiPins, Self::Error>;
 }
 
 #[derive(Debug)]
@@ -57,6 +58,10 @@ where
     pub fn hifi_artwork(&mut self, uri: &str) -> Result<HifiArtwork, RuntimeError<Hifi::Error>> {
         self.hifi.artwork(uri).map_err(RuntimeError::Hifi)
     }
+
+    pub fn hifi_pins(&mut self) -> Result<HifiPins, RuntimeError<Hifi::Error>> {
+        self.hifi.pins().map_err(RuntimeError::Hifi)
+    }
 }
 
 #[cfg(test)]
@@ -68,12 +73,26 @@ mod tests {
         let mut runtime = AppRuntime::new(FakeHifi::default());
 
         runtime
-            .handle_command(Command::Hifi(HifiCommand::ActivatePreset { preset: 1 }))
+            .handle_command(Command::Hifi(HifiCommand::InvokePinId { id: 4711 }))
             .unwrap();
 
         assert_eq!(
             runtime.into_hifi().commands.as_slice(),
-            [HifiCommand::ActivatePreset { preset: 1 }]
+            [HifiCommand::InvokePinId { id: 4711 }]
+        );
+    }
+
+    #[test]
+    fn dispatches_hifi_set_volume_command_to_controller() {
+        let mut runtime = AppRuntime::new(FakeHifi::default());
+
+        runtime
+            .handle_command(Command::Hifi(HifiCommand::SetVolume { volume: 42 }))
+            .unwrap();
+
+        assert_eq!(
+            runtime.into_hifi().commands.as_slice(),
+            [HifiCommand::SetVolume { volume: 42 }]
         );
     }
 
@@ -110,6 +129,10 @@ mod tests {
 
         fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error> {
             Ok(HifiArtwork::new(uri).unwrap())
+        }
+
+        fn pins(&mut self) -> Result<HifiPins, Self::Error> {
+            Ok(HifiPins::new())
         }
     }
 }

@@ -11,8 +11,8 @@ use heapless::String;
 use mplusfonts::{mplus, style::BitmapFontStyleBuilder};
 
 use crate::{
-    HIFI_ARTWORK_PIXELS, HIFI_ARTWORK_SIZE, HIFI_TEXT_LEN, HIFI_URI_LEN, HifiArtwork, HifiStatus,
-    PlaybackState, RenderError,
+    HIFI_ARTWORK_PIXELS, HIFI_ARTWORK_SIZE, HIFI_PIN_COUNT, HIFI_TEXT_LEN, HIFI_URI_LEN,
+    HIFI_VOLUME_MAX, HifiArtwork, HifiPins, HifiStatus, PlaybackState, RenderError,
 };
 
 use super::super::{
@@ -36,9 +36,6 @@ const TIMER_TOP: i32 = 218;
 const PROGRESS_TOP: i32 = 274;
 const PROGRESS_WIDTH: u32 = 294;
 const PROGRESS_HEIGHT: u32 = 18;
-const PIN_BUTTON_SIZE: u32 = 54;
-const PIN_BUTTON_SIDE_INSET: i32 = 8;
-const PIN_BUTTON_TOP: i32 = 218;
 const VOLUME_DIAMETER: u32 = 442;
 const VOLUME_START_DEGREES: f32 = 135.0;
 const VOLUME_SWEEP_DEGREES: f32 = 270.0;
@@ -57,19 +54,55 @@ const PLAY_SLOT_PAUSE_BARS: u8 = 3;
 const PLAY_SLOT_BUFFERING: u8 = 4;
 const PLAY_SLOT_ARTWORK: u8 = 5;
 
+// Pins page layout: 3 columns x 2 rows.
+const PINS_GRID_TOP: i32 = 110;
+const PINS_BUTTON_SIZE: Size = Size::new(96, 80);
+const PINS_GRID_GAP: i32 = 14;
+
+// Volume page layout.
+const VOLUME_TITLE_SLOT_HEIGHT: u32 = 40;
+const VOLUME_TITLE_TOP: i32 = 96;
+const VOLUME_VALUE_SLOT_HEIGHT: u32 = 56;
+const VOLUME_VALUE_TOP: i32 = 152;
+const VOLUME_BUTTON_SIZE: u32 = 88;
+const VOLUME_BUTTON_Y: i32 = 268;
+const VOLUME_BUTTON_GAP: i32 = 56;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HifiPage {
+    #[default]
+    Status,
+    Pins,
+    Volume,
+}
+
+impl HifiPage {
+    fn next(self) -> Self {
+        match self {
+            Self::Status => Self::Pins,
+            Self::Pins => Self::Volume,
+            Self::Volume => Self::Status,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Layout {
-    pub(super) safe_square: Rectangle,
-    pub(super) song_band: Rectangle,
-    pub(super) song_origin: Point,
-    pub(super) artist_band: Rectangle,
-    pub(super) artist_origin: Point,
+    pub(super) page_body: Rectangle,
     pub(super) volume: VolumeLayout,
-    pub(super) play_button: Rectangle,
-    pub(super) pin_buttons: [Rectangle; 2],
-    pub(super) timer_origin: Point,
-    pub(super) timer_bounds: Rectangle,
-    pub(super) progress: Rectangle,
+    pub(super) status: StatusLayout,
+    pub(super) pins: PinsLayout,
+    pub(super) volume_page: VolumePageLayout,
+}
+
+impl Layout {
+    const fn body_for_page(&self, page: HifiPage) -> Rectangle {
+        match page {
+            HifiPage::Status => self.status.body,
+            HifiPage::Pins => self.pins.body,
+            HifiPage::Volume => self.volume_page.body,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,21 +110,56 @@ pub(super) struct VolumeLayout {
     pub(super) center: Point,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct StatusLayout {
+    pub(super) body: Rectangle,
+    pub(super) song_band: Rectangle,
+    pub(super) song_origin: Point,
+    pub(super) artist_band: Rectangle,
+    pub(super) artist_origin: Point,
+    pub(super) play_button: Rectangle,
+    pub(super) timer_origin: Point,
+    pub(super) timer_bounds: Rectangle,
+    pub(super) progress: Rectangle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PinsLayout {
+    pub(super) body: Rectangle,
+    pub(super) buttons: [Rectangle; HIFI_PIN_COUNT],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct VolumePageLayout {
+    pub(super) body: Rectangle,
+    pub(super) title_slot: Rectangle,
+    pub(super) value_slot: Rectangle,
+    pub(super) controls_slot: Rectangle,
+    pub(super) digit_origin: Point,
+    pub(super) decrement_button: Rectangle,
+    pub(super) increment_button: Rectangle,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct State {
+    page: HifiPage,
+    last_rendered_page: Option<HifiPage>,
     status: HifiStatus,
     artwork: Option<HifiArtwork>,
+    pins: HifiPins,
     created_at_ms: u64,
     loading: bool,
     last_second: u64,
     current_ms: u64,
     current_second: u64,
-    last_rendered: LastRendered,
+    status_cache: StatusCache,
+    pins_cache: PinsCache,
+    volume_cache: VolumeCache,
     play_slot: Slot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
-struct LastRendered {
+struct StatusCache {
     has_rendered: bool,
     volume_percent: Option<u8>,
     spinner_phase: Option<u8>,
@@ -101,7 +169,6 @@ struct LastRendered {
     title: String<HIFI_TEXT_LEN>,
     artist: String<HIFI_TEXT_LEN>,
     artwork_uri: String<HIFI_URI_LEN>,
-    pin_buttons_drawn: bool,
     loading_visible: bool,
     title_overflow_px: u32,
     title_anim_base_ms: u64,
@@ -111,16 +178,32 @@ struct LastRendered {
     artist_marquee_offset_px: Option<i32>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+struct PinsCache {
+    drawn_titles: [String<HIFI_TEXT_LEN>; HIFI_PIN_COUNT],
+    drawn_active: [bool; HIFI_PIN_COUNT],
+    has_rendered: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+struct VolumeCache {
+    static_drawn: bool,
+    volume_percent: Option<u8>,
+    digit_value: Option<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action {
     TogglePlayback,
-    InvokePin(u8),
+    InvokePinSlot(usize),
+    VolumeDelta(i16),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
-    ActivatePreset { preset: u8 },
+    InvokePinId { id: u32 },
     TogglePlayback,
+    SetVolume { volume: u8 },
 }
 
 impl State {
@@ -128,18 +211,32 @@ impl State {
         let current_second = uptime_ms / 1000;
 
         Self {
+            page: HifiPage::Status,
+            last_rendered_page: None,
             status: HifiStatus::waiting(),
             artwork: None,
+            pins: HifiPins::new(),
             created_at_ms: uptime_ms,
             loading: true,
             last_second: current_second,
             current_ms: uptime_ms,
             current_second,
-            last_rendered: LastRendered::default(),
-            // Bounds is filled in lazily — the Layout is screen-fixed but the
-            // State is created before we know it.
+            status_cache: StatusCache::default(),
+            pins_cache: PinsCache::default(),
+            volume_cache: VolumeCache::default(),
+            // Bounds is filled in lazily — Layout is screen-fixed but State is
+            // created before we know it.
             play_slot: Slot::new(Rectangle::new(Point::zero(), Size::zero())),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn page(&self) -> HifiPage {
+        self.page
+    }
+
+    pub(crate) fn cycle_page(&mut self) {
+        self.page = self.page.next();
     }
 
     pub(crate) fn on_tick(&mut self, uptime_ms: u64) -> bool {
@@ -154,8 +251,9 @@ impl State {
             return true;
         }
 
-        let marquee_active =
-            self.last_rendered.title_overflow_px > 0 || self.last_rendered.artist_overflow_px > 0;
+        let marquee_active = matches!(self.page, HifiPage::Status)
+            && (self.status_cache.title_overflow_px > 0
+                || self.status_cache.artist_overflow_px > 0);
 
         if self.status.playback == PlaybackState::Buffering {
             return true;
@@ -227,13 +325,27 @@ impl State {
         true
     }
 
+    pub(crate) fn apply_pins(&mut self, pins: HifiPins) -> bool {
+        if self.pins == pins {
+            return false;
+        }
+        self.pins = pins;
+        // Force a Pins-page redraw next time we're on it.
+        self.pins_cache = PinsCache::default();
+        true
+    }
+
     pub(crate) fn handle_touch(
         &mut self,
         layout: &Layout,
         point: Point,
         uptime_ms: u64,
     ) -> Option<Command> {
-        let action = hit_test(layout, point)?;
+        let action = match self.page {
+            HifiPage::Status => hit_test_status(&layout.status, point),
+            HifiPage::Pins => hit_test_pins(&layout.pins, point),
+            HifiPage::Volume => hit_test_volume(&layout.volume_page, point),
+        }?;
         self.handle(action, uptime_ms)
     }
 
@@ -251,7 +363,19 @@ impl State {
                 }
                 Some(Command::TogglePlayback)
             }
-            Action::InvokePin(pin) => Some(Command::ActivatePreset { preset: pin }),
+            Action::InvokePinSlot(slot) => {
+                let pin = self.pins.get(slot)?;
+                Some(Command::InvokePinId { id: pin.id })
+            }
+            Action::VolumeDelta(delta) => {
+                let current = self.status.volume_percent as i16;
+                let next = (current + delta).clamp(0, HIFI_VOLUME_MAX as i16) as u8;
+                if next == self.status.volume_percent {
+                    return None;
+                }
+                self.status.volume_percent = next;
+                Some(Command::SetVolume { volume: next })
+            }
         }
     }
 }
@@ -259,76 +383,152 @@ impl State {
 pub(crate) fn layout(bounds: Rectangle) -> Layout {
     let center_x = bounds.top_left.x + (bounds.size.width / 2) as i32;
     let center_y = bounds.top_left.y + (bounds.size.height / 2) as i32;
-    let safe_square = centered_square(bounds, ROUND_SAFE_SQUARE_SIZE);
-    let play_center = Point::new(center_x, safe_square.top_left.y + PLAY_CENTER_Y);
+    let page_body = centered_square(bounds, ROUND_SAFE_SQUARE_SIZE);
 
+    let status = status_layout(&page_body, center_x);
+    let pins = pins_layout(&page_body, center_x);
+    let volume_page = volume_page_layout(&page_body, center_x);
+
+    Layout {
+        page_body,
+        volume: VolumeLayout {
+            center: Point::new(center_x, center_y),
+        },
+        status,
+        pins,
+        volume_page,
+    }
+}
+
+fn status_layout(body: &Rectangle, center_x: i32) -> StatusLayout {
+    let play_center = Point::new(center_x, body.top_left.y + PLAY_CENTER_Y);
     let song_band = Rectangle::new(
-        Point::new(safe_square.top_left.x, safe_square.top_left.y + SONG_TOP),
-        Size::new(safe_square.size.width, TEXT_BAND_HEIGHT),
+        Point::new(body.top_left.x, body.top_left.y + SONG_TOP),
+        Size::new(body.size.width, TEXT_BAND_HEIGHT),
     );
     let artist_band = Rectangle::new(
-        Point::new(safe_square.top_left.x, safe_square.top_left.y + ARTIST_TOP),
-        Size::new(safe_square.size.width, TEXT_BAND_HEIGHT),
+        Point::new(body.top_left.x, body.top_left.y + ARTIST_TOP),
+        Size::new(body.size.width, TEXT_BAND_HEIGHT),
     );
-    let timer_origin = Point::new(
-        center_x - DURATION_WIDTH / 2,
-        safe_square.top_left.y + TIMER_TOP,
-    );
+    let timer_origin = Point::new(center_x - DURATION_WIDTH / 2, body.top_left.y + TIMER_TOP);
     let timer_bounds = Rectangle::new(
         timer_origin,
         Size::new(DURATION_WIDTH as u32, TEXT_BAND_HEIGHT),
     );
+    let progress = Rectangle::new(
+        Point::new(
+            center_x - (PROGRESS_WIDTH / 2) as i32,
+            body.top_left.y + PROGRESS_TOP,
+        ),
+        Size::new(PROGRESS_WIDTH, PROGRESS_HEIGHT),
+    );
+    let status_body = vertical_page_body(body, song_band.top_left.y, rect_bottom(progress));
 
-    Layout {
-        safe_square,
+    StatusLayout {
+        body: status_body,
         song_band,
-        song_origin: Point::new(center_x, safe_square.top_left.y + SONG_TOP),
+        song_origin: Point::new(center_x, body.top_left.y + SONG_TOP),
         artist_band,
-        artist_origin: Point::new(center_x, safe_square.top_left.y + ARTIST_TOP),
-        volume: VolumeLayout {
-            center: Point::new(center_x, center_y),
-        },
+        artist_origin: Point::new(center_x, body.top_left.y + ARTIST_TOP),
         play_button: Rectangle::new(
             play_center - Point::new((PLAY_SIZE / 2) as i32, (PLAY_SIZE / 2) as i32),
             Size::new(PLAY_SIZE, PLAY_SIZE),
         ),
-        pin_buttons: [
-            Rectangle::new(
-                Point::new(
-                    safe_square.top_left.x + PIN_BUTTON_SIDE_INSET,
-                    safe_square.top_left.y + PIN_BUTTON_TOP,
-                ),
-                Size::new(PIN_BUTTON_SIZE, PIN_BUTTON_SIZE),
-            ),
-            Rectangle::new(
-                Point::new(
-                    safe_square.top_left.x + safe_square.size.width as i32
-                        - PIN_BUTTON_SIDE_INSET
-                        - PIN_BUTTON_SIZE as i32,
-                    safe_square.top_left.y + PIN_BUTTON_TOP,
-                ),
-                Size::new(PIN_BUTTON_SIZE, PIN_BUTTON_SIZE),
-            ),
-        ],
         timer_origin,
         timer_bounds,
-        progress: Rectangle::new(
-            Point::new(
-                center_x - (PROGRESS_WIDTH / 2) as i32,
-                safe_square.top_left.y + PROGRESS_TOP,
-            ),
-            Size::new(PROGRESS_WIDTH, PROGRESS_HEIGHT),
-        ),
+        progress,
     }
 }
 
-fn hit_test(layout: &Layout, point: Point) -> Option<Action> {
+fn pins_layout(body: &Rectangle, center_x: i32) -> PinsLayout {
+    let cols = 3_i32;
+    let rows = HIFI_PIN_COUNT.div_ceil(cols as usize) as i32;
+    let total_width = cols * PINS_BUTTON_SIZE.width as i32 + (cols - 1) * PINS_GRID_GAP;
+    let total_height = rows * PINS_BUTTON_SIZE.height as i32 + (rows - 1) * PINS_GRID_GAP;
+    let start_x = center_x - total_width / 2;
+    let start_y = body.top_left.y + PINS_GRID_TOP;
+    let mut buttons = [Rectangle::new(Point::zero(), PINS_BUTTON_SIZE); HIFI_PIN_COUNT];
+    for slot in 0..HIFI_PIN_COUNT {
+        let row = (slot / cols as usize) as i32;
+        let col = (slot % cols as usize) as i32;
+        let x = start_x + col * (PINS_BUTTON_SIZE.width as i32 + PINS_GRID_GAP);
+        let y = start_y + row * (PINS_BUTTON_SIZE.height as i32 + PINS_GRID_GAP);
+        buttons[slot] = Rectangle::new(Point::new(x, y), PINS_BUTTON_SIZE);
+    }
+    PinsLayout {
+        body: vertical_page_body(body, start_y, start_y + total_height),
+        buttons,
+    }
+}
+
+fn volume_page_layout(body: &Rectangle, center_x: i32) -> VolumePageLayout {
+    let title_slot = Rectangle::new(
+        Point::new(body.top_left.x, body.top_left.y + VOLUME_TITLE_TOP),
+        Size::new(body.size.width, VOLUME_TITLE_SLOT_HEIGHT),
+    );
+    let value_slot = Rectangle::new(
+        Point::new(body.top_left.x, body.top_left.y + VOLUME_VALUE_TOP),
+        Size::new(body.size.width, VOLUME_VALUE_SLOT_HEIGHT),
+    );
+    let digit_origin = Point::new(center_x, body.top_left.y + VOLUME_VALUE_TOP);
+    let half_size = (VOLUME_BUTTON_SIZE / 2) as i32;
+    let half_gap = VOLUME_BUTTON_GAP / 2;
+    let button_top = body.top_left.y + VOLUME_BUTTON_Y - half_size;
+    let decrement_button = Rectangle::new(
+        Point::new(center_x - half_gap - VOLUME_BUTTON_SIZE as i32, button_top),
+        Size::new(VOLUME_BUTTON_SIZE, VOLUME_BUTTON_SIZE),
+    );
+    let increment_button = Rectangle::new(
+        Point::new(center_x + half_gap, button_top),
+        Size::new(VOLUME_BUTTON_SIZE, VOLUME_BUTTON_SIZE),
+    );
+    let controls_slot = Rectangle::new(
+        Point::new(body.top_left.x, button_top),
+        Size::new(body.size.width, VOLUME_BUTTON_SIZE),
+    );
+    VolumePageLayout {
+        body: vertical_page_body(body, title_slot.top_left.y, rect_bottom(controls_slot)),
+        title_slot,
+        value_slot,
+        controls_slot,
+        digit_origin,
+        decrement_button,
+        increment_button,
+    }
+}
+
+fn vertical_page_body(inner: &Rectangle, top: i32, bottom: i32) -> Rectangle {
+    Rectangle::new(
+        Point::new(inner.top_left.x, top),
+        Size::new(inner.size.width, bottom.saturating_sub(top) as u32),
+    )
+}
+
+fn rect_bottom(rect: Rectangle) -> i32 {
+    rect.top_left.y + rect.size.height as i32
+}
+
+fn hit_test_status(layout: &StatusLayout, point: Point) -> Option<Action> {
     if layout.play_button.contains(point) {
         Some(Action::TogglePlayback)
-    } else if layout.pin_buttons[0].contains(point) {
-        Some(Action::InvokePin(1))
-    } else if layout.pin_buttons[1].contains(point) {
-        Some(Action::InvokePin(2))
+    } else {
+        None
+    }
+}
+
+fn hit_test_pins(layout: &PinsLayout, point: Point) -> Option<Action> {
+    layout
+        .buttons
+        .iter()
+        .position(|rect| rect.contains(point))
+        .map(Action::InvokePinSlot)
+}
+
+fn hit_test_volume(layout: &VolumePageLayout, point: Point) -> Option<Action> {
+    if layout.decrement_button.contains(point) {
+        Some(Action::VolumeDelta(-1))
+    } else if layout.increment_button.contains(point) {
+        Some(Action::VolumeDelta(1))
     } else {
         None
     }
@@ -343,10 +543,19 @@ pub(crate) fn render<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    state.play_slot.bounds = ui_layout.play_button;
+    state.play_slot.bounds = ui_layout.status.play_button;
+
+    if state.last_rendered_page != Some(state.page) {
+        let page_to_clear = state.last_rendered_page.unwrap_or(state.page);
+        clear_rect(display, ui_layout.body_for_page(page_to_clear))?;
+        invalidate_caches_on_page_change(state);
+        state.last_rendered_page = Some(state.page);
+    }
+
     let mut painter = Painter::new(display, scratch);
 
-    // Volume arc (smart-diff: only the wedge that changed; full-redraw on first frame).
+    // Volume arc is rendered on every page; reflects volume_percent against
+    // the receiver max (0..=HIFI_VOLUME_MAX).
     let volume = VolumeArc {
         center: ui_layout.volume.center,
         diameter: VOLUME_DIAMETER,
@@ -356,10 +565,37 @@ where
         track_color: VOLUME_TRACK,
         active_color: VOLUME_ACTIVE,
         percent: state.status.volume_percent,
-        previous_percent: state.last_rendered.volume_percent,
+        previous_percent: state.status_cache.volume_percent,
     };
     painter.draw(&volume).map_err(RenderError::Draw)?;
-    state.last_rendered.volume_percent = Some(state.status.volume_percent);
+    state.status_cache.volume_percent = Some(state.status.volume_percent);
+
+    drop(painter);
+
+    match state.page {
+        HifiPage::Status => render_status(state, display, scratch, &ui_layout.status),
+        HifiPage::Pins => render_pins(state, display, scratch, &ui_layout.pins),
+        HifiPage::Volume => render_volume_page(state, display, scratch, &ui_layout.volume_page),
+    }
+}
+
+fn invalidate_caches_on_page_change(state: &mut State) {
+    state.status_cache = StatusCache::default();
+    state.pins_cache = PinsCache::default();
+    state.volume_cache = VolumeCache::default();
+    state.play_slot.previous_kind = None;
+}
+
+fn render_status<D>(
+    state: &mut State,
+    display: &mut D,
+    scratch: &mut [Rgb565],
+    ui_layout: &StatusLayout,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let mut painter = Painter::new(display, scratch);
 
     // The play-button area is a slot: spinner / play icon / pause bars / buffering / artwork
     // are mutually exclusive and the slot clears on kind transitions.
@@ -372,57 +608,54 @@ where
     if state.loading {
         // Center on the play-button slot so the slot's clear (used when
         // loading ends and the play icon takes over) fully covers the
-        // spinner's footprint. Centering on volume.center used to leave a
-        // ~20 px strip of dots below the slot.
+        // spinner's footprint.
         let spinner = Spinner {
             center: rect_visual_center(ui_layout.play_button),
             phase: spinner_phase(state.current_ms),
             previous_phase: if state.play_slot.previous_kind == Some(PLAY_SLOT_SPINNER) {
-                state.last_rendered.spinner_phase
+                state.status_cache.spinner_phase
             } else {
                 None
             },
         };
         painter.draw(&spinner).map_err(RenderError::Draw)?;
-        state.last_rendered.spinner_phase = Some(spinner.phase);
+        state.status_cache.spinner_phase = Some(spinner.phase);
         state.play_slot.previous_kind = Some(play_kind);
-        state.last_rendered.loading_visible = true;
-        state.last_rendered.has_rendered = true;
+        state.status_cache.loading_visible = true;
+        state.status_cache.has_rendered = true;
         return Ok(());
     }
 
-    if state.last_rendered.loading_visible {
+    if state.status_cache.loading_visible {
         // Transitioning out of loading: invalidate caches so all widgets we
         // skipped during the spinner-only phase get a fresh first frame.
-        state.last_rendered.title.clear();
-        state.last_rendered.artist.clear();
-        state.last_rendered.title_marquee_offset_px = None;
-        state.last_rendered.artist_marquee_offset_px = None;
-        state.last_rendered.elapsed_seconds = None;
-        state.last_rendered.duration_seconds = None;
-        state.last_rendered.progress_filled_px = None;
-        state.last_rendered.pin_buttons_drawn = false;
-        state.last_rendered.loading_visible = false;
+        state.status_cache.title.clear();
+        state.status_cache.artist.clear();
+        state.status_cache.title_marquee_offset_px = None;
+        state.status_cache.artist_marquee_offset_px = None;
+        state.status_cache.elapsed_seconds = None;
+        state.status_cache.duration_seconds = None;
+        state.status_cache.progress_filled_px = None;
+        state.status_cache.loading_visible = false;
     }
 
-    // Play-button area — slot already cleared on kind change.
     match play_kind {
         PLAY_SLOT_BUFFERING => {
             let spinner = Spinner {
                 center: rect_visual_center(ui_layout.play_button),
                 phase: spinner_phase(state.current_ms),
                 previous_phase: if state.play_slot.previous_kind == Some(PLAY_SLOT_BUFFERING) {
-                    state.last_rendered.spinner_phase
+                    state.status_cache.spinner_phase
                 } else {
                     None
                 },
             };
             painter.draw(&spinner).map_err(RenderError::Draw)?;
-            state.last_rendered.spinner_phase = Some(spinner.phase);
+            state.status_cache.spinner_phase = Some(spinner.phase);
         }
         PLAY_SLOT_ARTWORK => {
             let artwork = state.artwork.as_ref().expect("artwork present");
-            let already_drawn = state.last_rendered.artwork_uri.as_str()
+            let already_drawn = state.status_cache.artwork_uri.as_str()
                 == artwork.source_uri.as_str()
                 && state.play_slot.previous_kind == Some(PLAY_SLOT_ARTWORK);
             let widget = ArtworkWidget {
@@ -431,9 +664,9 @@ where
                 already_drawn,
             };
             painter.draw(&widget).map_err(RenderError::Draw)?;
-            state.last_rendered.artwork_uri.clear();
+            state.status_cache.artwork_uri.clear();
             let _ = state
-                .last_rendered
+                .status_cache
                 .artwork_uri
                 .push_str(artwork.source_uri.as_str());
         }
@@ -455,56 +688,45 @@ where
     }
     state.play_slot.previous_kind = Some(play_kind);
 
-    if !state.last_rendered.pin_buttons_drawn {
-        for (index, rect) in ui_layout.pin_buttons.iter().enumerate() {
-            let widget = PinButton {
-                rect: *rect,
-                label: if index == 0 { "1" } else { "2" },
-            };
-            painter.draw(&widget).map_err(RenderError::Draw)?;
-        }
-        state.last_rendered.pin_buttons_drawn = true;
-    }
-
     let timer = TimerDisplay {
         origin: ui_layout.timer_origin,
         bounds: ui_layout.timer_bounds,
         elapsed: state.status.elapsed_seconds,
-        previous_elapsed: state.last_rendered.elapsed_seconds,
+        previous_elapsed: state.status_cache.elapsed_seconds,
     };
     painter.draw(&timer).map_err(RenderError::Draw)?;
-    state.last_rendered.elapsed_seconds = Some(state.status.elapsed_seconds);
+    state.status_cache.elapsed_seconds = Some(state.status.elapsed_seconds);
 
     let new_filled_px =
         progress_filled_px(state.status.elapsed_seconds, state.status.duration_seconds);
     let progress = ProgressBarWidget {
         rect: ui_layout.progress,
         filled_px: new_filled_px,
-        previous_filled_px: state.last_rendered.progress_filled_px,
-        previous_duration: state.last_rendered.duration_seconds,
+        previous_filled_px: state.status_cache.progress_filled_px,
+        previous_duration: state.status_cache.duration_seconds,
         duration: state.status.duration_seconds,
     };
     painter.draw(&progress).map_err(RenderError::Draw)?;
-    state.last_rendered.progress_filled_px = Some(new_filled_px);
-    state.last_rendered.duration_seconds = Some(state.status.duration_seconds);
+    state.status_cache.progress_filled_px = Some(new_filled_px);
+    state.status_cache.duration_seconds = Some(state.status.duration_seconds);
 
     let song_text = non_empty_or(&state.status.title, "No track");
-    let song_text_changed = state.last_rendered.title.as_str() != song_text;
+    let song_text_changed = state.status_cache.title.as_str() != song_text;
     if song_text_changed {
-        state.last_rendered.title_anim_base_ms = state.current_ms;
-        state.last_rendered.title_marquee_offset_px = None;
+        state.status_cache.title_anim_base_ms = state.current_ms;
+        state.status_cache.title_marquee_offset_px = None;
     }
     let song_text_width = measure_band_text_width(song_text);
     let song_overflow_px = song_text_width.saturating_sub(ui_layout.song_band.size.width);
     let song_offset_px = compute_marquee_offset(
         state
             .current_ms
-            .saturating_sub(state.last_rendered.title_anim_base_ms),
+            .saturating_sub(state.status_cache.title_anim_base_ms),
         song_overflow_px,
     );
-    let song_unchanged = state.last_rendered.has_rendered
+    let song_unchanged = state.status_cache.has_rendered
         && !song_text_changed
-        && state.last_rendered.title_marquee_offset_px == Some(song_offset_px);
+        && state.status_cache.title_marquee_offset_px == Some(song_offset_px);
     let song = MarqueeBand {
         band: ui_layout.song_band,
         centered_origin: ui_layout.song_origin,
@@ -515,28 +737,28 @@ where
         offset_px: song_offset_px,
     };
     painter.draw(&song).map_err(RenderError::Draw)?;
-    state.last_rendered.title.clear();
-    let _ = state.last_rendered.title.push_str(song_text);
-    state.last_rendered.title_overflow_px = song_overflow_px;
-    state.last_rendered.title_marquee_offset_px = Some(song_offset_px);
+    state.status_cache.title.clear();
+    let _ = state.status_cache.title.push_str(song_text);
+    state.status_cache.title_overflow_px = song_overflow_px;
+    state.status_cache.title_marquee_offset_px = Some(song_offset_px);
 
     let artist_text = non_empty_or(&state.status.artist, "Not playing");
-    let artist_text_changed = state.last_rendered.artist.as_str() != artist_text;
+    let artist_text_changed = state.status_cache.artist.as_str() != artist_text;
     if artist_text_changed {
-        state.last_rendered.artist_anim_base_ms = state.current_ms;
-        state.last_rendered.artist_marquee_offset_px = None;
+        state.status_cache.artist_anim_base_ms = state.current_ms;
+        state.status_cache.artist_marquee_offset_px = None;
     }
     let artist_text_width = measure_band_text_width(artist_text);
     let artist_overflow_px = artist_text_width.saturating_sub(ui_layout.artist_band.size.width);
     let artist_offset_px = compute_marquee_offset(
         state
             .current_ms
-            .saturating_sub(state.last_rendered.artist_anim_base_ms),
+            .saturating_sub(state.status_cache.artist_anim_base_ms),
         artist_overflow_px,
     );
-    let artist_unchanged = state.last_rendered.has_rendered
+    let artist_unchanged = state.status_cache.has_rendered
         && !artist_text_changed
-        && state.last_rendered.artist_marquee_offset_px == Some(artist_offset_px);
+        && state.status_cache.artist_marquee_offset_px == Some(artist_offset_px);
     let artist = MarqueeBand {
         band: ui_layout.artist_band,
         centered_origin: ui_layout.artist_origin,
@@ -547,12 +769,159 @@ where
         offset_px: artist_offset_px,
     };
     painter.draw(&artist).map_err(RenderError::Draw)?;
-    state.last_rendered.artist.clear();
-    let _ = state.last_rendered.artist.push_str(artist_text);
-    state.last_rendered.artist_overflow_px = artist_overflow_px;
-    state.last_rendered.artist_marquee_offset_px = Some(artist_offset_px);
+    state.status_cache.artist.clear();
+    let _ = state.status_cache.artist.push_str(artist_text);
+    state.status_cache.artist_overflow_px = artist_overflow_px;
+    state.status_cache.artist_marquee_offset_px = Some(artist_offset_px);
 
-    state.last_rendered.has_rendered = true;
+    state.status_cache.has_rendered = true;
+    Ok(())
+}
+
+fn render_pins<D>(
+    state: &mut State,
+    display: &mut D,
+    _scratch: &mut [Rgb565],
+    ui_layout: &PinsLayout,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    for slot in 0..HIFI_PIN_COUNT {
+        let pin = state.pins.get(slot);
+        let active = pin.is_some();
+        let label = pin_button_label(slot, pin);
+
+        let label_changed = state.pins_cache.drawn_titles[slot].as_str() != label.as_str();
+        let active_changed = state.pins_cache.drawn_active[slot] != active;
+        if state.pins_cache.has_rendered && !label_changed && !active_changed {
+            continue;
+        }
+
+        let rect = ui_layout.buttons[slot];
+        let tone = if active {
+            ButtonTone::Start
+        } else {
+            ButtonTone::Stop
+        };
+        if let Err(error) = draw_button(display, rect, label.as_str(), active, tone) {
+            return match error {
+                RenderError::Draw(error) => Err(RenderError::Draw(error)),
+                RenderError::TextFormat => Ok(()),
+            };
+        }
+        state.pins_cache.drawn_titles[slot].clear();
+        let _ = state.pins_cache.drawn_titles[slot].push_str(label.as_str());
+        state.pins_cache.drawn_active[slot] = active;
+    }
+    state.pins_cache.has_rendered = true;
+    Ok(())
+}
+
+fn pin_button_label(slot: usize, pin: Option<&crate::HifiPin>) -> String<HIFI_TEXT_LEN> {
+    let mut label = String::<HIFI_TEXT_LEN>::new();
+    if let Some(pin) = pin
+        && !pin.title.is_empty()
+        && label.push_str(pin.title.as_str()).is_ok()
+    {
+        return label;
+    }
+    label.clear();
+    let _ = label.push_str("Pin ");
+    let digit = (slot as u8 + 1).min(9);
+    let _ = label.push((b'0' + digit) as char);
+    label
+}
+
+fn render_volume_page<D>(
+    state: &mut State,
+    display: &mut D,
+    _scratch: &mut [Rgb565],
+    ui_layout: &VolumePageLayout,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    if !state.volume_cache.static_drawn {
+        let title_font = ui_font!(BOLD);
+        let title_style = BitmapFontStyleBuilder::new()
+            .text_color(TEXT_PRIMARY)
+            .background_color(OLED_BLACK)
+            .font(&title_font)
+            .build();
+        let centered = TextStyleBuilder::new()
+            .alignment(Alignment::Center)
+            .baseline(Baseline::Top)
+            .build();
+        let title_origin = Point::new(
+            ui_layout.title_slot.center().x,
+            ui_layout.title_slot.top_left.y,
+        );
+        Text::with_text_style("VOLUME", title_origin, title_style, centered)
+            .draw(display)
+            .map_err(RenderError::Draw)?;
+        if let Err(error) = draw_button(
+            display,
+            ui_layout.decrement_button,
+            "-",
+            true,
+            ButtonTone::Stop,
+        ) {
+            return match error {
+                RenderError::Draw(error) => Err(RenderError::Draw(error)),
+                RenderError::TextFormat => Ok(()),
+            };
+        }
+        if let Err(error) = draw_button(
+            display,
+            ui_layout.increment_button,
+            "+",
+            true,
+            ButtonTone::Start,
+        ) {
+            return match error {
+                RenderError::Draw(error) => Err(RenderError::Draw(error)),
+                RenderError::TextFormat => Ok(()),
+            };
+        }
+        state.volume_cache.static_drawn = true;
+    }
+
+    let value = state.status.volume_percent.min(HIFI_VOLUME_MAX);
+    if state.volume_cache.digit_value == Some(value) {
+        return Ok(());
+    }
+    clear_rect(display, ui_layout.value_slot)?;
+
+    let digit_font = ui_font!(BOLD);
+    let digit_style = BitmapFontStyleBuilder::new()
+        .text_color(TEXT_PRIMARY)
+        .background_color(OLED_BLACK)
+        .font(&digit_font)
+        .build();
+    let centered = TextStyleBuilder::new()
+        .alignment(Alignment::Center)
+        .baseline(Baseline::Top)
+        .build();
+
+    let mut buffer = String::<4>::new();
+    if value >= 100 {
+        let _ = buffer.push((b'0' + (value / 100)) as char);
+    }
+    if value >= 10 {
+        let _ = buffer.push((b'0' + ((value / 10) % 10)) as char);
+    }
+    let _ = buffer.push((b'0' + (value % 10)) as char);
+
+    Text::with_text_style(
+        buffer.as_str(),
+        ui_layout.digit_origin,
+        digit_style,
+        centered,
+    )
+    .draw(display)
+    .map_err(RenderError::Draw)?;
+    state.volume_cache.digit_value = Some(value);
     Ok(())
 }
 
@@ -589,17 +958,25 @@ fn progress_filled_px(elapsed: u32, duration: u32) -> u32 {
 
 #[cfg(test)]
 pub(crate) fn play_button_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
-    layout(bounds).play_button.center()
+    layout(bounds).status.play_button.center()
 }
 
 #[cfg(test)]
-pub(crate) fn pin_1_button_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
-    layout(bounds).pin_buttons[0].center()
+pub(crate) fn pin_slot_button_center(
+    bounds: Rectangle,
+    slot: usize,
+) -> embedded_graphics::geometry::Point {
+    layout(bounds).pins.buttons[slot].center()
 }
 
 #[cfg(test)]
-pub(crate) fn pin_2_button_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
-    layout(bounds).pin_buttons[1].center()
+pub(crate) fn volume_decrement_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
+    layout(bounds).volume_page.decrement_button.center()
+}
+
+#[cfg(test)]
+pub(crate) fn volume_increment_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
+    layout(bounds).volume_page.increment_button.center()
 }
 
 fn non_empty_or<'a>(value: &'a str, fallback: &'static str) -> &'a str {
@@ -611,6 +988,7 @@ fn has_live_content(status: &HifiStatus) -> bool {
         || !status.artist.is_empty()
         || status.duration_seconds > 0
         || status.elapsed_seconds > 0
+        || status.volume_percent > 0
         || status.playback != PlaybackState::Unknown
 }
 
@@ -647,7 +1025,7 @@ impl Widget<Action> for VolumeArc {
     where
         D: DrawTarget<Color = Rgb565>,
     {
-        let new_active = self.sweep_deg * (self.percent.min(100) as f32) / 100.0;
+        let new_active = arc_sweep_for_volume(self.percent, self.sweep_deg);
 
         match self.previous_percent {
             // First frame — paint the full track plus the active wedge.
@@ -677,7 +1055,7 @@ impl Widget<Action> for VolumeArc {
                 // Smart-skip.
             }
             Some(prev) => {
-                let prev_active = self.sweep_deg * (prev.min(100) as f32) / 100.0;
+                let prev_active = arc_sweep_for_volume(prev, self.sweep_deg);
                 let (delta_start, delta_sweep, color) = if new_active > prev_active {
                     (
                         self.start_deg + prev_active,
@@ -707,6 +1085,11 @@ impl Widget<Action> for VolumeArc {
 
         Ok(())
     }
+}
+
+fn arc_sweep_for_volume(percent: u8, sweep_deg: f32) -> f32 {
+    let clamped = percent.min(HIFI_VOLUME_MAX);
+    sweep_deg * (clamped as f32) / (HIFI_VOLUME_MAX as f32)
 }
 
 struct Spinner {
@@ -823,28 +1206,6 @@ impl Widget<Action> for ArtworkWidget<'_> {
                     .map(|color| Pixel(top_left + Point::new(x, y), color))
             })
         }))
-    }
-}
-
-struct PinButton {
-    rect: Rectangle,
-    label: &'static str,
-}
-
-impl Widget<Action> for PinButton {
-    fn bounds(&self) -> Rectangle {
-        self.rect
-    }
-
-    fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
-    where
-        D: DrawTarget<Color = Rgb565>,
-    {
-        match draw_button(target, self.rect, self.label, true, ButtonTone::Start) {
-            Ok(()) => Ok(()),
-            Err(RenderError::Draw(e)) => Err(e),
-            Err(RenderError::TextFormat) => Ok(()),
-        }
     }
 }
 
@@ -1014,8 +1375,6 @@ impl Widget<Action> for MarqueeBand<'_> {
             .background_color(OLED_BLACK)
             .font(&body_font)
             .build();
-        // No-op against an already-black scratch; correctness fallback for the
-        // non-scratch test path.
         if let Err(RenderError::Draw(e)) = clear_rect(target, self.band) {
             return Err(e);
         }
@@ -1027,8 +1386,6 @@ impl Widget<Action> for MarqueeBand<'_> {
             Text::with_text_style(self.text, self.centered_origin, style, text_style)
                 .draw(target)?;
         } else {
-            // Left-align and shift by offset; framebuf clipping in the painter
-            // discards the glyph pixels that fall outside the band.
             let text_style = TextStyleBuilder::new()
                 .alignment(Alignment::Left)
                 .baseline(Baseline::Top)
@@ -1040,61 +1397,6 @@ impl Widget<Action> for MarqueeBand<'_> {
     }
 }
 
-#[allow(dead_code)]
-struct CenteredTextBand<'a> {
-    clear_band: Rectangle,
-    text_origin: Point,
-    text: &'a str,
-    unchanged: bool,
-    primary: bool,
-}
-
-impl Widget<Action> for CenteredTextBand<'_> {
-    fn bounds(&self) -> Rectangle {
-        self.clear_band
-    }
-
-    fn use_scratch(&self) -> bool {
-        true
-    }
-
-    fn should_draw(&self) -> bool {
-        // Critical: scratch widgets that don't override this would have a
-        // black band blitted over their existing pixels each unchanged frame.
-        !self.unchanged
-    }
-
-    fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
-    where
-        D: DrawTarget<Color = Rgb565>,
-    {
-        let body_font = ui_font!(500);
-        let centered_top_text_style = TextStyleBuilder::new()
-            .alignment(Alignment::Center)
-            .baseline(Baseline::Top)
-            .build();
-        let color = if self.primary {
-            TEXT_PRIMARY
-        } else {
-            TEXT_SECONDARY
-        };
-        let style = BitmapFontStyleBuilder::new()
-            .text_color(color)
-            .background_color(OLED_BLACK)
-            .font(&body_font)
-            .build();
-        // When painter routes us through scratch, the buffer is pre-cleared
-        // black, so this clear_rect is a no-op against an already-black scratch.
-        // When scratch isn't used (test paths), it ensures correctness.
-        if let Err(RenderError::Draw(e)) = clear_rect(target, self.clear_band) {
-            return Err(e);
-        }
-        Text::with_text_style(self.text, self.text_origin, style, centered_top_text_style)
-            .draw(target)?;
-        Ok(())
-    }
-}
-
 fn rect_visual_center(rect: Rectangle) -> Point {
     rect.top_left + Point::new((rect.size.width / 2) as i32, (rect.size.height / 2) as i32)
 }
@@ -1102,77 +1404,234 @@ fn rect_visual_center(rect: Rectangle) -> Point {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::HifiPin;
     use crate::ui::SCREEN_BOUNDS;
     use crate::ui::painter::is_two_aligned;
+
+    fn assert_contains_rect(outer: Rectangle, inner: Rectangle) {
+        assert!(
+            outer.contains(inner.top_left)
+                && outer.contains(Point::new(
+                    inner.top_left.x + inner.size.width as i32 - 1,
+                    inner.top_left.y + inner.size.height as i32 - 1,
+                )),
+            "{outer:?} should contain {inner:?}"
+        );
+    }
+
+    fn assert_no_overlap(a: Rectangle, b: Rectangle) {
+        assert!(!rects_overlap(a, b), "{a:?} should not overlap {b:?}");
+    }
+
+    fn rects_overlap(a: Rectangle, b: Rectangle) -> bool {
+        let a_right = a.top_left.x + a.size.width as i32;
+        let a_bottom = a.top_left.y + a.size.height as i32;
+        let b_right = b.top_left.x + b.size.width as i32;
+        let b_bottom = b.top_left.y + b.size.height as i32;
+
+        a.top_left.x < b_right
+            && b.top_left.x < a_right
+            && a.top_left.y < b_bottom
+            && b.top_left.y < a_bottom
+    }
 
     #[test]
     fn hit_tests_play_button() {
         let ui_layout = layout(SCREEN_BOUNDS);
 
         assert_eq!(
-            hit_test(&ui_layout, ui_layout.play_button.center()),
+            hit_test_status(&ui_layout.status, ui_layout.status.play_button.center()),
             Some(Action::TogglePlayback)
         );
     }
 
     #[test]
-    fn hit_tests_pin_buttons() {
+    fn hit_tests_pin_slots() {
+        let ui_layout = layout(SCREEN_BOUNDS);
+
+        for slot in 0..HIFI_PIN_COUNT {
+            assert_eq!(
+                hit_test_pins(&ui_layout.pins, ui_layout.pins.buttons[slot].center()),
+                Some(Action::InvokePinSlot(slot))
+            );
+        }
+    }
+
+    #[test]
+    fn hit_tests_volume_buttons() {
         let ui_layout = layout(SCREEN_BOUNDS);
 
         assert_eq!(
-            hit_test(&ui_layout, ui_layout.pin_buttons[0].center()),
-            Some(Action::InvokePin(1))
+            hit_test_volume(
+                &ui_layout.volume_page,
+                ui_layout.volume_page.decrement_button.center()
+            ),
+            Some(Action::VolumeDelta(-1))
         );
         assert_eq!(
-            hit_test(&ui_layout, ui_layout.pin_buttons[1].center()),
-            Some(Action::InvokePin(2))
+            hit_test_volume(
+                &ui_layout.volume_page,
+                ui_layout.volume_page.increment_button.center()
+            ),
+            Some(Action::VolumeDelta(1))
         );
     }
 
     #[test]
-    fn main_controls_stay_inside_safe_square() {
+    fn cycles_through_pages() {
+        let mut state = State::new(0);
+        assert_eq!(state.page(), HifiPage::Status);
+        state.cycle_page();
+        assert_eq!(state.page(), HifiPage::Pins);
+        state.cycle_page();
+        assert_eq!(state.page(), HifiPage::Volume);
+        state.cycle_page();
+        assert_eq!(state.page(), HifiPage::Status);
+    }
+
+    #[test]
+    fn pins_page_taps_emit_invoke_pin_id() {
+        let ui_layout = layout(SCREEN_BOUNDS);
+        let mut state = State::new(0);
+        let mut pins = HifiPins::new();
+        let mut title = String::<{ crate::HIFI_PIN_TITLE_LEN }>::new();
+        title.push_str("Radio").unwrap();
+        pins.set(0, HifiPin { id: 4711, title });
+        state.apply_pins(pins);
+        state.cycle_page(); // -> Pins
+
+        let command = state
+            .handle_touch(&ui_layout, ui_layout.pins.buttons[0].center(), 100)
+            .unwrap();
+        assert_eq!(command, Command::InvokePinId { id: 4711 });
+    }
+
+    #[test]
+    fn pins_page_inactive_slot_emits_no_command() {
+        let ui_layout = layout(SCREEN_BOUNDS);
+        let mut state = State::new(0);
+        state.cycle_page(); // -> Pins (no pins loaded)
+        assert!(
+            state
+                .handle_touch(&ui_layout, ui_layout.pins.buttons[0].center(), 100)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn volume_buttons_emit_clamped_set_volume() {
+        let ui_layout = layout(SCREEN_BOUNDS);
+        let mut state = State::new(0);
+        let mut status = HifiStatus::empty();
+        status.volume_percent = 50;
+        state.apply_status(status, 0);
+        state.cycle_page();
+        state.cycle_page(); // -> Volume
+
+        let increment = ui_layout.volume_page.increment_button.center();
+        let decrement = ui_layout.volume_page.decrement_button.center();
+
+        assert_eq!(
+            state.handle_touch(&ui_layout, increment, 100),
+            Some(Command::SetVolume { volume: 51 })
+        );
+        assert_eq!(
+            state.handle_touch(&ui_layout, decrement, 100),
+            Some(Command::SetVolume { volume: 50 })
+        );
+    }
+
+    #[test]
+    fn volume_clamped_at_max() {
+        let ui_layout = layout(SCREEN_BOUNDS);
+        let mut state = State::new(0);
+        let mut status = HifiStatus::empty();
+        status.volume_percent = HIFI_VOLUME_MAX;
+        state.apply_status(status, 0);
+        state.cycle_page();
+        state.cycle_page(); // -> Volume
+
+        // At max — increment is a no-op.
+        let increment = ui_layout.volume_page.increment_button.center();
+        assert_eq!(state.handle_touch(&ui_layout, increment, 100), None);
+    }
+
+    #[test]
+    fn page_controls_stay_inside_their_page_bodies() {
         let ui_layout = layout(SCREEN_BOUNDS);
 
-        assert!(
-            ui_layout
-                .safe_square
-                .contains(ui_layout.play_button.center())
+        assert_contains_rect(ui_layout.status.body, ui_layout.status.song_band);
+        assert_contains_rect(ui_layout.status.body, ui_layout.status.artist_band);
+        assert_contains_rect(ui_layout.status.body, ui_layout.status.play_button);
+        assert_contains_rect(ui_layout.status.body, ui_layout.status.timer_bounds);
+        assert_contains_rect(ui_layout.status.body, ui_layout.status.progress);
+
+        for button in &ui_layout.pins.buttons {
+            assert_contains_rect(ui_layout.pins.body, *button);
+        }
+
+        assert_contains_rect(ui_layout.volume_page.body, ui_layout.volume_page.title_slot);
+        assert_contains_rect(ui_layout.volume_page.body, ui_layout.volume_page.value_slot);
+        assert_contains_rect(
+            ui_layout.volume_page.body,
+            ui_layout.volume_page.controls_slot,
         );
-        assert!(ui_layout.safe_square.contains(ui_layout.timer_origin));
-        assert!(ui_layout.safe_square.contains(ui_layout.progress.top_left));
-        assert!(
-            ui_layout
-                .safe_square
-                .contains(ui_layout.pin_buttons[0].center())
+        assert_contains_rect(
+            ui_layout.volume_page.controls_slot,
+            ui_layout.volume_page.decrement_button,
         );
-        assert!(
-            ui_layout
-                .safe_square
-                .contains(ui_layout.pin_buttons[1].center())
+        assert_contains_rect(
+            ui_layout.volume_page.controls_slot,
+            ui_layout.volume_page.increment_button,
         );
-        assert!(
-            ui_layout.pin_buttons[0].top_left.x + (PIN_BUTTON_SIZE as i32)
-                < ui_layout.timer_origin.x
-        );
-        assert!(ui_layout.timer_origin.x + DURATION_WIDTH < ui_layout.pin_buttons[1].top_left.x);
+    }
+
+    #[test]
+    fn page_bodies_stay_inside_the_hifi_inner_screen() {
+        let ui_layout = layout(SCREEN_BOUNDS);
+
+        assert_contains_rect(ui_layout.page_body, ui_layout.status.body);
+        assert_contains_rect(ui_layout.page_body, ui_layout.pins.body);
+        assert_contains_rect(ui_layout.page_body, ui_layout.volume_page.body);
+    }
+
+    #[test]
+    fn pins_and_volume_do_not_own_status_text_bands() {
+        let ui_layout = layout(SCREEN_BOUNDS);
+
+        for body in [ui_layout.pins.body, ui_layout.volume_page.body] {
+            assert_no_overlap(body, ui_layout.status.song_band);
+            assert_no_overlap(body, ui_layout.status.artist_band);
+        }
+    }
+
+    #[test]
+    fn volume_page_slots_do_not_overlap() {
+        let ui_layout = layout(SCREEN_BOUNDS);
+        let volume = ui_layout.volume_page;
+
+        assert_no_overlap(volume.title_slot, volume.value_slot);
+        assert_no_overlap(volume.value_slot, volume.controls_slot);
+        assert_no_overlap(volume.title_slot, volume.controls_slot);
     }
 
     #[test]
     fn primary_elements_are_centered() {
         let ui_layout = layout(SCREEN_BOUNDS);
 
-        assert_eq!(ui_layout.song_origin.x, ui_layout.volume.center.x);
-        assert_eq!(ui_layout.artist_origin.x, ui_layout.volume.center.x);
+        assert_eq!(ui_layout.status.song_origin.x, ui_layout.volume.center.x);
+        assert_eq!(ui_layout.status.artist_origin.x, ui_layout.volume.center.x);
         assert_eq!(
-            rect_visual_center(ui_layout.play_button).x,
+            rect_visual_center(ui_layout.status.play_button).x,
             ui_layout.volume.center.x
         );
         assert_eq!(
-            ui_layout.timer_origin.x + DURATION_WIDTH / 2,
+            ui_layout.status.timer_origin.x + DURATION_WIDTH / 2,
             ui_layout.volume.center.x
         );
         assert_eq!(
-            ui_layout.progress.top_left.x + (ui_layout.progress.size.width / 2) as i32,
+            ui_layout.status.progress.top_left.x
+                + (ui_layout.status.progress.size.width / 2) as i32,
             ui_layout.volume.center.x
         );
     }
@@ -1183,7 +1642,7 @@ mod tests {
     #[test]
     fn scratched_widget_bounds_are_two_aligned() {
         let ui_layout = layout(SCREEN_BOUNDS);
-        for bounds in [ui_layout.song_band, ui_layout.artist_band] {
+        for bounds in [ui_layout.status.song_band, ui_layout.status.artist_band] {
             assert!(
                 is_two_aligned(bounds),
                 "scratched bounds {bounds:?} are not 2-px aligned"
@@ -1244,6 +1703,16 @@ mod tests {
     }
 
     #[test]
+    fn volume_only_status_finishes_loading() {
+        let mut state = State::new(0);
+        let mut status = HifiStatus::empty();
+        status.volume_percent = 42;
+
+        assert!(state.apply_status(status, 200));
+        assert!(!state.loading);
+    }
+
+    #[test]
     fn loading_spinner_times_out() {
         let mut state = State::new(0);
 
@@ -1293,21 +1762,19 @@ mod tests {
 
     #[test]
     fn song_text_lands_non_black_pixels_in_band() {
-        // Catches scratch-blit regressions: render a hifi state with a known
-        // title and assert the song band has at least one non-black pixel.
         let layout = layout(SCREEN_BOUNDS);
         let mut state = State::new(0);
         let mut status = HifiStatus::empty();
         status.title.push_str("Caroline").unwrap();
         status.playback = PlaybackState::Playing;
-        state.apply_status(status, 100);
+        state.apply_status(status.clone(), 100);
 
         let mut display = TestDisplay::new(466, 466);
         let mut scratch = std::vec![Rgb565::BLACK; crate::ui::RECOMMENDED_SCRATCH_PIXELS];
 
         render(&mut state, &mut display, &mut scratch, &layout).unwrap();
 
-        let band = layout.song_band;
+        let band = layout.status.song_band;
         let mut non_black = 0_u32;
         for y in band.top_left.y..band.top_left.y + band.size.height as i32 {
             for x in band.top_left.x..band.top_left.x + band.size.width as i32 {
@@ -1325,9 +1792,6 @@ mod tests {
 
     #[test]
     fn song_text_persists_across_unchanged_renders() {
-        // Regression: second render with unchanged title must NOT blit a
-        // freshly-cleared (black) scratch over the existing text. The widget
-        // smart-skips, so the painter must too — otherwise we lose the text.
         let layout = layout(SCREEN_BOUNDS);
         let mut state = State::new(0);
         let mut status = HifiStatus::empty();
@@ -1339,11 +1803,11 @@ mod tests {
         let mut scratch = std::vec![Rgb565::BLACK; crate::ui::RECOMMENDED_SCRATCH_PIXELS];
 
         render(&mut state, &mut display, &mut scratch, &layout).unwrap();
-        let after_first = count_non_black(&display, layout.song_band);
+        let after_first = count_non_black(&display, layout.status.song_band);
         assert!(after_first > 0, "first render should draw the title");
 
         render(&mut state, &mut display, &mut scratch, &layout).unwrap();
-        let after_second = count_non_black(&display, layout.song_band);
+        let after_second = count_non_black(&display, layout.status.song_band);
         assert_eq!(
             after_first, after_second,
             "second render with unchanged title must preserve text pixels"
@@ -1352,22 +1816,14 @@ mod tests {
 
     #[test]
     fn loading_spinner_pixels_are_cleared_on_transition_out_of_loading() {
-        // Regression: when the loading spinner is centered differently from
-        // the play-button slot, the slot's clear leaves a strip of spinner
-        // dots untouched. Specifically, with loading spinner @ volume.center
-        // (y=233) and play_button slot @ y=210, the bottom ~20 px of the
-        // spinner footprint sits below the slot and would survive the
-        // transition.
         let layout = layout(SCREEN_BOUNDS);
         let mut state = State::new(0);
         let mut display = TestDisplay::new(466, 466);
         let mut scratch = std::vec![Rgb565::BLACK; crate::ui::RECOMMENDED_SCRATCH_PIXELS];
 
-        // Render while loading — paints the spinner.
         render(&mut state, &mut display, &mut scratch, &layout).unwrap();
         assert!(state.loading);
 
-        // Apply a status so loading ends, then re-render.
         let mut status = HifiStatus::empty();
         status.title.push_str("Caroline").unwrap();
         status.artist.push_str("Jacob Banks").unwrap();
@@ -1376,18 +1832,15 @@ mod tests {
         render(&mut state, &mut display, &mut scratch, &layout).unwrap();
         assert!(!state.loading);
 
-        // Inspect the suspect strip: pixels within the play button's
-        // horizontal extent, BUT below the play button's bottom edge,
-        // where a spinner centered at volume.center would overhang.
-        // That strip is also above the progress bar so no other widget
-        // paints there — any non-black pixel is a ghost.
-        let slot_bottom = layout.play_button.top_left.y + layout.play_button.size.height as i32;
-        let progress_top = layout.progress.top_left.y;
-        let x_lo = layout.play_button.top_left.x;
-        let x_hi = layout.play_button.top_left.x + layout.play_button.size.width as i32;
+        let slot_bottom =
+            layout.status.play_button.top_left.y + layout.status.play_button.size.height as i32;
+        let progress_top = layout.status.progress.top_left.y;
+        let x_lo = layout.status.play_button.top_left.x;
+        let x_hi =
+            layout.status.play_button.top_left.x + layout.status.play_button.size.width as i32;
         for y in slot_bottom..progress_top.min(slot_bottom + 24) {
             for x in x_lo..x_hi {
-                if layout.timer_bounds.contains(Point::new(x, y)) {
+                if layout.status.timer_bounds.contains(Point::new(x, y)) {
                     continue;
                 }
                 let idx = (y as usize * 466) + x as usize;
@@ -1398,6 +1851,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn volume_value_redraw_preserves_button_controls() {
+        let layout = layout(SCREEN_BOUNDS);
+        let mut state = State::new(0);
+        let mut status = HifiStatus::empty();
+        status.volume_percent = 23;
+        state.apply_status(status.clone(), 100);
+        state.cycle_page();
+        state.cycle_page(); // -> Volume
+
+        let mut display = TestDisplay::new(466, 466);
+        let mut scratch = std::vec![Rgb565::BLACK; crate::ui::RECOMMENDED_SCRATCH_PIXELS];
+        render(&mut state, &mut display, &mut scratch, &layout).unwrap();
+
+        let button_probe = Point::new(
+            layout.volume_page.decrement_button.center().x,
+            layout.volume_page.decrement_button.top_left.y + 2,
+        );
+        assert_ne!(display.pixel_at(button_probe), Rgb565::BLACK);
+
+        status.volume_percent = 24;
+        state.apply_status(status, 200);
+        render(&mut state, &mut display, &mut scratch, &layout).unwrap();
+
+        assert_ne!(display.pixel_at(button_probe), Rgb565::BLACK);
     }
 
     fn count_non_black(display: &TestDisplay, band: Rectangle) -> u32 {
@@ -1428,7 +1908,7 @@ mod tests {
 
         render(&mut state, &mut display, &mut scratch, &layout).unwrap();
 
-        let band = layout.artist_band;
+        let band = layout.status.artist_band;
         let mut non_black = 0_u32;
         for y in band.top_left.y..band.top_left.y + band.size.height as i32 {
             for x in band.top_left.x..band.top_left.x + band.size.width as i32 {
@@ -1459,6 +1939,10 @@ mod tests {
                 height,
                 pixels: std::vec![Rgb565::BLACK; (width * height) as usize],
             }
+        }
+
+        fn pixel_at(&self, point: Point) -> Rgb565 {
+            self.pixels[(point.y as u32 * self.width + point.x as u32) as usize]
         }
     }
 
@@ -1536,5 +2020,22 @@ mod tests {
         };
         arc.draw(&mut t).unwrap();
         assert_eq!(t.calls.get(), 0, "volume arc should smart-skip");
+    }
+
+    #[test]
+    fn volume_arc_full_at_max_volume() {
+        // Volume at HIFI_VOLUME_MAX should fill the arc completely.
+        assert!(
+            (arc_sweep_for_volume(HIFI_VOLUME_MAX, VOLUME_SWEEP_DEGREES) - VOLUME_SWEEP_DEGREES)
+                .abs()
+                < 0.01
+        );
+        // And anything beyond max also caps at the full sweep.
+        assert!(
+            (arc_sweep_for_volume(HIFI_VOLUME_MAX + 10, VOLUME_SWEEP_DEGREES)
+                - VOLUME_SWEEP_DEGREES)
+                .abs()
+                < 0.01
+        );
     }
 }

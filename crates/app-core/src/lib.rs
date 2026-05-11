@@ -24,6 +24,7 @@ pub enum Event {
     NetworkStatus(NetworkStatus),
     HifiStatus(HifiStatus),
     HifiArtwork(HifiArtwork),
+    HifiPins(HifiPins),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +68,46 @@ pub const HIFI_ARTWORK_PIXELS: usize = HIFI_ARTWORK_SIZE as usize * HIFI_ARTWORK
 pub const HIFI_ARTWORK_SIZE: u32 = 96;
 pub const HIFI_TEXT_LEN: usize = 64;
 pub const HIFI_URI_LEN: usize = 256;
+pub const HIFI_PIN_COUNT: usize = 6;
+pub const HIFI_PIN_TITLE_LEN: usize = 32;
+
+/// Maximum volume value the receiver accepts; the volume arc fills at this value.
+pub const HIFI_VOLUME_MAX: u8 = 70;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HifiPin {
+    pub id: u32,
+    pub title: String<HIFI_PIN_TITLE_LEN>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HifiPins {
+    pins: [Option<HifiPin>; HIFI_PIN_COUNT],
+}
+
+impl HifiPins {
+    pub const fn new() -> Self {
+        Self {
+            pins: [None, None, None, None, None, None],
+        }
+    }
+
+    pub fn set(&mut self, slot: usize, pin: HifiPin) -> bool {
+        if slot >= HIFI_PIN_COUNT {
+            return false;
+        }
+        self.pins[slot] = Some(pin);
+        true
+    }
+
+    pub fn get(&self, slot: usize) -> Option<&HifiPin> {
+        self.pins.get(slot).and_then(|entry| entry.as_ref())
+    }
+
+    pub const fn slots(&self) -> &[Option<HifiPin>; HIFI_PIN_COUNT] {
+        &self.pins
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HifiStatus {
@@ -265,8 +306,17 @@ impl App {
             }
             Event::TouchUp => false,
             Event::ButtonPressed(_) => {
+                // Single hardware button on this device (BOOT/GPIO9). Both
+                // variants behave the same: cycle pages when in HIFI mode,
+                // navigate to Launcher otherwise. The simulator emits both
+                // variants from its menu; we keep them as one code path.
                 self.interaction_count = self.interaction_count.saturating_add(1);
-                self.navigate(Screen::Launcher);
+                match &mut self.active_screen {
+                    ActiveScreen::HifiControl(state) => state.cycle_page(),
+                    ActiveScreen::Launcher(_) | ActiveScreen::Stopwatch(_) => {
+                        self.navigate(Screen::Launcher);
+                    }
+                }
                 true
             }
             Event::NetworkStatus(status) => {
@@ -283,6 +333,10 @@ impl App {
             },
             Event::HifiArtwork(artwork) => match &mut self.active_screen {
                 ActiveScreen::HifiControl(state) => state.apply_artwork(artwork),
+                ActiveScreen::Launcher(_) | ActiveScreen::Stopwatch(_) => false,
+            },
+            Event::HifiPins(pins) => match &mut self.active_screen {
+                ActiveScreen::HifiControl(state) => state.apply_pins(pins),
                 ActiveScreen::Launcher(_) | ActiveScreen::Stopwatch(_) => false,
             },
         };
@@ -400,12 +454,25 @@ mod tests {
         touch_point(ui::hifi_play_button_center())
     }
 
-    fn hifi_pin_1_touch() -> TouchPoint {
-        touch_point(ui::hifi_pin_1_button_center())
+    fn hifi_pin_slot_touch(slot: usize) -> TouchPoint {
+        touch_point(ui::hifi_pin_slot_center(slot))
     }
 
-    fn hifi_pin_2_touch() -> TouchPoint {
-        touch_point(ui::hifi_pin_2_button_center())
+    fn hifi_volume_increment_touch() -> TouchPoint {
+        touch_point(ui::hifi_volume_increment_center())
+    }
+
+    fn hifi_volume_decrement_touch() -> TouchPoint {
+        touch_point(ui::hifi_volume_decrement_center())
+    }
+
+    fn loaded_pin(id: u32, title: &str) -> HifiPin {
+        let mut pin_title = String::<HIFI_PIN_TITLE_LEN>::new();
+        pin_title.push_str(title).unwrap();
+        HifiPin {
+            id,
+            title: pin_title,
+        }
     }
 
     fn hifi_status(playback: PlaybackState) -> HifiStatus {
@@ -562,29 +629,86 @@ mod tests {
     }
 
     #[test]
-    fn hifi_pin_1_touch_requests_invoke_command() {
+    fn hifi_pin_slot_touch_requests_invoke_command_with_loaded_id() {
         let mut app = App::new_on_screen(Screen::HifiControl);
+        let mut pins = HifiPins::new();
+        pins.set(0, loaded_pin(4711, "Radio"));
+        pins.set(1, loaded_pin(8128, "Spotify"));
+        app.update(Event::HifiPins(pins));
+        // User-button cycles Status -> Pins.
+        app.update(Event::ButtonPressed(Button::User));
 
-        let outcome = app.update(Event::TouchDown(hifi_pin_1_touch()));
-
+        let outcome = app.update(Event::TouchDown(hifi_pin_slot_touch(0)));
         assert!(outcome.render_requested);
         assert_eq!(
             outcome.command,
-            Some(Command::Hifi(HifiCommand::ActivatePreset { preset: 1 }))
+            Some(Command::Hifi(HifiCommand::InvokePinId { id: 4711 }))
+        );
+
+        let outcome = app.update(Event::TouchDown(hifi_pin_slot_touch(1)));
+        assert_eq!(
+            outcome.command,
+            Some(Command::Hifi(HifiCommand::InvokePinId { id: 8128 }))
         );
     }
 
     #[test]
-    fn hifi_pin_2_touch_requests_invoke_command() {
+    fn hifi_pin_slot_without_loaded_pin_emits_no_command() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        app.update(Event::ButtonPressed(Button::User)); // -> Pins page
+
+        let outcome = app.update(Event::TouchDown(hifi_pin_slot_touch(0)));
+        assert!(outcome.render_requested);
+        assert_eq!(outcome.command, None);
+    }
+
+    #[test]
+    fn hifi_user_button_cycles_pages() {
         let mut app = App::new_on_screen(Screen::HifiControl);
 
-        let outcome = app.update(Event::TouchDown(hifi_pin_2_touch()));
+        // Tap the increment button while on Volume page after two cycles.
+        let mut status = hifi_status(PlaybackState::Paused);
+        status.volume_percent = 30;
+        app.update(Event::HifiStatus(status));
+        app.update(Event::ButtonPressed(Button::User)); // Status -> Pins
+        app.update(Event::ButtonPressed(Button::User)); // Pins -> Volume
 
-        assert!(outcome.render_requested);
+        let outcome = app.update(Event::TouchDown(hifi_volume_increment_touch()));
         assert_eq!(
             outcome.command,
-            Some(Command::Hifi(HifiCommand::ActivatePreset { preset: 2 }))
+            Some(Command::Hifi(HifiCommand::SetVolume { volume: 31 }))
         );
+
+        // Cycle again returns to Status — touching the volume button now is
+        // a no-op (it's not on screen).
+        app.update(Event::ButtonPressed(Button::User)); // Volume -> Status
+        let outcome = app.update(Event::TouchDown(hifi_volume_decrement_touch()));
+        assert_eq!(outcome.command, None);
+    }
+
+    #[test]
+    fn hifi_boot_button_cycles_pages_same_as_user_button() {
+        // With a single hardware button, Boot and User both cycle HIFI pages.
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        let mut status = hifi_status(PlaybackState::Paused);
+        status.volume_percent = 30;
+        app.update(Event::HifiStatus(status));
+        app.update(Event::ButtonPressed(Button::Boot)); // Status -> Pins
+        app.update(Event::ButtonPressed(Button::Boot)); // Pins -> Volume
+
+        let outcome = app.update(Event::TouchDown(hifi_volume_increment_touch()));
+        assert_eq!(
+            outcome.command,
+            Some(Command::Hifi(HifiCommand::SetVolume { volume: 31 }))
+        );
+    }
+
+    #[test]
+    fn boot_button_from_stopwatch_navigates_to_launcher() {
+        // Outside HIFI mode, the button still routes to Launcher.
+        let mut app = App::new_on_screen(Screen::Stopwatch);
+        app.update(Event::ButtonPressed(Button::Boot));
+        assert_eq!(app.screen(), Screen::Launcher);
     }
 
     #[test]

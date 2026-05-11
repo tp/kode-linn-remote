@@ -12,8 +12,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use app_config::{AppConfig, WifiConfig};
 use app_core::{
-    App, Command, Event, HIFI_URI_LEN, HifiArtwork, HifiCommand, HifiStatus, NetworkStatus,
-    PlaybackState, RECOMMENDED_SCRATCH_PIXELS, Screen,
+    App, Button, Command, Event, HIFI_URI_LEN, HifiArtwork, HifiCommand, HifiPins, HifiStatus,
+    NetworkStatus, PlaybackState, RECOMMENDED_SCRATCH_PIXELS, Screen,
 };
 use app_runtime::lpec::{
     ARTWORK_DECODE_BUFFER_BYTES, ARTWORK_HTTP_BUFFER_BYTES, Error as LpecError, LpecSession,
@@ -33,9 +33,10 @@ use embassy_time::{Duration as EmbassyDuration, Instant as EmbassyInstant, Timer
 use embedded_graphics::{draw_target::DrawTarget, pixelcolor::Rgb565, prelude::RgbColor};
 use esp_backtrace as _;
 use esp_hal::{
+    gpio::{Input, InputConfig, Pull},
     i2c::master::{Config as I2cConfig, I2c},
     interrupt::software::SoftwareInterruptControl,
-    peripherals::WIFI,
+    peripherals::{GPIO9, WIFI},
     ram,
     time::{Duration, Instant, Rate},
     timer::timg::TimerGroup,
@@ -58,6 +59,10 @@ const TOUCH_POLL_MS: u64 = 50;
 const HEARTBEAT_MS: u64 = 1_000;
 const LPEC_EVENT_POLL_MS: u64 = 100;
 const WIFI_CONNECT_ATTEMPTS: u8 = 5;
+/// Bounce window: any falling edge within this of the last accepted press is
+/// discarded. The Waveshare BOOT button is mechanically clean enough that
+/// 50 ms is plenty without making the UI feel laggy.
+const BUTTON_DEBOUNCE_MS: u64 = 50;
 const LOCAL_CONFIG: &str = include_str!("../../../config/local.env");
 
 static FIRMWARE_EVENTS: Channel<CriticalSectionRawMutex, FirmwareEvent, 1> = Channel::new();
@@ -176,6 +181,9 @@ async fn main(spawner: Spawner) -> ! {
         }
         Err(_) => println!("display: initial render failed"),
     }
+
+    spawner
+        .spawn(boot_button_task(peripherals.GPIO9).expect("boot-button task should allocate once"));
 
     let booted_at = Instant::now();
     let mut next_heartbeat_ms = 0;
@@ -351,6 +359,24 @@ enum WifiConnection<'d> {
 }
 
 #[embassy_executor::task]
+async fn boot_button_task(pin: GPIO9<'static>) {
+    // GPIO9 = the BOOT key on the Waveshare ESP32-C6 Touch AMOLED 1.43.
+    // Active low (button to GND), internal pull-up; interrupt-driven via
+    // esp-hal's async GPIO support — no polling on the main loop.
+    let mut input = Input::new(pin, InputConfig::default().with_pull(Pull::Up));
+    let mut last_press_ms: u64 = 0;
+    loop {
+        input.wait_for_falling_edge().await;
+        let now_ms = EmbassyInstant::now().as_millis();
+        if now_ms.saturating_sub(last_press_ms) < BUTTON_DEBOUNCE_MS {
+            continue;
+        }
+        last_press_ms = now_ms;
+        send_app_event(Event::ButtonPressed(Button::Boot)).await;
+    }
+}
+
+#[embassy_executor::task]
 async fn firmware_runtime_task(wifi: WIFI<'static>, config: WifiConfig, endpoint: Endpoint) {
     match connect_wifi(wifi, &config).await {
         WifiConnection::Connected {
@@ -422,6 +448,7 @@ async fn hifi_runtime_loop(
     artwork_pool: &mut ArtworkPool,
 ) -> ! {
     let mut hifi_active = false;
+    let mut pins_fetched = false;
     let mut next_lpec_event_poll_at = EmbassyInstant::now();
     let mut lpec_session = LpecSession::new();
     let mut last_hifi_artwork_uri = heapless::String::<HIFI_URI_LEN>::new();
@@ -470,6 +497,26 @@ async fn hifi_runtime_loop(
                 .await;
             }
             next_lpec_event_poll_at = now + EmbassyDuration::from_millis(LPEC_EVENT_POLL_MS);
+        }
+
+        if hifi_active && !pins_fetched {
+            let pins = fetch_linn_pins(network, endpoint, &mut lpec_session);
+            // Mark fetched after the first attempt regardless — retrying
+            // a `JsonCorrupt` etc. on every iteration just spams the
+            // device. Pins are optional, so failures must not destabilize
+            // the status/volume subscription.
+            pins_fetched = true;
+            if let Some(pins) = pins {
+                send_app_event(Event::HifiPins(pins)).await;
+            }
+            if let Some(status) = lpec_session.live_status() {
+                send_hifi_status(
+                    &mut last_hifi_artwork_uri,
+                    &mut pending_hifi_artwork_uri,
+                    status,
+                )
+                .await;
+            }
         }
 
         if let Some(artwork) = load_pending_hifi_artwork(
@@ -583,6 +630,37 @@ fn poll_linn_events(
             println!("linn: session poll failed: {:?}", error);
             session.reset();
             network.reset_lpec();
+            None
+        }
+    }
+}
+
+fn fetch_linn_pins(
+    network: &mut FirmwareNetwork,
+    endpoint: Endpoint,
+    session: &mut LpecSession,
+) -> Option<HifiPins> {
+    let mut stream = match network.connect(endpoint) {
+        Ok(stream) => stream,
+        Err(error) => {
+            println!("linn: pins tcp connect failed: {:?}", error);
+            return None;
+        }
+    };
+    match session.fetch_pins(&mut stream) {
+        Ok(pins) => Some(pins),
+        Err(LpecError::Protocol(::linn_lpec::Error::Remote { code, description })) => {
+            // Receiver said no — connection is still healthy, don't reset
+            // (resetting would tear down the status/volume subscription).
+            println!(
+                "linn: pins not available (code {}: {})",
+                code,
+                description.as_str()
+            );
+            None
+        }
+        Err(error) => {
+            println!("linn: pins fetch transport error: {:?}", error);
             None
         }
     }

@@ -71,11 +71,16 @@ pub(crate) fn hifi_play_button_center() -> embedded_graphics::geometry::Point {
 }
 
 #[cfg(test)]
-pub(crate) fn hifi_pin_1_button_center() -> embedded_graphics::geometry::Point {
-    screens::hifi::pin_1_button_center(SCREEN_BOUNDS)
+pub(crate) fn hifi_pin_slot_center(slot: usize) -> embedded_graphics::geometry::Point {
+    screens::hifi::pin_slot_button_center(SCREEN_BOUNDS, slot)
 }
 
 #[cfg(test)]
-pub(crate) fn hifi_pin_2_button_center() -> embedded_graphics::geometry::Point {
-    screens::hifi::pin_2_button_center(SCREEN_BOUNDS)
+pub(crate) fn hifi_volume_decrement_center() -> embedded_graphics::geometry::Point {
+    screens::hifi::volume_decrement_center(SCREEN_BOUNDS)
+}
+
+#[cfg(test)]
+pub(crate) fn hifi_volume_increment_center() -> embedded_graphics::geometry::Point {
+    screens::hifi::volume_increment_center(SCREEN_BOUNDS)
 }
