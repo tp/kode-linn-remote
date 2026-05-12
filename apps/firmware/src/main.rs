@@ -12,14 +12,16 @@ use alloc::vec;
 use alloc::vec::Vec;
 use app_config::{AppConfig, WifiConfig};
 use app_core::{
-    App, Button, Command, Event, HIFI_URI_LEN, HifiArtwork, HifiCommand, HifiPins, HifiStatus,
-    NetworkStatus, PlaybackState, RECOMMENDED_SCRATCH_PIXELS, Screen,
+    App, Button, Command, Event, HifiArtwork, HifiCommand, HifiPins, HifiStatus, NetworkStatus,
+    RECOMMENDED_SCRATCH_PIXELS, Screen,
 };
+use app_runtime::hifi::{DriverError as HifiDriverError, HifiDriver};
 use app_runtime::lpec::{
     ARTWORK_DECODE_BUFFER_BYTES, ARTWORK_HTTP_BUFFER_BYTES, Error as LpecError, LpecSession,
     load_artwork_with_buffers_into,
 };
 use app_runtime::net::Endpoint;
+use app_runtime::{HifiController, RuntimeError};
 use artwork_pool::ArtworkPool;
 use board_waveshare_c6::{BOARD_NAME, DISPLAY_SIZE, peripherals};
 use display::AmoledDisplay;
@@ -405,7 +407,7 @@ async fn firmware_runtime_task(wifi: WIFI<'static>, config: WifiConfig, endpoint
             let mut network = FirmwareNetwork::new(interfaces.station, buffers);
             let http_buffer = HTTP_BUFFER.init([0; ARTWORK_HTTP_BUFFER_BYTES]);
             let decode_buffer = DECODE_BUFFER.init([0; ARTWORK_DECODE_BUFFER_BYTES]);
-            let mut artwork_pool = ArtworkPool::new();
+            let artwork_pool = ArtworkPool::new();
 
             loop {
                 match network.poll_config_up() {
@@ -414,14 +416,14 @@ async fn firmware_runtime_task(wifi: WIFI<'static>, config: WifiConfig, endpoint
                             println!("net: dhcp address {}", config.address);
                         }
                         send_app_event(Event::NetworkStatus(NetworkStatus::Online)).await;
-                        hifi_runtime_loop(
-                            &mut network,
+                        let hifi = FirmwareHifi::new(
+                            network,
                             endpoint,
                             http_buffer,
                             decode_buffer,
-                            &mut artwork_pool,
-                        )
-                        .await;
+                            artwork_pool,
+                        );
+                        hifi_runtime_loop(HifiDriver::new(hifi, LPEC_EVENT_POLL_MS)).await;
                     }
                     Ok(false) => {
                         Timer::after(EmbassyDuration::from_millis(TOUCH_POLL_MS)).await;
@@ -440,97 +442,207 @@ async fn firmware_runtime_task(wifi: WIFI<'static>, config: WifiConfig, endpoint
     }
 }
 
-async fn hifi_runtime_loop(
-    network: &mut FirmwareNetwork,
-    endpoint: Endpoint,
-    http_buffer: &mut [u8],
-    decode_buffer: &mut [u8],
-    artwork_pool: &mut ArtworkPool,
-) -> ! {
-    let mut hifi_active = false;
-    let mut pins_fetched = false;
-    let mut next_lpec_event_poll_at = EmbassyInstant::now();
-    let mut lpec_session = LpecSession::new();
-    let mut last_hifi_artwork_uri = heapless::String::<HIFI_URI_LEN>::new();
-    let mut pending_hifi_artwork_uri = heapless::String::<HIFI_URI_LEN>::new();
-
+async fn hifi_runtime_loop(mut driver: HifiDriver<FirmwareHifi<'static>>) -> ! {
     loop {
-        let mut commands = heapless::Vec::<HifiCommand, 4>::new();
         while let Ok(request) = HIFI_REQUESTS.try_receive() {
             match request {
                 HifiRequest::SetActive(active) => {
-                    hifi_active = active;
-                    next_lpec_event_poll_at = EmbassyInstant::now();
+                    driver.set_active(active, EmbassyInstant::now().as_millis());
                 }
                 HifiRequest::Command(command) => {
-                    let _ = commands.push(command);
+                    apply_hifi_driver_result(driver.handle_command(command)).await;
                 }
             }
         }
 
-        if hifi_active {
-            for command in commands {
-                if let Some(status) =
-                    handle_linn_command(network, endpoint, &mut lpec_session, command)
-                {
-                    send_hifi_status(
-                        &mut last_hifi_artwork_uri,
-                        &mut pending_hifi_artwork_uri,
-                        status,
-                    )
-                    .await;
-                }
-                next_lpec_event_poll_at = EmbassyInstant::now();
-            }
-        } else if !commands.is_empty() {
-            println!("linn: command ignored while HIFI screen is inactive");
-        }
+        let uptime_ms = EmbassyInstant::now().as_millis();
+        apply_hifi_driver_result(driver.poll_status_if_due(uptime_ms)).await;
+        apply_hifi_driver_result(driver.load_pending_artwork()).await;
+        apply_hifi_driver_result(driver.fetch_pins_if_needed()).await;
 
-        let now = EmbassyInstant::now();
-        if hifi_active && now >= next_lpec_event_poll_at {
-            if let Some(status) = poll_linn_events(network, endpoint, &mut lpec_session) {
-                send_hifi_status(
-                    &mut last_hifi_artwork_uri,
-                    &mut pending_hifi_artwork_uri,
-                    status,
-                )
-                .await;
-            }
-            next_lpec_event_poll_at = now + EmbassyDuration::from_millis(LPEC_EVENT_POLL_MS);
-        }
+        Timer::after(EmbassyDuration::from_millis(TOUCH_POLL_MS)).await;
+    }
+}
 
-        if hifi_active && !pins_fetched {
-            let pins = fetch_linn_pins(network, endpoint, &mut lpec_session);
-            // Mark fetched after the first attempt regardless — retrying
-            // a `JsonCorrupt` etc. on every iteration just spams the
-            // device. Pins are optional, so failures must not destabilize
-            // the status/volume subscription.
-            pins_fetched = true;
-            if let Some(pins) = pins {
-                send_app_event(Event::HifiPins(pins)).await;
-            }
-            if let Some(status) = lpec_session.live_status() {
-                send_hifi_status(
-                    &mut last_hifi_artwork_uri,
-                    &mut pending_hifi_artwork_uri,
-                    status,
-                )
-                .await;
-            }
-        }
+struct FirmwareHifi<'a> {
+    network: FirmwareNetwork,
+    endpoint: Endpoint,
+    session: LpecSession,
+    pending_status: Option<HifiStatus>,
+    http_buffer: &'a mut [u8],
+    decode_buffer: &'a mut [u8],
+    artwork_pool: ArtworkPool,
+}
 
-        if let Some(artwork) = load_pending_hifi_artwork(
+#[derive(Debug)]
+enum FirmwareHifiError {
+    Idle,
+    Net(FirmwareNetError),
+    Lpec(LpecError<FirmwareNetError>),
+}
+
+impl<'a> FirmwareHifi<'a> {
+    fn new(
+        network: FirmwareNetwork,
+        endpoint: Endpoint,
+        http_buffer: &'a mut [u8],
+        decode_buffer: &'a mut [u8],
+        artwork_pool: ArtworkPool,
+    ) -> Self {
+        Self {
             network,
-            &mut last_hifi_artwork_uri,
-            &mut pending_hifi_artwork_uri,
+            endpoint,
+            session: LpecSession::new(),
+            pending_status: None,
             http_buffer,
             decode_buffer,
             artwork_pool,
-        ) {
-            send_app_event(Event::HifiArtwork(artwork)).await;
+        }
+    }
+
+    fn reset_lpec(&mut self) {
+        self.session.reset();
+        self.network.reset_lpec();
+    }
+}
+
+impl HifiController for FirmwareHifi<'_> {
+    type Error = FirmwareHifiError;
+
+    fn handle_command(&mut self, command: HifiCommand) -> Result<(), Self::Error> {
+        println!("linn: command {:?}", command);
+        let result = {
+            let mut stream = self
+                .network
+                .connect(self.endpoint)
+                .map_err(FirmwareHifiError::Net)?;
+            self.session.handle_command(&mut stream, command)
+        };
+
+        match result {
+            Ok(status) => {
+                self.pending_status = status;
+                println!("linn: command sent");
+                Ok(())
+            }
+            Err(error) => {
+                println!("linn: command failed: {:?}", error);
+                self.reset_lpec();
+                Err(FirmwareHifiError::Lpec(error))
+            }
+        }
+    }
+
+    fn status(&mut self) -> Result<HifiStatus, Self::Error> {
+        if let Some(status) = self.pending_status.take() {
+            return Ok(status);
         }
 
-        Timer::after(EmbassyDuration::from_millis(TOUCH_POLL_MS)).await;
+        let result = {
+            let mut stream = self
+                .network
+                .connect_events(self.endpoint)
+                .map_err(FirmwareHifiError::Net)?;
+            self.session.poll(&mut stream)
+        };
+
+        match result {
+            Ok(Some(status)) => Ok(status),
+            Ok(None) => self.session.live_status().ok_or(FirmwareHifiError::Idle),
+            Err(LpecError::Connect(
+                FirmwareNetError::ConnectTimeout | FirmwareNetError::ReadTimeout,
+            )) => self.session.live_status().ok_or(FirmwareHifiError::Idle),
+            Err(error) => {
+                println!("linn: session poll failed: {:?}", error);
+                self.reset_lpec();
+                Err(FirmwareHifiError::Lpec(error))
+            }
+        }
+    }
+
+    fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error> {
+        println!("linn: artwork load {}", uri);
+        let pixels = self.artwork_pool.acquire();
+        load_artwork_with_buffers_into(
+            &mut self.network,
+            uri,
+            self.http_buffer,
+            self.decode_buffer,
+            pixels,
+        )
+        .map_err(FirmwareHifiError::Lpec)
+    }
+
+    fn pins(&mut self) -> Result<HifiPins, Self::Error> {
+        let result = {
+            let mut stream = self
+                .network
+                .connect(self.endpoint)
+                .map_err(FirmwareHifiError::Net)?;
+            self.session.fetch_pins(&mut stream)
+        };
+
+        match result {
+            Ok(pins) => Ok(pins),
+            Err(LpecError::Protocol(::linn_lpec::Error::Remote { code, description })) => {
+                println!(
+                    "linn: pins not available (code {}: {})",
+                    code,
+                    description.as_str()
+                );
+                Err(FirmwareHifiError::Idle)
+            }
+            Err(error) => {
+                println!("linn: pins fetch failed: {:?}", error);
+                Err(FirmwareHifiError::Lpec(error))
+            }
+        }
+    }
+
+    fn mark_track_changed(&mut self) {
+        self.pending_status = None;
+        self.session.clear_track_metadata();
+    }
+}
+
+async fn apply_hifi_driver_result(
+    result: Result<Option<Event>, HifiDriverError<FirmwareHifiError>>,
+) {
+    match result {
+        Ok(Some(event)) => send_app_event(event).await,
+        Ok(None)
+        | Err(HifiDriverError::Status(RuntimeError::Hifi(FirmwareHifiError::Idle)))
+        | Err(HifiDriverError::Pins(RuntimeError::Hifi(FirmwareHifiError::Idle))) => {}
+        Err(error) => log_hifi_driver_error(error),
+    }
+}
+
+fn log_hifi_driver_error(error: HifiDriverError<FirmwareHifiError>) {
+    match error {
+        HifiDriverError::Command(RuntimeError::Hifi(error)) => {
+            log_firmware_hifi_error("command", error);
+        }
+        HifiDriverError::Status(RuntimeError::Hifi(error)) => {
+            log_firmware_hifi_error("status", error);
+        }
+        HifiDriverError::Artwork(RuntimeError::Hifi(error)) => {
+            log_firmware_hifi_error("artwork", error);
+        }
+        HifiDriverError::Pins(RuntimeError::Hifi(error)) => {
+            log_firmware_hifi_error("pins", error);
+        }
+    }
+}
+
+fn log_firmware_hifi_error(context: &str, error: FirmwareHifiError) {
+    match error {
+        FirmwareHifiError::Idle => {}
+        FirmwareHifiError::Net(error) => {
+            println!("linn: {} network error: {:?}", context, error);
+        }
+        FirmwareHifiError::Lpec(error) => {
+            println!("linn: {} protocol error: {:?}", context, error);
+        }
     }
 }
 
@@ -582,15 +694,6 @@ async fn send_app_event(event: Event) {
     FIRMWARE_EVENTS.send(FirmwareEvent::App(event)).await;
 }
 
-async fn send_hifi_status(
-    last_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
-    pending_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
-    status: HifiStatus,
-) {
-    let event = hifi_status_event(last_artwork_uri, pending_artwork_uri, status);
-    send_app_event(event).await;
-}
-
 fn firmware_config() -> AppConfig {
     let mut config = AppConfig::parse_env(LOCAL_CONFIG).unwrap_or_default();
     if let Err(error) =
@@ -599,178 +702,6 @@ fn firmware_config() -> AppConfig {
         println!("wifi: compile-time env config ignored: {:?}", error);
     }
     config
-}
-
-fn poll_linn_events(
-    network: &mut FirmwareNetwork,
-    endpoint: Endpoint,
-    session: &mut LpecSession,
-) -> Option<HifiStatus> {
-    let started_at = Instant::now();
-    let result = {
-        let mut stream = match network.connect_events(endpoint) {
-            Ok(stream) => stream,
-            Err(FirmwareNetError::ConnectTimeout | FirmwareNetError::ReadTimeout) => return None,
-            Err(error) => {
-                println!(
-                    "linn: event tcp connect failed after {}ms: {:?}",
-                    started_at.elapsed().as_millis(),
-                    error
-                );
-                return None;
-            }
-        };
-        session.poll(&mut stream)
-    };
-
-    match result {
-        Ok(Some(status)) => Some(status),
-        Ok(None) | Err(LpecError::Connect(FirmwareNetError::ReadTimeout)) => None,
-        Err(error) => {
-            println!("linn: session poll failed: {:?}", error);
-            session.reset();
-            network.reset_lpec();
-            None
-        }
-    }
-}
-
-fn fetch_linn_pins(
-    network: &mut FirmwareNetwork,
-    endpoint: Endpoint,
-    session: &mut LpecSession,
-) -> Option<HifiPins> {
-    let mut stream = match network.connect(endpoint) {
-        Ok(stream) => stream,
-        Err(error) => {
-            println!("linn: pins tcp connect failed: {:?}", error);
-            return None;
-        }
-    };
-    match session.fetch_pins(&mut stream) {
-        Ok(pins) => Some(pins),
-        Err(LpecError::Protocol(::linn_lpec::Error::Remote { code, description })) => {
-            // Receiver said no — connection is still healthy, don't reset
-            // (resetting would tear down the status/volume subscription).
-            println!(
-                "linn: pins not available (code {}: {})",
-                code,
-                description.as_str()
-            );
-            None
-        }
-        Err(error) => {
-            println!("linn: pins fetch transport error: {:?}", error);
-            None
-        }
-    }
-}
-
-fn handle_linn_command(
-    network: &mut FirmwareNetwork,
-    endpoint: Endpoint,
-    session: &mut LpecSession,
-    command: HifiCommand,
-) -> Option<HifiStatus> {
-    println!("linn: command {:?}", command);
-    let result = {
-        let mut stream = match network.connect(endpoint) {
-            Ok(stream) => stream,
-            Err(error) => {
-                println!("linn: command tcp connect failed: {:?}", error);
-                return None;
-            }
-        };
-        session.handle_command(&mut stream, command)
-    };
-
-    match result {
-        Ok(Some(status)) => {
-            println!("linn: command sent");
-            Some(status)
-        }
-        Ok(None) => {
-            println!("linn: command sent");
-            None
-        }
-        Err(error) => {
-            println!("linn: command failed: {:?}", error);
-            session.reset();
-            network.reset_lpec();
-            None
-        }
-    }
-}
-
-fn hifi_status_event(
-    last_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
-    pending_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
-    status: HifiStatus,
-) -> Event {
-    let artwork_uri = status.album_art_uri.clone();
-    let should_load_artwork =
-        status.playback == PlaybackState::Playing && !artwork_uri.as_str().is_empty();
-
-    if should_load_artwork
-        && last_artwork_uri.as_str() != artwork_uri.as_str()
-        && pending_artwork_uri.as_str() != artwork_uri.as_str()
-    {
-        pending_artwork_uri.clear();
-        let _ = pending_artwork_uri.push_str(artwork_uri.as_str());
-    } else if artwork_uri.as_str().is_empty() {
-        last_artwork_uri.clear();
-        pending_artwork_uri.clear();
-    }
-
-    Event::HifiStatus(status)
-}
-
-fn load_pending_hifi_artwork(
-    network: &mut FirmwareNetwork,
-    last_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
-    pending_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
-    http_buffer: &mut [u8],
-    decode_buffer: &mut [u8],
-    artwork_pool: &mut ArtworkPool,
-) -> Option<HifiArtwork> {
-    if pending_artwork_uri.is_empty() {
-        return None;
-    };
-
-    let mut uri = heapless::String::<HIFI_URI_LEN>::new();
-    let _ = uri.push_str(pending_artwork_uri.as_str());
-    pending_artwork_uri.clear();
-    load_hifi_artwork(
-        network,
-        last_artwork_uri,
-        uri.as_str(),
-        http_buffer,
-        decode_buffer,
-        artwork_pool,
-    )
-}
-
-fn load_hifi_artwork(
-    network: &mut FirmwareNetwork,
-    last_artwork_uri: &mut heapless::String<HIFI_URI_LEN>,
-    uri: &str,
-    http_buffer: &mut [u8],
-    decode_buffer: &mut [u8],
-    artwork_pool: &mut ArtworkPool,
-) -> Option<HifiArtwork> {
-    last_artwork_uri.clear();
-    let _ = last_artwork_uri.push_str(uri);
-    println!("linn: artwork load {}", uri);
-
-    let pixels = artwork_pool.acquire();
-
-    match load_artwork_with_buffers_into(network, uri, http_buffer, decode_buffer, pixels) {
-        Ok(artwork) => Some(artwork),
-        Err(error) => {
-            println!("linn: artwork failed: {:?}", error);
-            None
-        }
-    }
 }
 
 async fn scan_configured_access_point(

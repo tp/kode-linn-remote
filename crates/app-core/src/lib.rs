@@ -454,6 +454,14 @@ mod tests {
         touch_point(ui::hifi_play_button_center())
     }
 
+    fn hifi_previous_touch() -> TouchPoint {
+        touch_point(ui::hifi_previous_button_center())
+    }
+
+    fn hifi_next_touch() -> TouchPoint {
+        touch_point(ui::hifi_next_button_center())
+    }
+
     fn hifi_pin_slot_touch(slot: usize) -> TouchPoint {
         touch_point(ui::hifi_pin_slot_center(slot))
     }
@@ -739,6 +747,21 @@ mod tests {
             outcome.command,
             Some(Command::Hifi(HifiCommand::TogglePlayback))
         );
+    }
+
+    #[test]
+    fn hifi_track_touches_request_track_commands() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        app.update(Event::HifiStatus(hifi_status(PlaybackState::Playing)));
+
+        let previous = app.update(Event::TouchDown(hifi_previous_touch()));
+        let next = app.update(Event::TouchDown(hifi_next_touch()));
+
+        assert_eq!(
+            previous.command,
+            Some(Command::Hifi(HifiCommand::PreviousTrack))
+        );
+        assert_eq!(next.command, Some(Command::Hifi(HifiCommand::NextTrack)));
     }
 
     #[test]

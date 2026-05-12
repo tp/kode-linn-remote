@@ -4,6 +4,7 @@ extern crate alloc;
 
 use app_core::{Command, HifiArtwork, HifiCommand, HifiPins, HifiStatus};
 
+pub mod hifi;
 #[cfg(feature = "std")]
 pub mod host_tcp;
 pub mod lpec;
@@ -21,6 +22,7 @@ pub trait HifiController {
     fn status(&mut self) -> Result<HifiStatus, Self::Error>;
     fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error>;
     fn pins(&mut self) -> Result<HifiPins, Self::Error>;
+    fn mark_track_changed(&mut self) {}
 }
 
 #[derive(Debug)]
@@ -35,6 +37,10 @@ impl<Hifi> AppRuntime<Hifi> {
 
     pub fn into_hifi(self) -> Hifi {
         self.hifi
+    }
+
+    pub fn hifi_mut(&mut self) -> &mut Hifi {
+        &mut self.hifi
     }
 }
 
@@ -107,6 +113,23 @@ mod tests {
         assert_eq!(
             runtime.into_hifi().commands.as_slice(),
             [HifiCommand::TogglePlayback]
+        );
+    }
+
+    #[test]
+    fn dispatches_hifi_track_commands_to_controller() {
+        let mut runtime = AppRuntime::new(FakeHifi::default());
+
+        runtime
+            .handle_command(Command::Hifi(HifiCommand::PreviousTrack))
+            .unwrap();
+        runtime
+            .handle_command(Command::Hifi(HifiCommand::NextTrack))
+            .unwrap();
+
+        assert_eq!(
+            runtime.into_hifi().commands.as_slice(),
+            [HifiCommand::PreviousTrack, HifiCommand::NextTrack]
         );
     }
 

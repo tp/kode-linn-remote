@@ -32,6 +32,8 @@ const ARTIST_TOP: i32 = 56;
 const TEXT_BAND_HEIGHT: u32 = 40;
 const PLAY_SIZE: u32 = 104;
 const PLAY_CENTER_Y: i32 = 142;
+const TRACK_BUTTON_SIZE: u32 = 64;
+const TRACK_BUTTON_GAP: i32 = 24;
 const TIMER_TOP: i32 = 218;
 const PROGRESS_TOP: i32 = 274;
 const PROGRESS_WIDTH: u32 = 294;
@@ -117,7 +119,9 @@ pub(super) struct StatusLayout {
     pub(super) song_origin: Point,
     pub(super) artist_band: Rectangle,
     pub(super) artist_origin: Point,
+    pub(super) previous_button: Rectangle,
     pub(super) play_button: Rectangle,
+    pub(super) next_button: Rectangle,
     pub(super) timer_origin: Point,
     pub(super) timer_bounds: Rectangle,
     pub(super) progress: Rectangle,
@@ -176,6 +180,7 @@ struct StatusCache {
     artist_overflow_px: u32,
     artist_anim_base_ms: u64,
     artist_marquee_offset_px: Option<i32>,
+    transport_controls_drawn: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
@@ -194,7 +199,9 @@ struct VolumeCache {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action {
+    PreviousTrack,
     TogglePlayback,
+    NextTrack,
     InvokePinSlot(usize),
     VolumeDelta(i16),
 }
@@ -202,7 +209,9 @@ enum Action {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
     InvokePinId { id: u32 },
+    PreviousTrack,
     TogglePlayback,
+    NextTrack,
     SetVolume { volume: u8 },
 }
 
@@ -351,6 +360,10 @@ impl State {
 
     fn handle(&mut self, action: Action, uptime_ms: u64) -> Option<Command> {
         match action {
+            Action::PreviousTrack => {
+                self.clear_current_track();
+                Some(Command::PreviousTrack)
+            }
             Action::TogglePlayback => {
                 if playback_can_pause(self.status.playback) {
                     self.on_tick(uptime_ms);
@@ -362,6 +375,10 @@ impl State {
                     self.status.playback = PlaybackState::Playing;
                 }
                 Some(Command::TogglePlayback)
+            }
+            Action::NextTrack => {
+                self.clear_current_track();
+                Some(Command::NextTrack)
             }
             Action::InvokePinSlot(slot) => {
                 let pin = self.pins.get(slot)?;
@@ -377,6 +394,17 @@ impl State {
                 Some(Command::SetVolume { volume: next })
             }
         }
+    }
+
+    fn clear_current_track(&mut self) {
+        self.status.title.clear();
+        self.status.artist.clear();
+        self.status.album.clear();
+        self.status.album_art_uri.clear();
+        self.status.elapsed_seconds = 0;
+        self.status.duration_seconds = 0;
+        self.status.playback = PlaybackState::Buffering;
+        self.artwork = None;
     }
 }
 
@@ -402,6 +430,25 @@ pub(crate) fn layout(bounds: Rectangle) -> Layout {
 
 fn status_layout(body: &Rectangle, center_x: i32) -> StatusLayout {
     let play_center = Point::new(center_x, body.top_left.y + PLAY_CENTER_Y);
+    let play_button = Rectangle::new(
+        play_center - Point::new((PLAY_SIZE / 2) as i32, (PLAY_SIZE / 2) as i32),
+        Size::new(PLAY_SIZE, PLAY_SIZE),
+    );
+    let track_button_top = play_center.y - (TRACK_BUTTON_SIZE / 2) as i32;
+    let previous_button = Rectangle::new(
+        Point::new(
+            play_button.top_left.x - TRACK_BUTTON_GAP - TRACK_BUTTON_SIZE as i32,
+            track_button_top,
+        ),
+        Size::new(TRACK_BUTTON_SIZE, TRACK_BUTTON_SIZE),
+    );
+    let next_button = Rectangle::new(
+        Point::new(
+            play_button.top_left.x + play_button.size.width as i32 + TRACK_BUTTON_GAP,
+            track_button_top,
+        ),
+        Size::new(TRACK_BUTTON_SIZE, TRACK_BUTTON_SIZE),
+    );
     let song_band = Rectangle::new(
         Point::new(body.top_left.x, body.top_left.y + SONG_TOP),
         Size::new(body.size.width, TEXT_BAND_HEIGHT),
@@ -430,10 +477,9 @@ fn status_layout(body: &Rectangle, center_x: i32) -> StatusLayout {
         song_origin: Point::new(center_x, body.top_left.y + SONG_TOP),
         artist_band,
         artist_origin: Point::new(center_x, body.top_left.y + ARTIST_TOP),
-        play_button: Rectangle::new(
-            play_center - Point::new((PLAY_SIZE / 2) as i32, (PLAY_SIZE / 2) as i32),
-            Size::new(PLAY_SIZE, PLAY_SIZE),
-        ),
+        previous_button,
+        play_button,
+        next_button,
         timer_origin,
         timer_bounds,
         progress,
@@ -509,8 +555,12 @@ fn rect_bottom(rect: Rectangle) -> i32 {
 }
 
 fn hit_test_status(layout: &StatusLayout, point: Point) -> Option<Action> {
-    if layout.play_button.contains(point) {
+    if layout.previous_button.contains(point) {
+        Some(Action::PreviousTrack)
+    } else if layout.play_button.contains(point) {
         Some(Action::TogglePlayback)
+    } else if layout.next_button.contains(point) {
+        Some(Action::NextTrack)
     } else {
         None
     }
@@ -637,6 +687,22 @@ where
         state.status_cache.duration_seconds = None;
         state.status_cache.progress_filled_px = None;
         state.status_cache.loading_visible = false;
+    }
+
+    if !state.status_cache.transport_controls_drawn {
+        draw_transport_button(
+            painter.display(),
+            ui_layout.previous_button,
+            "<<",
+            ButtonTone::Stop,
+        )?;
+        draw_transport_button(
+            painter.display(),
+            ui_layout.next_button,
+            ">>",
+            ButtonTone::Start,
+        )?;
+        state.status_cache.transport_controls_drawn = true;
     }
 
     match play_kind {
@@ -776,6 +842,22 @@ where
 
     state.status_cache.has_rendered = true;
     Ok(())
+}
+
+fn draw_transport_button<D>(
+    display: &mut D,
+    rect: Rectangle,
+    label: &str,
+    tone: ButtonTone,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    match draw_button(display, rect, label, true, tone) {
+        Ok(()) => Ok(()),
+        Err(RenderError::Draw(error)) => Err(RenderError::Draw(error)),
+        Err(RenderError::TextFormat) => Ok(()),
+    }
 }
 
 fn render_pins<D>(
@@ -959,6 +1041,16 @@ fn progress_filled_px(elapsed: u32, duration: u32) -> u32 {
 #[cfg(test)]
 pub(crate) fn play_button_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
     layout(bounds).status.play_button.center()
+}
+
+#[cfg(test)]
+pub(crate) fn previous_button_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
+    layout(bounds).status.previous_button.center()
+}
+
+#[cfg(test)]
+pub(crate) fn next_button_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
+    layout(bounds).status.next_button.center()
 }
 
 #[cfg(test)]
@@ -1440,9 +1532,66 @@ mod tests {
         let ui_layout = layout(SCREEN_BOUNDS);
 
         assert_eq!(
+            hit_test_status(&ui_layout.status, ui_layout.status.previous_button.center()),
+            Some(Action::PreviousTrack)
+        );
+        assert_eq!(
             hit_test_status(&ui_layout.status, ui_layout.status.play_button.center()),
             Some(Action::TogglePlayback)
         );
+        assert_eq!(
+            hit_test_status(&ui_layout.status, ui_layout.status.next_button.center()),
+            Some(Action::NextTrack)
+        );
+    }
+
+    #[test]
+    fn status_page_track_buttons_emit_commands() {
+        let ui_layout = layout(SCREEN_BOUNDS);
+        let mut state = State::new(0);
+
+        assert_eq!(
+            state.handle_touch(&ui_layout, ui_layout.status.previous_button.center(), 100),
+            Some(Command::PreviousTrack)
+        );
+        assert_eq!(
+            state.handle_touch(&ui_layout, ui_layout.status.next_button.center(), 100),
+            Some(Command::NextTrack)
+        );
+    }
+
+    #[test]
+    fn track_buttons_clear_local_current_track() {
+        let ui_layout = layout(SCREEN_BOUNDS);
+        let mut state = State::new(0);
+        let mut status = HifiStatus::empty();
+        status.title.push_str("Old title").unwrap();
+        status.artist.push_str("Old artist").unwrap();
+        status.album.push_str("Old album").unwrap();
+        status.album_art_uri.push_str("http://art/old.jpg").unwrap();
+        status.elapsed_seconds = 42;
+        status.duration_seconds = 180;
+        status.volume_percent = 37;
+        status.playback = PlaybackState::Playing;
+        state.apply_status(status, 0);
+        let mut artwork = HifiArtwork::new("http://art/old.jpg").unwrap();
+        while artwork.push_pixel(Rgb565::WHITE) {}
+        assert!(state.apply_artwork(artwork));
+
+        assert_eq!(
+            state.handle_touch(&ui_layout, ui_layout.status.next_button.center(), 100),
+            Some(Command::NextTrack)
+        );
+
+        assert!(state.status.title.is_empty());
+        assert!(state.status.artist.is_empty());
+        assert!(state.status.album.is_empty());
+        assert!(state.status.album_art_uri.is_empty());
+        assert_eq!(state.status.elapsed_seconds, 0);
+        assert_eq!(state.status.duration_seconds, 0);
+        assert_eq!(state.status.volume_percent, 37);
+        assert_eq!(state.status.playback, PlaybackState::Buffering);
+        assert!(state.artwork.is_none());
     }
 
     #[test]
@@ -1562,9 +1711,16 @@ mod tests {
 
         assert_contains_rect(ui_layout.status.body, ui_layout.status.song_band);
         assert_contains_rect(ui_layout.status.body, ui_layout.status.artist_band);
+        assert_contains_rect(ui_layout.status.body, ui_layout.status.previous_button);
         assert_contains_rect(ui_layout.status.body, ui_layout.status.play_button);
+        assert_contains_rect(ui_layout.status.body, ui_layout.status.next_button);
         assert_contains_rect(ui_layout.status.body, ui_layout.status.timer_bounds);
         assert_contains_rect(ui_layout.status.body, ui_layout.status.progress);
+        assert_no_overlap(
+            ui_layout.status.previous_button,
+            ui_layout.status.play_button,
+        );
+        assert_no_overlap(ui_layout.status.play_button, ui_layout.status.next_button);
 
         for button in &ui_layout.pins.buttons {
             assert_contains_rect(ui_layout.pins.body, *button);

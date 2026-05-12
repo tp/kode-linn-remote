@@ -265,6 +265,14 @@ impl TcpConnector for FirmwareNetwork {
         FirmwareNetwork::connect(self, endpoint)
     }
 
+    fn connect_events(&mut self, endpoint: Endpoint) -> Result<Self::Stream<'_>, Self::Error> {
+        FirmwareNetwork::connect_events(self, endpoint)
+    }
+
+    fn reset(&mut self, _endpoint: Endpoint) {
+        self.reset_lpec();
+    }
+
     fn connect_host(&mut self, host: &str, port: u16) -> Result<Self::Stream<'_>, Self::Error> {
         let address = self.resolve_ipv4(host)?;
         let remote = IpEndpoint::new(IpAddress::Ipv4(address), port);
@@ -308,6 +316,10 @@ impl ByteStream for FirmwareTcpStream<'_> {
             Ok(Err(_)) => Err(FirmwareNetError::FlushFailed),
             Err(Timeout) => Err(FirmwareNetError::FlushTimeout),
         }
+    }
+
+    fn is_read_timeout(error: &Self::Error) -> bool {
+        matches!(error, FirmwareNetError::ReadTimeout)
     }
 }
 

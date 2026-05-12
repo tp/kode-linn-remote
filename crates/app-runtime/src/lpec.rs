@@ -54,6 +54,15 @@ use crate::{
 const MAX_ARTWORK_BYTES: usize = 128 * 1024;
 const MAX_HTTP_HEADER_BYTES: usize = 8 * 1024;
 const SESSION_ACTION_LINE_BUDGET: usize = 16;
+/// Upper bound on event lines drained from a single `poll()`. Stops a misbehaving
+/// device from holding the worker thread indefinitely.
+const SESSION_POLL_LINE_BUDGET: usize = 32;
+/// Consecutive `is_read_timeout` errors tolerated immediately after subscribing
+/// before giving up on the initial event burst. Each tolerated timeout is one
+/// read-timeout window (see `event_read_timeout` on the connector); the device
+/// pushes initial-state events for every subscribed service, but the burst may
+/// not have started by the time the first read fires.
+const SESSION_SUBSCRIBE_PATIENCE: usize = 10;
 pub const ARTWORK_HTTP_BUFFER_BYTES: usize = 32 * 1024;
 pub const ARTWORK_DECODE_BUFFER_BYTES: usize = 36 * 1024;
 
@@ -137,6 +146,109 @@ where
     endpoint: Endpoint,
 }
 
+#[derive(Debug)]
+pub struct LpecSessionHifi<C>
+where
+    C: TcpConnector,
+{
+    connector: C,
+    endpoint: Endpoint,
+    session: LpecSession,
+    pending_status: Option<HifiStatus>,
+}
+
+impl<C> LpecSessionHifi<C>
+where
+    C: TcpConnector,
+{
+    pub fn new(connector: C, endpoint: Endpoint) -> Self {
+        Self {
+            connector,
+            endpoint,
+            session: LpecSession::new(),
+            pending_status: None,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.session.reset();
+        self.connector.reset(self.endpoint);
+    }
+
+    pub fn into_connector(self) -> C {
+        self.connector
+    }
+}
+
+impl<C> HifiController for LpecSessionHifi<C>
+where
+    C: TcpConnector,
+{
+    type Error = Error<C::Error>;
+
+    fn handle_command(&mut self, command: HifiCommand) -> Result<(), Self::Error> {
+        let result = {
+            let mut stream = self
+                .connector
+                .connect(self.endpoint)
+                .map_err(Error::Connect)?;
+            self.session.handle_command(&mut stream, command)
+        };
+
+        match result {
+            Ok(status) => {
+                self.pending_status = status;
+                Ok(())
+            }
+            Err(error) => {
+                self.reset();
+                Err(error)
+            }
+        }
+    }
+
+    fn status(&mut self) -> Result<HifiStatus, Self::Error> {
+        if let Some(status) = self.pending_status.take() {
+            return Ok(status);
+        }
+
+        let result = {
+            let mut stream = self
+                .connector
+                .connect_events(self.endpoint)
+                .map_err(Error::Connect)?;
+            self.session.poll(&mut stream)
+        };
+
+        match result {
+            Ok(Some(status)) => Ok(status),
+            Ok(None) => self.session.live_status().ok_or(Error::StatusUnavailable),
+            Err(Error::Connect(error)) => self.session.live_status().ok_or(Error::Connect(error)),
+            Err(error) => {
+                self.reset();
+                Err(error)
+            }
+        }
+    }
+
+    fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error> {
+        load_artwork(&mut self.connector, uri)
+    }
+
+    fn pins(&mut self) -> Result<HifiPins, Self::Error> {
+        let mut stream = self
+            .connector
+            .connect(self.endpoint)
+            .map_err(Error::Connect)?;
+        self.session.fetch_pins(&mut stream)
+    }
+
+    fn mark_track_changed(&mut self) {
+        self.pending_status = None;
+        self.session.clear_track_metadata();
+    }
+}
+
 impl<C> LpecHifi<C>
 where
     C: TcpConnector,
@@ -157,8 +269,7 @@ where
             .connector
             .connect(self.endpoint)
             .map_err(Error::Connect)?;
-        let transport = LpecTransport::new(stream).sync()?;
-        Ok(LinnClient::new(transport))
+        Ok(LinnClient::new(LpecTransport::new(stream)))
     }
 
     fn invoke_pin_id(&mut self, id: u32) -> Result<(), Error<C::Error>> {
@@ -193,6 +304,20 @@ where
         }
     }
 
+    fn previous_track(&mut self) -> Result<(), Error<C::Error>> {
+        self.client()?
+            .action(linn_lpec::playlist_previous())
+            .map(|_| ())
+            .map_err(map_client_error)
+    }
+
+    fn next_track(&mut self) -> Result<(), Error<C::Error>> {
+        self.client()?
+            .action(linn_lpec::playlist_next())
+            .map(|_| ())
+            .map_err(map_client_error)
+    }
+
     pub fn fetch_pins(&mut self) -> Result<HifiPins, Error<C::Error>> {
         let mut client = self.client()?;
         fetch_pins(&mut client)
@@ -208,7 +333,9 @@ where
     fn handle_command(&mut self, command: HifiCommand) -> Result<(), Self::Error> {
         match command {
             HifiCommand::InvokePinId { id } => self.invoke_pin_id(id),
+            HifiCommand::PreviousTrack => self.previous_track(),
             HifiCommand::TogglePlayback => self.toggle_playback(),
+            HifiCommand::NextTrack => self.next_track(),
             HifiCommand::SetVolume { volume } => self.set_volume(volume),
         }
     }
@@ -233,6 +360,9 @@ where
     let mut client = LinnClient::new(LpecTransport::new(stream).sync()?);
     match command {
         HifiCommand::InvokePinId { id } => invoke_pin_id(&mut client, id),
+        HifiCommand::PreviousTrack => {
+            action_with_retry(&mut client, linn_lpec::playlist_previous()).map(|_| ())
+        }
         HifiCommand::TogglePlayback => {
             let playback = read_playback_state(&mut client)?;
             if playback_can_pause(playback) {
@@ -240,6 +370,9 @@ where
             } else {
                 action_with_retry(&mut client, linn_lpec::playlist_play()).map(|_| ())
             }
+        }
+        HifiCommand::NextTrack => {
+            action_with_retry(&mut client, linn_lpec::playlist_next()).map(|_| ())
         }
         HifiCommand::SetVolume { volume } => {
             let clamped = volume.min(HIFI_VOLUME_MAX);
@@ -356,19 +489,66 @@ impl LpecSession {
         self.subscribed = false;
     }
 
+    /// Clear track-derived fields (title, artist, album, art, durations) so a
+    /// new track loads cleanly. Volume and playback state are preserved because
+    /// they come from their own subscriptions (`Ds/Volume`, `Ds/Info`'s
+    /// `TransportState`) and the device only re-emits them when they actually
+    /// change.
+    pub fn clear_track_metadata(&mut self) {
+        self.status.title.clear();
+        self.status.artist.clear();
+        self.status.album.clear();
+        self.status.album_art_uri.clear();
+        self.status.elapsed_seconds = 0;
+        self.status.duration_seconds = 0;
+    }
+
     pub fn live_status(&self) -> Option<HifiStatus> {
-        self.changed_status(true)
+        if status_has_live_content(&self.status) {
+            Some(self.status.clone())
+        } else {
+            None
+        }
     }
 
     pub fn poll<S>(&mut self, stream: &mut S) -> Result<Option<HifiStatus>, Error<S::Error>>
     where
         S: ByteStream,
     {
-        self.ensure_subscribed(stream)?;
+        let just_subscribed = self.ensure_subscribed(stream)?;
 
-        let line = read_lpec_line(stream)?;
-        let message = linn_lpec::parse_message(line.as_str()).map_err(Error::Protocol)?;
-        let changed = self.handle_message(message);
+        let mut changed = false;
+        let mut lines_read = 0_usize;
+        let mut consecutive_timeouts = 0_usize;
+
+        while lines_read < SESSION_POLL_LINE_BUDGET {
+            match read_lpec_line(stream) {
+                Ok(line) => {
+                    lines_read += 1;
+                    consecutive_timeouts = 0;
+                    let message =
+                        linn_lpec::parse_message(line.as_str()).map_err(Error::Protocol)?;
+                    changed |= self.handle_message(message);
+                }
+                Err(Error::Connect(error)) if S::is_read_timeout(&error) => {
+                    consecutive_timeouts += 1;
+                    // Right after subscribing the device may not have started
+                    // emitting initial-state events yet — wait a few timeout
+                    // windows for the burst. Once we've read at least one line,
+                    // a single timeout means the buffer is drained.
+                    let limit = if just_subscribed && lines_read == 0 {
+                        SESSION_SUBSCRIBE_PATIENCE
+                    } else {
+                        1
+                    };
+                    if consecutive_timeouts >= limit {
+                        break;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
         Ok(self.changed_status(changed))
     }
 
@@ -392,6 +572,9 @@ impl LpecSession {
                     .action(stream, linn_lpec::invoke_pin_arg(&pin_arg))?
                     .changed;
             }
+            HifiCommand::PreviousTrack => {
+                changed |= self.action(stream, linn_lpec::playlist_previous())?.changed;
+            }
             HifiCommand::SetVolume { volume } => {
                 let clamped = volume.min(HIFI_VOLUME_MAX);
                 let mut volume_arg = heapless::String::<3>::new();
@@ -403,6 +586,9 @@ impl LpecSession {
                     self.status.volume_percent = clamped;
                     changed = true;
                 }
+            }
+            HifiCommand::NextTrack => {
+                changed |= self.action(stream, linn_lpec::playlist_next())?.changed;
             }
             HifiCommand::TogglePlayback => {
                 let playback = if self.status.playback == PlaybackState::Unknown {
@@ -463,16 +649,20 @@ impl LpecSession {
         Ok(pins)
     }
 
-    fn ensure_subscribed<S>(&mut self, stream: &mut S) -> Result<(), Error<S::Error>>
+    /// Returns `true` if this call performed the SUBSCRIBE handshake, `false`
+    /// if the session was already subscribed. Used by `poll` to grant extra
+    /// patience on the initial event burst.
+    fn ensure_subscribed<S>(&mut self, stream: &mut S) -> Result<bool, Error<S::Error>>
     where
         S: ByteStream,
     {
         if self.subscribed {
-            return Ok(());
+            return Ok(false);
         }
 
         write_lpec_line(stream, "")?;
         for service in [
+            linn_lpec::Service::Playlist,
             linn_lpec::Service::Time,
             linn_lpec::Service::Info,
             linn_lpec::Service::Volume,
@@ -481,7 +671,7 @@ impl LpecSession {
             write_lpec_line(stream, line.as_str())?;
         }
         self.subscribed = true;
-        Ok(())
+        Ok(true)
     }
 
     fn action<S>(
@@ -2018,7 +2208,6 @@ mod tests {
         let mut stream =
             ScriptedByteStream::new(&[r#"EVENT 1 0 Duration "180""#, r#"EVENT 1 1 Seconds "2""#]);
 
-        assert!(session.poll(&mut stream).unwrap().is_some());
         let status = session.poll(&mut stream).unwrap().unwrap();
 
         assert_eq!(status.elapsed_seconds, 2);
@@ -2153,6 +2342,12 @@ mod tests {
 
         fn flush(&mut self) -> Result<(), Self::Error> {
             Ok(())
+        }
+
+        fn is_read_timeout(_error: &Self::Error) -> bool {
+            // Tests use the unit error solely to mean "no more scripted bytes,"
+            // which is the same drain-complete signal as a real read timeout.
+            true
         }
     }
 

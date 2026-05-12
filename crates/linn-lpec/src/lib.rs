@@ -185,6 +185,14 @@ pub fn playlist_pause() -> Action<'static> {
     Action::new(Service::Playlist, 1, "Pause", &[])
 }
 
+pub fn playlist_next() -> Action<'static> {
+    Action::new(Service::Playlist, 1, "Next", &[])
+}
+
+pub fn playlist_previous() -> Action<'static> {
+    Action::new(Service::Playlist, 1, "Previous", &[])
+}
+
 pub fn info_metatext() -> Action<'static> {
     Action::new(Service::Info, 1, "Metatext", &[])
 }
@@ -499,6 +507,14 @@ where
         self.action(playlist_pause()).map(|_| ())
     }
 
+    pub fn playlist_next(&mut self) -> Result<(), Error<T::Error>> {
+        self.action(playlist_next()).map(|_| ())
+    }
+
+    pub fn playlist_previous(&mut self) -> Result<(), Error<T::Error>> {
+        self.action(playlist_previous()).map(|_| ())
+    }
+
     pub fn volume(&mut self) -> Result<u8, Error<T::Error>> {
         let args = self.action(get_volume())?;
         let volume = args.first().ok_or(Error::InvalidMessage)?;
@@ -795,6 +811,14 @@ mod tests {
         assert_eq!(
             format_action(playlist_pause()).unwrap().as_str(),
             "ACTION Ds/Playlist 1 Pause"
+        );
+        assert_eq!(
+            format_action(playlist_next()).unwrap().as_str(),
+            "ACTION Ds/Playlist 1 Next"
+        );
+        assert_eq!(
+            format_action(playlist_previous()).unwrap().as_str(),
+            "ACTION Ds/Playlist 1 Previous"
         );
     }
 

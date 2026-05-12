@@ -3,17 +3,26 @@
 use std::{
     cell::{Cell, OnceCell, RefCell},
     convert::Infallible,
-    sync::mpsc::{self, Receiver, Sender, TryRecvError},
-    thread,
+    sync::mpsc::TryRecvError,
     time::Instant,
 };
 
 use app_config::AppConfig;
 use app_core::{
-    App, Command, DISPLAY_SIZE, Event, NetworkStatus, PlaybackState, RECOMMENDED_SCRATCH_PIXELS,
-    Screen, TouchPoint,
+    App, Command, DISPLAY_SIZE, Event, NetworkStatus, RECOMMENDED_SCRATCH_PIXELS, Screen,
+    TouchPoint,
 };
-use app_runtime::{AppRuntime, host_tcp::HostTcpConnector, lpec::LpecHifi};
+use app_runtime::{
+    hifi::{
+        HifiDriver,
+        worker::{
+            self as runtime_worker, Request as RuntimeWorkerRequest,
+            Response as RuntimeWorkerResponse, Worker as RuntimeWorker,
+        },
+    },
+    host_tcp::HostTcpConnector,
+    lpec::{Error as LpecError, LpecSessionHifi},
+};
 use embedded_graphics::{
     Pixel,
     draw_target::DrawTarget,
@@ -46,6 +55,15 @@ const BUTTON_WIDTH: f64 = 178.0;
 const BUTTON_HEIGHT: f64 = 32.0;
 const BUTTON_SPACING: f64 = 44.0;
 const HIFI_STATUS_POLL_MS: u64 = 2_000;
+
+type SimHifiError = LpecError<std::io::Error>;
+
+fn start_runtime_worker() -> RuntimeWorker<SimHifiError> {
+    let endpoint = AppConfig::load_local_or_default().linn_lpec_endpoint;
+    let hifi = LpecSessionHifi::new(HostTcpConnector::new(), endpoint);
+    let command_hifi = LpecSessionHifi::new(HostTcpConnector::new(), endpoint);
+    runtime_worker::start(HifiDriver::new(hifi, HIFI_STATUS_POLL_MS), command_hifi)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DisplayShape {
@@ -203,83 +221,6 @@ impl OriginDimensions for Framebuffer {
 }
 
 #[derive(Debug)]
-enum HifiWorkerRequest {
-    Command(Command),
-    Status,
-    Artwork(String),
-    Pins,
-}
-
-#[derive(Debug)]
-enum HifiWorkerResponse {
-    CommandFailed(String),
-    Status(Result<app_core::HifiStatus, String>),
-    Artwork {
-        uri: String,
-        result: Result<app_core::HifiArtwork, String>,
-    },
-    Pins(Result<app_core::HifiPins, String>),
-}
-
-#[derive(Debug)]
-struct HifiWorker {
-    requests: Sender<HifiWorkerRequest>,
-    responses: Receiver<HifiWorkerResponse>,
-}
-
-impl HifiWorker {
-    fn start() -> Self {
-        let (requests_tx, requests_rx) = mpsc::channel();
-        let (responses_tx, responses_rx) = mpsc::channel();
-
-        thread::spawn(move || {
-            let endpoint = AppConfig::load_local_or_default().linn_lpec_endpoint;
-            let mut runtime = AppRuntime::new(LpecHifi::new(HostTcpConnector::new(), endpoint));
-
-            while let Ok(request) = requests_rx.recv() {
-                match request {
-                    HifiWorkerRequest::Command(command) => match runtime.handle_command(command) {
-                        Ok(()) => {
-                            let result =
-                                runtime.hifi_status().map_err(|error| format!("{error:?}"));
-                            let _ = responses_tx.send(HifiWorkerResponse::Status(result));
-                        }
-                        Err(error) => {
-                            let _ = responses_tx
-                                .send(HifiWorkerResponse::CommandFailed(format!("{error:?}")));
-                        }
-                    },
-                    HifiWorkerRequest::Status => {
-                        let result = runtime.hifi_status().map_err(|error| format!("{error:?}"));
-                        let _ = responses_tx.send(HifiWorkerResponse::Status(result));
-                    }
-                    HifiWorkerRequest::Artwork(uri) => {
-                        let result = runtime
-                            .hifi_artwork(&uri)
-                            .map_err(|error| format!("{error:?}"));
-                        let _ = responses_tx.send(HifiWorkerResponse::Artwork { uri, result });
-                    }
-                    HifiWorkerRequest::Pins => {
-                        let responses_tx = responses_tx.clone();
-                        thread::spawn(move || {
-                            let mut runtime =
-                                AppRuntime::new(LpecHifi::new(HostTcpConnector::new(), endpoint));
-                            let result = runtime.hifi_pins().map_err(|error| format!("{error:?}"));
-                            let _ = responses_tx.send(HifiWorkerResponse::Pins(result));
-                        });
-                    }
-                }
-            }
-        });
-
-        Self {
-            requests: requests_tx,
-            responses: responses_rx,
-        }
-    }
-}
-
-#[derive(Debug)]
 struct NativeSimulator {
     app: App,
     app_framebuffer: Framebuffer,
@@ -288,15 +229,9 @@ struct NativeSimulator {
     app_frame_dirty: bool,
     output_frame_dirty: bool,
     display_shape: DisplayShape,
-    hifi_worker: HifiWorker,
+    runtime_worker: RuntimeWorker<SimHifiError>,
     started_at: Instant,
     manual_time_offset_ms: u64,
-    last_hifi_status_poll_ms: u64,
-    last_hifi_artwork_uri: Option<String>,
-    hifi_status_in_flight: bool,
-    hifi_artwork_in_flight: Option<String>,
-    hifi_pins_loaded: bool,
-    hifi_pins_in_flight: bool,
     tap_highlight: Option<TapHighlight>,
     render_stats: RenderStats,
 }
@@ -314,15 +249,9 @@ impl NativeSimulator {
             app_frame_dirty: true,
             output_frame_dirty: true,
             display_shape: DisplayShape::Circle,
-            hifi_worker: HifiWorker::start(),
+            runtime_worker: start_runtime_worker(),
             started_at: Instant::now(),
             manual_time_offset_ms: 0,
-            last_hifi_status_poll_ms: 0,
-            last_hifi_artwork_uri: None,
-            hifi_status_in_flight: false,
-            hifi_artwork_in_flight: None,
-            hifi_pins_loaded: false,
-            hifi_pins_in_flight: false,
             tap_highlight: None,
             render_stats: RenderStats::new(),
         }
@@ -338,13 +267,14 @@ impl NativeSimulator {
             self.output_frame_dirty = true;
             self.render_stats.record_core_request();
         }
+        self.sync_runtime_screen();
     }
 
     fn handle_command(&mut self, command: Command) {
+        let Command::Hifi(command) = command;
         if let Err(error) = self
-            .hifi_worker
-            .requests
-            .send(HifiWorkerRequest::Command(command))
+            .runtime_worker
+            .send(RuntimeWorkerRequest::Command(command))
         {
             eprintln!("failed to queue app command {command:?}: {error:?}");
         }
@@ -352,115 +282,39 @@ impl NativeSimulator {
 
     fn tick(&mut self) {
         let uptime_ms = self.uptime_ms();
-        self.drain_hifi_worker();
+        self.drain_runtime_worker();
         self.update(Event::Tick { uptime_ms });
-        self.poll_hifi_status_if_needed(uptime_ms);
-        self.fetch_hifi_pins_if_needed();
+        self.sync_runtime_screen();
+        if let Err(error) = self
+            .runtime_worker
+            .send(RuntimeWorkerRequest::Tick { uptime_ms })
+        {
+            eprintln!("failed to queue runtime tick: {error:?}");
+        }
         self.render_stats.update_sample();
     }
 
-    fn fetch_hifi_pins_if_needed(&mut self) {
-        if self.app.screen() != Screen::HifiControl
-            || self.hifi_pins_loaded
-            || self.hifi_pins_in_flight
-        {
-            return;
-        }
-        self.hifi_pins_in_flight = true;
-        if let Err(error) = self.hifi_worker.requests.send(HifiWorkerRequest::Pins) {
-            self.hifi_pins_in_flight = false;
-            eprintln!("failed to queue Linn pins fetch: {error:?}");
+    fn sync_runtime_screen(&self) {
+        let request = RuntimeWorkerRequest::SyncScreen {
+            screen: self.app.screen(),
+            uptime_ms: self.uptime_ms(),
+        };
+        if let Err(error) = self.runtime_worker.send(request) {
+            eprintln!("failed to sync runtime screen: {error:?}");
         }
     }
 
-    fn drain_hifi_worker(&mut self) {
+    fn drain_runtime_worker(&mut self) {
         loop {
-            match self.hifi_worker.responses.try_recv() {
-                Ok(HifiWorkerResponse::CommandFailed(error)) => {
-                    eprintln!("failed to handle app command: {error}");
-                    self.last_hifi_status_poll_ms = 0;
-                    self.hifi_status_in_flight = false;
+            match self.runtime_worker.try_recv() {
+                Ok(RuntimeWorkerResponse::Event(event)) => self.update(event),
+                Ok(RuntimeWorkerResponse::Error(error)) => {
+                    eprintln!("hifi runtime error: {error:?}");
                 }
-                Ok(HifiWorkerResponse::Status(result)) => {
-                    self.hifi_status_in_flight = false;
-                    match result {
-                        Ok(status) => {
-                            let artwork_uri = status.album_art_uri.as_str().to_owned();
-                            let should_load_artwork = status.playback == PlaybackState::Playing
-                                && !artwork_uri.is_empty();
-                            self.update(Event::HifiStatus(status));
-                            if should_load_artwork {
-                                self.load_hifi_artwork_if_needed(&artwork_uri);
-                            } else if artwork_uri.is_empty() {
-                                self.last_hifi_artwork_uri = None;
-                            }
-                        }
-                        Err(error) => eprintln!("failed to read Linn hifi status: {error}"),
-                    }
-                }
-                Ok(HifiWorkerResponse::Artwork { uri, result }) => {
-                    if self.hifi_artwork_in_flight.as_deref() == Some(uri.as_str()) {
-                        self.hifi_artwork_in_flight = None;
-                    }
-                    match result {
-                        Ok(artwork) => self.update(Event::HifiArtwork(artwork)),
-                        Err(error) => eprintln!("failed to load Linn artwork {uri:?}: {error}"),
-                    }
-                }
-                Ok(HifiWorkerResponse::Pins(result)) => {
-                    self.hifi_pins_in_flight = false;
-                    match result {
-                        Ok(pins) => {
-                            self.hifi_pins_loaded = true;
-                            self.update(Event::HifiPins(pins));
-                        }
-                        Err(error) => eprintln!("failed to fetch Linn pins: {error}"),
-                    }
-                }
+                Ok(RuntimeWorkerResponse::Disconnected) => break,
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    self.hifi_status_in_flight = false;
-                    self.hifi_artwork_in_flight = None;
-                    self.hifi_pins_in_flight = false;
-                    break;
-                }
+                Err(TryRecvError::Disconnected) => break,
             }
-        }
-    }
-
-    fn poll_hifi_status_if_needed(&mut self, uptime_ms: u64) {
-        if self.app.screen() != Screen::HifiControl
-            || self.hifi_status_in_flight
-            || uptime_ms.saturating_sub(self.last_hifi_status_poll_ms) < HIFI_STATUS_POLL_MS
-        {
-            return;
-        }
-
-        self.last_hifi_status_poll_ms = uptime_ms;
-        self.hifi_status_in_flight = true;
-        if let Err(error) = self.hifi_worker.requests.send(HifiWorkerRequest::Status) {
-            self.hifi_status_in_flight = false;
-            eprintln!("failed to queue Linn hifi status poll: {error:?}");
-        }
-    }
-
-    fn load_hifi_artwork_if_needed(&mut self, uri: &str) {
-        if self.last_hifi_artwork_uri.as_deref() == Some(uri) {
-            return;
-        }
-        if self.hifi_artwork_in_flight.as_deref() == Some(uri) {
-            return;
-        }
-
-        self.last_hifi_artwork_uri = Some(uri.to_owned());
-        self.hifi_artwork_in_flight = Some(uri.to_owned());
-        if let Err(error) = self
-            .hifi_worker
-            .requests
-            .send(HifiWorkerRequest::Artwork(uri.to_owned()))
-        {
-            self.hifi_artwork_in_flight = None;
-            eprintln!("failed to queue Linn artwork load {uri:?}: {error:?}");
         }
     }
 
