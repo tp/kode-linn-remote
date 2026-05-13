@@ -24,8 +24,10 @@ use app_runtime::net::Endpoint;
 use app_runtime::{HifiController, RuntimeError};
 use artwork_pool::ArtworkPool;
 use board_waveshare_c6::{BOARD_NAME, DISPLAY_SIZE, peripherals};
+use core::sync::atomic::{AtomicBool, Ordering};
 use display::AmoledDisplay;
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_net::StackResources;
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex,
@@ -38,7 +40,7 @@ use esp_hal::{
     gpio::{Input, InputConfig, Pull},
     i2c::master::{Config as I2cConfig, I2c},
     interrupt::software::SoftwareInterruptControl,
-    peripherals::{GPIO9, WIFI},
+    peripherals::{GPIO2, GPIO9, WIFI},
     ram,
     time::{Duration, Instant, Rate},
     timer::timg::TimerGroup,
@@ -65,10 +67,21 @@ const WIFI_CONNECT_ATTEMPTS: u8 = 5;
 /// discarded. The Waveshare BOOT button is mechanically clean enough that
 /// 50 ms is plenty without making the UI feel laggy.
 const BUTTON_DEBOUNCE_MS: u64 = 50;
+/// Hold duration on PWR that counts as a shutdown request. Anything shorter is
+/// treated as an accidental tap and ignored.
+const PWR_LONG_PRESS_MS: u64 = 1_500;
+/// TCA9554 I2C address on this board.
+const TCA9554_ADDR: u8 = 0x20;
+/// TCA9554 Output Port register. Boot init writes `0xc0` here (EXIO6 BAT_EN +
+/// EXIO7 PA_CTRL high). Releasing the battery latch means clearing bit 6 while
+/// leaving the audio-amp gate (bit 7) alone.
+const TCA9554_OUTPUT_REG: u8 = 0x01;
+const TCA9554_OUTPUT_BAT_RELEASED: u8 = 0x80;
 const LOCAL_CONFIG: &str = include_str!("../../../config/local.env");
 
 static FIRMWARE_EVENTS: Channel<CriticalSectionRawMutex, FirmwareEvent, 1> = Channel::new();
 static HIFI_REQUESTS: Channel<CriticalSectionRawMutex, HifiRequest, 4> = Channel::new();
+static POWER_OFF_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 enum FirmwareEvent {
     App(Event),
@@ -186,6 +199,8 @@ async fn main(spawner: Spawner) -> ! {
 
     spawner
         .spawn(boot_button_task(peripherals.GPIO9).expect("boot-button task should allocate once"));
+    spawner
+        .spawn(pwr_button_task(peripherals.GPIO2).expect("pwr-button task should allocate once"));
 
     let booted_at = Instant::now();
     let mut next_heartbeat_ms = 0;
@@ -212,6 +227,30 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     loop {
+        if POWER_OFF_REQUESTED.load(Ordering::Acquire) {
+            println!("power: shutting down");
+            if let Err(error) = display.set_brightness(0x00) {
+                println!("power: brightness off failed: {}", error);
+            }
+            // Brief grace so the brightness write and logs make it out before
+            // the rails collapse on battery.
+            Timer::after(EmbassyDuration::from_millis(100)).await;
+            match i2c.write(
+                TCA9554_ADDR,
+                &[TCA9554_OUTPUT_REG, TCA9554_OUTPUT_BAT_RELEASED],
+            ) {
+                Ok(()) => {
+                    println!("power: battery latch released; on battery the device will power off")
+                }
+                Err(error) => println!("power: latch release failed: {:?}", error),
+            }
+            // On battery, execution stops here as VBAT drops out. On USB the
+            // rails stay up — yield to the executor and wait visibly forever.
+            loop {
+                Timer::after(EmbassyDuration::from_secs(60)).await;
+            }
+        }
+
         let uptime_ms = booted_at.elapsed().as_millis() as u64;
         let mut render_requested = false;
         let mut frame_rendered = false;
@@ -375,6 +414,45 @@ async fn boot_button_task(pin: GPIO9<'static>) {
         }
         last_press_ms = now_ms;
         send_app_event(Event::ButtonPressed(Button::Boot)).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn pwr_button_task(pin: GPIO2<'static>) {
+    // GPIO2 = PWR_KEY on the Waveshare ESP32-C6 Touch AMOLED 1.43. Active low
+    // via the board's 10K pull-up to 3V3. Holding this is what turned the
+    // device on in the first place, so the line may still be low when this
+    // task starts running — wait for the initial release before arming
+    // long-press detection, otherwise the boot press would self-trigger.
+    let mut input = Input::new(pin, InputConfig::default().with_pull(Pull::Up));
+    input.wait_for_high().await;
+    println!("power: PWR armed");
+
+    loop {
+        input.wait_for_falling_edge().await;
+        let press_start = EmbassyInstant::now();
+        match select(
+            input.wait_for_rising_edge(),
+            Timer::after(EmbassyDuration::from_millis(PWR_LONG_PRESS_MS)),
+        )
+        .await
+        {
+            Either::First(()) => {
+                let held = press_start.elapsed().as_millis();
+                println!("power: PWR short press ({} ms), ignored", held);
+            }
+            Either::Second(()) => {
+                if input.is_low() {
+                    println!(
+                        "power: PWR long press (>= {} ms), shutdown requested",
+                        PWR_LONG_PRESS_MS
+                    );
+                    POWER_OFF_REQUESTED.store(true, Ordering::Release);
+                    return;
+                }
+                println!("power: PWR long-press timer fired but line is high, ignoring");
+            }
+        }
     }
 }
 
