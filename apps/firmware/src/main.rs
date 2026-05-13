@@ -98,7 +98,13 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default();
     let peripherals = esp_hal::init(config);
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
-    esp_alloc::heap_allocator!(size: 36 * 1024);
+    // Bumped from 36 KB to 64 KB to give esp-radio, embassy-net, and the JPEG
+    // artwork decoder comfortable headroom. The original budget was sitting
+    // a few KB above failure; a 3 KB alloc inside zune_jpeg's APP2 (ICC
+    // profile) parser was failing once `LpecSession::response_args` started
+    // boxing its 16 KB args buffer. The C6's stack region is enormous (most
+    // of the remaining RWDATA), so trading ~28 KB of stack for heap is free.
+    esp_alloc::heap_allocator!(size: 64 * 1024);
 
     let app_config = firmware_config();
 

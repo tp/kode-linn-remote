@@ -35,6 +35,7 @@
 //! the `GetIdArray` JSON array used to enable hardware-mapped pins, and
 //! [`parse_pin_list_json`] handles optional titles.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec as AllocVec;
 
 use app_core::{
@@ -475,6 +476,14 @@ where
 pub struct LpecSession {
     subscribed: bool,
     status: HifiStatus,
+    // Reusable buffer for the args of the most recent action response. Boxed
+    // so the ~16 KB sits on the heap rather than inline on the session — the
+    // session is itself embedded in the firmware's hifi embassy state machine
+    // and growing it shifted statics in a way that correlated with WiFi-blob
+    // crashes. Boxing keeps `LpecSession`'s footprint the same as before the
+    // stack-overflow fix while still letting `action()` return a borrowed view
+    // instead of a 16 KB by-value `Vec`.
+    response_args: Box<heapless::Vec<linn_lpec::ResponseArg, { linn_lpec::MAX_ARGS }>>,
 }
 
 impl LpecSession {
@@ -482,6 +491,7 @@ impl LpecSession {
         Self {
             subscribed: false,
             status: HifiStatus::empty(),
+            response_args: Box::new(heapless::Vec::new()),
         }
     }
 
@@ -637,9 +647,13 @@ impl LpecSession {
     {
         self.ensure_subscribed(stream)?;
 
-        let id_array_response = self.action(stream, linn_lpec::pins_id_array())?;
-        let device_ids = decode_pin_ids(id_array_response.args.iter().map(|s| s.as_str()))
-            .ok_or(Error::Protocol(linn_lpec::Error::InvalidMessage))?;
+        // Inner block bounds the borrow of `self.response_args` so the helper
+        // below can take `&mut self` again.
+        let device_ids = {
+            let response = self.action(stream, linn_lpec::pins_id_array())?;
+            decode_pin_ids(response.args.iter().map(|s| s.as_str()))
+                .ok_or(Error::Protocol(linn_lpec::Error::InvalidMessage))?
+        };
         if device_ids.is_empty() {
             return Ok(HifiPins::new());
         }
@@ -678,7 +692,7 @@ impl LpecSession {
         &mut self,
         stream: &mut S,
         action: linn_lpec::Action<'_>,
-    ) -> Result<SessionActionResponse, Error<S::Error>>
+    ) -> Result<SessionActionResponse<'_>, Error<S::Error>>
     where
         S: ByteStream,
     {
@@ -690,8 +704,12 @@ impl LpecSession {
             let line = read_lpec_line(stream)?;
             match linn_lpec::parse_message(line.as_str()).map_err(Error::Protocol)? {
                 linn_lpec::Message::Response { args } => {
-                    let args = copy_session_response_args(&args).map_err(Error::erase_transport)?;
-                    return Ok(SessionActionResponse { args, changed });
+                    fill_session_response_args(&args, &mut self.response_args)
+                        .map_err(Error::erase_transport)?;
+                    return Ok(SessionActionResponse {
+                        args: &self.response_args,
+                        changed,
+                    });
                 }
                 linn_lpec::Message::Error { code, description } => {
                     let description =
@@ -744,8 +762,8 @@ impl Default for LpecSession {
     }
 }
 
-struct SessionActionResponse {
-    args: heapless::Vec<linn_lpec::ResponseArg, { linn_lpec::MAX_ARGS }>,
+struct SessionActionResponse<'a> {
+    args: &'a [linn_lpec::ResponseArg],
     changed: bool,
 }
 
@@ -1295,19 +1313,20 @@ where
     }
 }
 
-fn copy_session_response_args(
+fn fill_session_response_args(
     args: &Vec<&str, { linn_lpec::MAX_ARGS }>,
-) -> Result<Vec<linn_lpec::ResponseArg, { linn_lpec::MAX_ARGS }>, Error<core::convert::Infallible>>
-{
-    let mut copied = Vec::new();
+    out: &mut Vec<linn_lpec::ResponseArg, { linn_lpec::MAX_ARGS }>,
+) -> Result<(), Error<core::convert::Infallible>> {
+    out.clear();
     for arg in args {
-        let mut value = linn_lpec::ResponseArg::new();
-        copy_xml_text(arg, &mut value);
-        copied
-            .push(value)
+        out.push(linn_lpec::ResponseArg::new())
             .map_err(|_| Error::Protocol(linn_lpec::Error::TooManyArgs))?;
+        // SAFETY-ish: we just pushed; `last_mut` is Some. Writing through the
+        // slot avoids a 2 KB `ResponseArg` temporary on the stack per iteration.
+        let slot = out.last_mut().expect("just pushed");
+        copy_xml_text(arg, slot);
     }
-    Ok(copied)
+    Ok(())
 }
 
 fn copy_remote_description(
