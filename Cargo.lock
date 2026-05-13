@@ -46,6 +46,7 @@ name = "app-runtime"
 version = "0.1.0"
 dependencies = [
  "app-core",
+ "esp-println",
  "heapless 0.9.1",
  "linn-lpec",
  "zune-core",

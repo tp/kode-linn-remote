@@ -8,7 +8,11 @@ rust-version.workspace = true
 [dependencies]
 app-config.workspace = true
 app-core.workspace = true
-app-runtime.workspace = true
+# Re-enable `lpec-diag` if LPEC parsing or session behaviour ever needs to be
+# debugged on device — it routes per-line traces from `LpecSession::action` /
+# `poll` through esp-println. Off by default because it floods the serial
+# output once metadata events start streaming.
+app-runtime = { workspace = true, features = [] }
 board-waveshare-c6.workspace = true
 embassy-executor.workspace = true
 embassy-futures.workspace = true

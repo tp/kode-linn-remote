@@ -38,6 +38,18 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec as AllocVec;
 
+// TEMP diagnostic macro. With the `lpec-diag` feature on (firmware), this
+// routes formatted lines through esp-println. Without it, it's a no-op so the
+// sim and any host build don't pull in esp-println at all.
+#[cfg(feature = "lpec-diag")]
+macro_rules! diag_log {
+    ($($arg:tt)*) => { esp_println::println!($($arg)*) };
+}
+#[cfg(not(feature = "lpec-diag"))]
+macro_rules! diag_log {
+    ($($arg:tt)*) => {{}};
+}
+
 use app_core::{
     ArtworkPixel, HIFI_ARTWORK_PIXELS, HIFI_ARTWORK_SIZE, HIFI_PIN_COUNT, HIFI_PIN_TITLE_LEN,
     HIFI_VOLUME_MAX, HifiArtwork, HifiCommand, HifiPin, HifiPins, HifiStatus, PlaybackState,
@@ -536,8 +548,17 @@ impl LpecSession {
                 Ok(line) => {
                     lines_read += 1;
                     consecutive_timeouts = 0;
-                    let message =
-                        linn_lpec::parse_message(line.as_str()).map_err(Error::Protocol)?;
+                    diag_log!("poll rx: {}", line.as_str());
+                    let message = match linn_lpec::parse_message(line.as_str()) {
+                        Ok(message) => message,
+                        Err(_error) => {
+                            // One malformed event must not tear down the
+                            // session — skip it and keep reading. (Most
+                            // commonly: a metadata blob we can't parse.)
+                            diag_log!("poll parse error: {:?}", _error);
+                            continue;
+                        }
+                    };
                     changed |= self.handle_message(message);
                 }
                 Err(Error::Connect(error)) if S::is_read_timeout(&error) => {
@@ -702,8 +723,31 @@ impl LpecSession {
         let mut changed = false;
         for _ in 0..SESSION_ACTION_LINE_BUDGET {
             let line = read_lpec_line(stream)?;
-            match linn_lpec::parse_message(line.as_str()).map_err(Error::Protocol)? {
+            // TEMP diagnostic: trace the raw LPEC line we read, what
+            // parse_message thinks of it, and how we filled response_args.
+            // Remove once the InvalidMessage on pin fetch is understood.
+            diag_log!("lpec rx: {}", line.as_str());
+            let parsed = match linn_lpec::parse_message(line.as_str()) {
+                Ok(message) => message,
+                Err(_error) => {
+                    // Skip malformed lines while waiting for our response —
+                    // a stray badly-formatted event must not abort the
+                    // action. If nothing parses within the budget the loop
+                    // exits with UnexpectedMessage below.
+                    diag_log!("lpec parse error: {:?}", _error);
+                    continue;
+                }
+            };
+            match parsed {
                 linn_lpec::Message::Response { args } => {
+                    diag_log!("lpec response: argc={}", args.len());
+                    if let Some(first) = args.first() {
+                        let bytes = first.as_bytes();
+                        let n = bytes.len().min(120);
+                        if let Ok(_text) = core::str::from_utf8(&bytes[..n]) {
+                            diag_log!("lpec response arg0: {}", _text);
+                        }
+                    }
                     fill_session_response_args(&args, &mut self.response_args)
                         .map_err(Error::erase_transport)?;
                     return Ok(SessionActionResponse {
@@ -712,6 +756,7 @@ impl LpecSession {
                     });
                 }
                 linn_lpec::Message::Error { code, description } => {
+                    diag_log!("lpec remote error: code={} desc={}", code, description);
                     let description =
                         copy_remote_description(description).map_err(Error::erase_transport)?;
                     return Err(Error::Protocol(linn_lpec::Error::Remote {
@@ -1286,6 +1331,14 @@ where
     let mut buffer = [0_u8; linn_lpec::MAX_LINE_LEN];
     let mut length = 0;
     let mut byte = [0; 1];
+    // LPEC values are wrapped in `"..."`. Real Linn DSMs sometimes send
+    // multi-line content inside a value (DIDL-Lite XML with raw newlines
+    // between tags is the practical case), so a naive split on `\n` would
+    // cut the value in half and `parse_message` would reject both halves.
+    // Track quote depth and absorb embedded line terminators inside quoted
+    // strings. `\"` does not toggle the quote state.
+    let mut in_quotes = false;
+    let mut escape = false;
 
     loop {
         let count = stream.read(&mut byte).map_err(Error::Connect)?;
@@ -1293,20 +1346,29 @@ where
             return Err(Error::UnexpectedEof);
         }
 
-        match byte[0] {
-            b'\n' => {
+        let b = byte[0];
+        match b {
+            b'\n' if !in_quotes => {
                 let value = core::str::from_utf8(&buffer[..length])
                     .map_err(|_| Error::Protocol(linn_lpec::Error::InvalidUtf8))?;
                 let mut line = Line::new();
                 line.push_str(value).map_err(|_| Error::LineTooLong)?;
                 return Ok(line);
             }
+            // CR is always dropped (original behaviour). LF outside quotes
+            // ended the line above; LF inside quotes falls through and is
+            // appended as part of the value so downstream metadata parsers
+            // see the bytes the device actually sent.
             b'\r' => {}
-            value => {
+            _ => {
+                if b == b'"' && !escape {
+                    in_quotes = !in_quotes;
+                }
+                escape = b == b'\\' && !escape;
                 if length == buffer.len() {
                     return Err(Error::LineTooLong);
                 }
-                buffer[length] = value;
+                buffer[length] = b;
                 length += 1;
             }
         }
@@ -2208,6 +2270,66 @@ mod tests {
         assert_eq!(status.title.as_str(), "Chips n Queso");
         assert_eq!(status.artist.as_str(), "Lorde");
         assert!(stream.writes_as_str().contains("SUBSCRIBE Ds/Info"));
+    }
+
+    #[test]
+    fn read_lpec_line_keeps_newlines_inside_quoted_value() {
+        // Linn DSMs ship DIDL-Lite Metadata as a single LPEC argument that
+        // happens to contain raw `\n` bytes between XML tags. The line reader
+        // must absorb those into the value rather than treating each as
+        // end-of-line.
+        let mut stream =
+            ScriptedByteStream::from_bytes(b"KEY \"value\nwith\nlines\"\r\nNEXT\r\n");
+        let line = read_lpec_line(&mut stream).unwrap();
+        assert_eq!(line.as_str(), "KEY \"value\nwith\nlines\"");
+        let next = read_lpec_line(&mut stream).unwrap();
+        assert_eq!(next.as_str(), "NEXT");
+    }
+
+    #[test]
+    fn read_lpec_line_treats_escaped_quote_as_value_content() {
+        // `\"` inside `"..."` must not toggle quote state, otherwise the
+        // outer value closes prematurely and the rest of the line spills
+        // into what the parser thinks is the next message.
+        let mut stream = ScriptedByteStream::from_bytes(
+            b"KEY \"contains \\\"escaped\\\" quotes\"\r\nNEXT\r\n",
+        );
+        let line = read_lpec_line(&mut stream).unwrap();
+        assert_eq!(line.as_str(), "KEY \"contains \\\"escaped\\\" quotes\"");
+        let next = read_lpec_line(&mut stream).unwrap();
+        assert_eq!(next.as_str(), "NEXT");
+    }
+
+    #[test]
+    fn session_applies_multi_line_didl_metadata_event() {
+        // Regression: real Linn DSMs send the Metatext / Metadata value as
+        // multi-line DIDL-Lite XML with raw `\n` characters between tags.
+        // The session must reassemble the full quoted value and still
+        // extract title/artist.
+        let mut session = LpecSession::new();
+        let bytes = b"EVENT 5 0 Metatext \"&lt;DIDL-Lite&gt;\n  \
+            &lt;item&gt;\n    &lt;dc:title&gt;Chips n Queso&lt;/dc:title&gt;\n    \
+            &lt;upnp:artist&gt;Lorde&lt;/upnp:artist&gt;\n  &lt;/item&gt;\n\
+            &lt;/DIDL-Lite&gt;\"\r\n";
+        let mut stream = ScriptedByteStream::from_bytes(bytes);
+
+        let status = session.poll(&mut stream).unwrap().unwrap();
+        assert_eq!(status.title.as_str(), "Chips n Queso");
+        assert_eq!(status.artist.as_str(), "Lorde");
+    }
+
+    #[test]
+    fn session_poll_skips_unparseable_lines() {
+        // One malformed line from the device must not tear down the
+        // session — a subsequent valid event must still apply.
+        let mut session = LpecSession::new();
+        let mut stream = ScriptedByteStream::new(&[
+            "GARBAGE NOT A VALID LPEC LINE",
+            r#"EVENT 7 0 Volume "55""#,
+        ]);
+
+        let status = session.poll(&mut stream).unwrap().unwrap();
+        assert_eq!(status.volume_percent, 55);
     }
 
     #[test]

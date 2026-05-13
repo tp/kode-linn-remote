@@ -8,9 +8,17 @@ rust-version.workspace = true
 [features]
 default = []
 std = []
+# Diagnostic switch: route per-line traces from `LpecSession::action` and
+# `LpecSession::poll` through esp-println so they show up on JTAG serial.
+# Off by default — once event subscriptions are active the device emits many
+# lines per second, which floods the console. Flip on by adding
+# `features = ["lpec-diag"]` to the firmware's `app-runtime` dep when
+# debugging LPEC framing, parser behaviour, or session resilience.
+lpec-diag = ["dep:esp-println"]
 
 [dependencies]
 app-core.workspace = true
+esp-println = { workspace = true, features = ["esp32c6", "jtag-serial"], optional = true }
 heapless.workspace = true
 linn-lpec.workspace = true
 zune-core.workspace = true
