@@ -1,4 +1,7 @@
-use app_core::{Command, Event, HIFI_URI_LEN, HifiArtwork, HifiCommand, PlaybackState, Screen};
+use app_core::{
+    Command, Event, HIFI_PIN_COUNT, HIFI_URI_LEN, HifiArtwork, HifiCommand, HifiPins,
+    PlaybackState, Screen,
+};
 use heapless::String;
 
 use crate::{AppRuntime, HifiController, RuntimeError};
@@ -37,6 +40,11 @@ pub struct HifiDriver<Hifi> {
     /// URI of whatever is in `prefetched_artwork`, or of the last attempt, so a
     /// cover that fails to fetch is not retried on every tick.
     prefetched_artwork_uri: String<HIFI_URI_LEN>,
+    /// Pins whose cover has been fetched, or attempted. Indexed by slot, so a
+    /// pin that changes underneath us is refetched and one that fails is not.
+    pin_artwork_uris: [String<HIFI_URI_LEN>; HIFI_PIN_COUNT],
+    /// The pin list, kept so covers can be fetched one slot per tick.
+    pins: HifiPins,
 }
 
 /// What a skip produces immediately: the new track, and its cover when that
@@ -60,6 +68,8 @@ impl<Hifi> HifiDriver<Hifi> {
             last_uptime_ms: 0,
             prefetched_artwork: None,
             prefetched_artwork_uri: String::new(),
+            pin_artwork_uris: [const { String::new() }; HIFI_PIN_COUNT],
+            pins: HifiPins::new(),
         }
     }
 
@@ -154,6 +164,37 @@ where
         events
     }
 
+    /// Fetches one pin cover, if any slot is still missing its own.
+    ///
+    /// One per call: six covers is six HTTP round trips, and doing them in a
+    /// burst would stall the tick that the now-playing screen depends on. The
+    /// grid fills in over a second or so instead, which is what the per-tile
+    /// repaint in `app-core` is for.
+    pub fn fetch_pin_artwork(&mut self) -> Option<Event> {
+        if !self.active {
+            return None;
+        }
+
+        for slot in 0..HIFI_PIN_COUNT {
+            let pin = self.pins.get(slot)?;
+            if pin.artwork_uri.is_empty()
+                || self.pin_artwork_uris[slot].as_str() == pin.artwork_uri.as_str()
+            {
+                continue;
+            }
+
+            // Record the attempt before making it, so a cover that cannot be
+            // loaded is tried once rather than on every tick.
+            let uri = pin.artwork_uri.clone();
+            self.pin_artwork_uris[slot].clear();
+            let _ = self.pin_artwork_uris[slot].push_str(uri.as_str());
+
+            let artwork = self.runtime.hifi_artwork(uri.as_str()).ok()?;
+            return Some(Event::HifiPinArtwork { slot, artwork });
+        }
+        None
+    }
+
     /// Fetches and decodes the cover a forward skip would need.
     ///
     /// Runs on idle ticks so the work happens while the current track plays.
@@ -234,6 +275,7 @@ where
 
         self.pins_fetched = true;
         let pins = self.runtime.hifi_pins().map_err(DriverError::Pins)?;
+        self.pins = pins.clone();
         Ok(Some(Event::HifiPins(pins)))
     }
 
@@ -257,7 +299,9 @@ where
     }
 
     fn refresh_status(&mut self) -> Result<Option<Event>, DriverError<Hifi::Error>> {
-        let status = self.runtime.hifi_status().map_err(DriverError::Status)?;
+        let Some(status) = self.runtime.hifi_status().map_err(DriverError::Status)? else {
+            return Ok(None);
+        };
         let artwork_uri = status.album_art_uri.clone();
         let should_load_artwork =
             status.playback == PlaybackState::Playing && !artwork_uri.as_str().is_empty();
@@ -425,6 +469,9 @@ pub mod worker {
                     // Last, and only once everything the screen is waiting on
                     // has been served: this is work for a press that has not
                     // happened yet.
+                    if let Some(event) = driver.fetch_pin_artwork() {
+                        let _ = responses.send(Response::Event(event));
+                    }
                     driver.prefetch_next_artwork();
                 }
                 Request::RequestStatusPoll => {

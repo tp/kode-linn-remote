@@ -280,6 +280,8 @@ pub(crate) struct State {
     /// Uptime after which the cover on screen stops standing in for the one
     /// still being fetched. `None` means the cover belongs to this track.
     stale_artwork_until_ms: Option<u64>,
+    /// Cover per pin tile, filled in as each is fetched.
+    pin_artwork: [Option<HifiArtwork>; CHOICES_VISIBLE],
 }
 
 /// What a screen did with a raw pad press.
@@ -357,6 +359,9 @@ struct ChoicesCache {
     header_drawn: bool,
     drawn_titles: [String<HIFI_TEXT_LEN>; CHOICES_VISIBLE],
     drawn_active: [bool; CHOICES_VISIBLE],
+    /// Source URI of the cover already on each tile, so one landing repaints
+    /// just that tile.
+    drawn_art: [String<HIFI_URI_LEN>; CHOICES_VISIBLE],
     has_rendered: bool,
 }
 
@@ -406,6 +411,7 @@ impl State {
             optimistic_playback: None,
             optimistic_volume: None,
             stale_artwork_until_ms: None,
+            pin_artwork: [const { None }; CHOICES_VISIBLE],
         }
     }
 
@@ -629,7 +635,43 @@ impl State {
         if self.pins == pins {
             return false;
         }
+        // A pin whose id changed is a different thing to play, so its cover is
+        // no longer its cover.
+        for slot in 0..CHOICES_VISIBLE {
+            let same = self
+                .pins
+                .get(slot)
+                .zip(pins.get(slot))
+                .is_some_and(|(before, after)| before.id == after.id);
+            if !same {
+                self.pin_artwork[slot] = None;
+            }
+        }
         self.pins = pins;
+        self.pins_dirty = true;
+        true
+    }
+
+    pub(crate) fn apply_pin_artwork(&mut self, slot: usize, artwork: HifiArtwork) -> bool {
+        if slot >= CHOICES_VISIBLE || !artwork.is_complete() {
+            return false;
+        }
+        // The pin has to still want this cover: the list can change while an
+        // image is in flight.
+        if self
+            .pins
+            .get(slot)
+            .is_none_or(|pin| pin.artwork_uri != artwork.source_uri)
+        {
+            return false;
+        }
+        if self.pin_artwork[slot]
+            .as_ref()
+            .is_some_and(|current| current.source_uri == artwork.source_uri)
+        {
+            return false;
+        }
+        self.pin_artwork[slot] = Some(artwork);
         self.pins_dirty = true;
         true
     }
@@ -1184,22 +1226,37 @@ where
 
         let label_changed = cache.choices.drawn_titles[slot].as_str() != label.as_str();
         let active_changed = cache.choices.drawn_active[slot] != active;
-        if cache.choices.has_rendered && !label_changed && !active_changed {
+        let art_changed = cache.choices.drawn_art[slot]
+            != state.pin_artwork[slot]
+                .as_ref()
+                .map(|artwork| artwork.source_uri.clone())
+                .unwrap_or_default();
+        if cache.choices.has_rendered && !label_changed && !active_changed && !art_changed {
             continue;
         }
 
-        let (fill, stroke) = if active {
-            *tint
-        } else {
-            (ACTION_INACTIVE, ACTION_INACTIVE_BORDER)
-        };
-        draw_panel(
-            painter.display(),
-            ui_layout.tile_art[slot],
-            TILE_RADIUS,
-            fill,
-            stroke,
-        )?;
+        // A cover if the device gave us one, the tinted card otherwise. The
+        // tint is still what makes an artless pin findable without reading,
+        // so it stays rather than becoming an empty rectangle.
+        match state.pin_artwork[slot].as_ref() {
+            Some(artwork) if active => {
+                draw_scaled_artwork(painter.display(), ui_layout.tile_art[slot], artwork)?;
+            }
+            _ => {
+                let (fill, stroke) = if active {
+                    *tint
+                } else {
+                    (ACTION_INACTIVE, ACTION_INACTIVE_BORDER)
+                };
+                draw_panel(
+                    painter.display(),
+                    ui_layout.tile_art[slot],
+                    TILE_RADIUS,
+                    fill,
+                    stroke,
+                )?;
+            }
+        }
 
         let caption_band = ui_layout.tile_caption[slot];
         let caption = CenteredBand {
@@ -1212,9 +1269,54 @@ where
         cache.choices.drawn_titles[slot].clear();
         let _ = cache.choices.drawn_titles[slot].push_str(label.as_str());
         cache.choices.drawn_active[slot] = active;
+        cache.choices.drawn_art[slot] = state.pin_artwork[slot]
+            .as_ref()
+            .map(|artwork| artwork.source_uri.clone())
+            .unwrap_or_default();
     }
     cache.choices.has_rendered = true;
     Ok(())
+}
+
+/// Blits a cover into a rectangle smaller than itself.
+///
+/// Pin covers arrive at the same 330 px as the now-playing hero, because they
+/// come down the same fetch-and-decode path; reusing it costs a few hundred KB
+/// of PSRAM and saves a second image pipeline. Sampling is nearest-neighbour,
+/// which is what the decoder already does going from source to slot, and tiles
+/// repaint rarely enough that per-pixel sampling is not worth avoiding.
+fn draw_scaled_artwork<D>(
+    display: &mut D,
+    target: Rectangle,
+    artwork: &HifiArtwork,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let pixels = artwork.pixels();
+    let source_size = crate::HIFI_ARTWORK_SIZE as usize;
+    if pixels.len() < source_size * source_size {
+        return Ok(());
+    }
+
+    let width = target.size.width as usize;
+    let height = target.size.height as usize;
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+
+    display
+        .fill_contiguous(
+            &target,
+            (0..height).flat_map(|y| {
+                let source_y = y * source_size / height;
+                (0..width).map(move |x| {
+                    let source_x = x * source_size / width;
+                    pixels[source_y * source_size + source_x]
+                })
+            }),
+        )
+        .map_err(RenderError::Draw)
 }
 
 /// What to write under a tile.
@@ -1927,6 +2029,86 @@ mod tests {
         assert_eq!(state.status.volume_percent, 12);
     }
 
+    #[test]
+    fn a_pin_cover_is_kept_only_while_the_pin_still_wants_it() {
+        let mut state = State::new(0);
+        let mut pins = HifiPins::new();
+        let mut pin = HifiPin::new(1, "Village");
+        let _ = pin.artwork_uri.push_str("http://art/village.jpg");
+        pins.set(0, pin);
+        state.apply_pins(pins);
+
+        let mut artwork = HifiArtwork::new("http://art/village.jpg").unwrap();
+        for _ in 0..crate::HIFI_ARTWORK_PIXELS {
+            artwork.push_pixel(Rgb565::CSS_REBECCAPURPLE);
+        }
+        assert!(state.apply_pin_artwork(0, artwork.clone()));
+        assert!(state.pin_artwork[0].is_some());
+
+        // A cover for a URI the pin no longer names is not this pin's cover.
+        let mut other = HifiArtwork::new("http://art/stale.jpg").unwrap();
+        for _ in 0..crate::HIFI_ARTWORK_PIXELS {
+            other.push_pixel(Rgb565::CSS_REBECCAPURPLE);
+        }
+        assert!(!state.apply_pin_artwork(0, other));
+    }
+
+    #[test]
+    fn changing_what_a_pin_plays_drops_its_cover() {
+        let mut state = State::new(0);
+        let mut pins = HifiPins::new();
+        let mut pin = HifiPin::new(1, "Village");
+        let _ = pin.artwork_uri.push_str("http://art/village.jpg");
+        pins.set(0, pin);
+        state.apply_pins(pins);
+
+        let mut artwork = HifiArtwork::new("http://art/village.jpg").unwrap();
+        for _ in 0..crate::HIFI_ARTWORK_PIXELS {
+            artwork.push_pixel(Rgb565::CSS_REBECCAPURPLE);
+        }
+        state.apply_pin_artwork(0, artwork);
+
+        let mut replaced = HifiPins::new();
+        replaced.set(0, HifiPin::new(9, "Something else"));
+        state.apply_pins(replaced);
+
+        assert!(
+            state.pin_artwork[0].is_none(),
+            "slot 0 kept a cover for a pin it no longer holds"
+        );
+    }
+
+    #[test]
+    fn three_nudges_apply_three_steps() {
+        // The reported symptom: pressing down three times only moved one or
+        // two, because the level each press read had been dragged back to what
+        // the device last reported.
+        let mut state = state_with_track(20);
+        let start = state.status.volume_percent as i16;
+
+        let mut sent = Vec::new();
+        for press in 0..3 {
+            let at = 1_000 + press * 40;
+            if let Some(Command::SetVolume { volume }) =
+                state.handle(Action::VolumeDelta(-VOLUME_STEP), at)
+            {
+                sent.push(volume);
+            }
+            // Between presses the device answers with the level from before.
+            let mut lagging = state.status.clone();
+            lagging.volume_percent = start as u8;
+            state.apply_status(lagging, at + 10);
+        }
+
+        assert_eq!(sent.len(), 3, "a press produced no command");
+        let expected = (start - 3 * VOLUME_STEP).max(0) as u8;
+        assert_eq!(
+            state.status.volume_percent, expected,
+            "three presses did not move three steps"
+        );
+        assert_eq!(sent.last().copied(), Some(expected));
+    }
+
     fn filled_pins() -> HifiPins {
         let mut pins = HifiPins::new();
         for slot in 0..CHOICES_VISIBLE {
@@ -1937,6 +2119,7 @@ mod tests {
                 HifiPin {
                     id: slot as u32 + 1,
                     title,
+                    artwork_uri: String::new(),
                 },
             );
         }
@@ -2222,6 +2405,7 @@ mod tests {
             HifiPin {
                 id: 4711,
                 title: String::new(),
+                artwork_uri: String::new(),
             },
         );
         assert_eq!(tile_label(0, pins.get(0)).as_str(), "Pin 4711");
