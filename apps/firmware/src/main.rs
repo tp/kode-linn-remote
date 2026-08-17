@@ -719,7 +719,10 @@ impl HifiController for FirmwareHifi<'_> {
                 .network
                 .connect_events(self.endpoint)
                 .map_err(FirmwareHifiError::Net)?;
-            self.session.poll(&mut stream)
+            // The session expires optimistic skips against this, so it wants
+            // wall-clock progress rather than anything app-relative.
+            self.session
+                .poll(&mut stream, EmbassyInstant::now().as_millis())
         };
 
         match result {
