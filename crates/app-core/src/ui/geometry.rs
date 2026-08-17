@@ -47,17 +47,6 @@ pub(super) fn vertical_pair(
     )
 }
 
-/// Shrinks `bounds` by `inset` on every side.
-pub(super) fn inset_rect(bounds: Rectangle, inset: i32) -> Rectangle {
-    Rectangle::new(
-        Point::new(bounds.top_left.x + inset, bounds.top_left.y + inset),
-        Size::new(
-            bounds.size.width.saturating_sub((inset * 2) as u32),
-            bounds.size.height.saturating_sub((inset * 2) as u32),
-        ),
-    )
-}
-
 pub(super) fn horizontal_pair(
     left: i32,
     y: i32,

@@ -111,7 +111,13 @@ pub enum Command {
 }
 
 pub const HIFI_ARTWORK_PIXELS: usize = HIFI_ARTWORK_SIZE as usize * HIFI_ARTWORK_SIZE as usize;
-pub const HIFI_ARTWORK_SIZE: u32 = 96;
+/// Decoded artwork resolution, and therefore the size of the Now Playing
+/// artwork slot — the two are the same constant so they cannot drift.
+///
+/// 330 px is ~27 mm on this panel, big enough to recognise a cover across a
+/// room. It is also `330 % 4 == 2`, which is what a centred widget needs to
+/// stay on the display controller's 2-px write grid.
+pub const HIFI_ARTWORK_SIZE: u32 = 330;
 pub const HIFI_TEXT_LEN: usize = 64;
 pub const HIFI_URI_LEN: usize = 256;
 pub const HIFI_PIN_COUNT: usize = 6;
@@ -124,6 +130,17 @@ pub const HIFI_VOLUME_MAX: u8 = 70;
 pub struct HifiPin {
     pub id: u32,
     pub title: String<HIFI_PIN_TITLE_LEN>,
+}
+
+impl HifiPin {
+    /// Builds a pin from a borrowed title, truncating anything that does not
+    /// fit. Lets callers construct one without naming `heapless::String`.
+    pub fn new(id: u32, title: &str) -> Self {
+        Self {
+            id,
+            title: string_from(title),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -443,6 +460,21 @@ impl App {
     }
 
     fn handle_button(&mut self, button: Button) -> (bool, Option<Command>) {
+        // Screens that bind the pad to actions rather than to movement get
+        // first refusal on every press. Returning `None` means "not mine",
+        // and the generic focus path below handles it as usual.
+        let uptime_ms = self.uptime_ms;
+        if let ActiveScreen::HifiControl(state) = &mut self.active_screen
+            && let Some(outcome) = state.intercept_button(button, uptime_ms)
+        {
+            if outcome.page_changed {
+                // Focus indices are per-page; carrying one across would point
+                // at an unrelated control.
+                self.focus = None;
+            }
+            return (outcome.redraw, outcome.command.map(Command::Hifi));
+        }
+
         match button {
             Button::Select => self.activate_focused(),
             Button::Back => (self.go_back(), None),
@@ -471,15 +503,11 @@ impl App {
         (true, self.handle_touch(center))
     }
 
-    /// Up one level: out of a HiFi subpage first, then out to the launcher.
+    /// Up one level, out to the launcher.
+    ///
+    /// The HiFi screen never reaches here: it intercepts `Back` to move
+    /// between Now Playing and Choices, which is the only navigation it has.
     fn go_back(&mut self) -> bool {
-        if let ActiveScreen::HifiControl(state) = &mut self.active_screen
-            && state.pop_page()
-        {
-            self.set_focus(None);
-            return true;
-        }
-
         if self.active_screen.screen() == Screen::Launcher {
             return false;
         }
@@ -494,22 +522,13 @@ impl App {
             return self.set_focus(Some(next));
         }
 
-        // Nothing further in that direction. On the HiFi screen the pages form
-        // a vertical stack, so running off the top or bottom edge moves
-        // between them instead of doing nothing.
-        match (&mut self.active_screen, direction) {
-            (ActiveScreen::HifiControl(state), Direction::Down) => {
-                state.cycle_page();
-                self.set_focus(None);
-                true
-            }
-            (ActiveScreen::HifiControl(state), Direction::Up) => {
-                state.cycle_page_back();
-                self.set_focus(None);
-                true
-            }
-            _ => false,
-        }
+        // Nothing further in that direction, so the ring stays put rather than
+        // wrapping — on a small panel, wrapping makes it easy to lose.
+        //
+        // This is also the seam a scrolling picker would use: "ran off the
+        // edge with nowhere to go" is exactly the signal that should later
+        // mean "scroll a row".
+        false
     }
 
     fn handle_touch(&mut self, point: TouchPoint) -> Option<Command> {
@@ -611,28 +630,18 @@ mod tests {
         touch_point(hifi)
     }
 
-    fn hifi_play_touch() -> TouchPoint {
-        touch_point(ui::hifi_play_button_center())
+    fn hifi_artwork_touch() -> TouchPoint {
+        touch_point(ui::hifi_artwork_center())
     }
 
-    fn hifi_previous_touch() -> TouchPoint {
-        touch_point(ui::hifi_previous_button_center())
+    fn hifi_tile_touch(slot: usize) -> TouchPoint {
+        touch_point(ui::hifi_tile_center(slot))
     }
 
-    fn hifi_next_touch() -> TouchPoint {
-        touch_point(ui::hifi_next_button_center())
-    }
-
-    fn hifi_pin_slot_touch(slot: usize) -> TouchPoint {
-        touch_point(ui::hifi_pin_slot_center(slot))
-    }
-
-    fn hifi_volume_increment_touch() -> TouchPoint {
-        touch_point(ui::hifi_volume_increment_center())
-    }
-
-    fn hifi_volume_decrement_touch() -> TouchPoint {
-        touch_point(ui::hifi_volume_decrement_center())
+    /// Back is the only way between the two HiFi screens, and it goes both
+    /// ways rather than out to the launcher.
+    fn hifi_to_choices(app: &mut App) {
+        app.update(Event::ButtonPressed(Button::Back));
     }
 
     fn loaded_pin(id: u32, title: &str) -> HifiPin {
@@ -792,7 +801,7 @@ mod tests {
                 .render_requested
         );
 
-        app.update(Event::TouchDown(hifi_play_touch()));
+        app.update(Event::ButtonPressed(Button::Select));
         assert!(
             !app.update(Event::Tick { uptime_ms: 5_000 })
                 .render_requested
@@ -806,16 +815,19 @@ mod tests {
         pins.set(0, loaded_pin(4711, "Radio"));
         pins.set(1, loaded_pin(8128, "Spotify"));
         app.update(Event::HifiPins(pins));
-        hifi_pad_to_pins(&mut app);
+        hifi_to_choices(&mut app);
 
-        let outcome = app.update(Event::TouchDown(hifi_pin_slot_touch(0)));
+        let outcome = app.update(Event::TouchDown(hifi_tile_touch(0)));
         assert!(outcome.render_requested);
         assert_eq!(
             outcome.command,
             Some(Command::Hifi(HifiCommand::InvokePinId { id: 4711 }))
         );
 
-        let outcome = app.update(Event::TouchDown(hifi_pin_slot_touch(1)));
+        // Playing a choice returns to Now Playing, so getting at the second
+        // one means going back to the grid.
+        hifi_to_choices(&mut app);
+        let outcome = app.update(Event::TouchDown(hifi_tile_touch(1)));
         assert_eq!(
             outcome.command,
             Some(Command::Hifi(HifiCommand::InvokePinId { id: 8128 }))
@@ -825,59 +837,70 @@ mod tests {
     #[test]
     fn hifi_pin_slot_without_loaded_pin_emits_no_command() {
         let mut app = App::new_on_screen(Screen::HifiControl);
-        hifi_pad_to_pins(&mut app);
+        hifi_to_choices(&mut app);
 
-        let outcome = app.update(Event::TouchDown(hifi_pin_slot_touch(0)));
+        let outcome = app.update(Event::TouchDown(hifi_tile_touch(0)));
         assert!(outcome.render_requested);
         assert_eq!(outcome.command, None);
     }
 
-    /// Walks the pad from a freshly opened HiFi screen to the Pins page.
-    ///
-    /// The first press only reveals the focus ring; the second runs off the
-    /// bottom of the single transport row, which is what advances the page.
-    fn hifi_pad_to_pins(app: &mut App) {
-        app.update(Event::ButtonPressed(Button::Down));
-        app.update(Event::ButtonPressed(Button::Down));
-    }
-
-    /// Continues from the Pins page to the Volume page. The pins form a 3x2
-    /// grid, so the ring steps into the second row before the page turns.
-    fn hifi_pad_to_volume(app: &mut App) {
-        hifi_pad_to_pins(app);
-        app.update(Event::ButtonPressed(Button::Down));
-        app.update(Event::ButtonPressed(Button::Down));
-        app.update(Event::ButtonPressed(Button::Down));
-    }
-
     #[test]
-    fn hifi_pad_walks_through_the_pages() {
+    fn hifi_volume_takes_one_press_on_now_playing() {
         let mut app = App::new_on_screen(Screen::HifiControl);
-
         let mut status = hifi_status(PlaybackState::Paused);
         status.volume_percent = 30;
         app.update(Event::HifiStatus(status));
-        hifi_pad_to_volume(&mut app);
 
-        let outcome = app.update(Event::TouchDown(hifi_volume_increment_touch()));
+        // No ring to reveal first: the very first press moves the volume.
+        let outcome = app.update(Event::ButtonPressed(Button::Up));
         assert_eq!(
             outcome.command,
-            Some(Command::Hifi(HifiCommand::SetVolume { volume: 31 }))
+            Some(Command::Hifi(HifiCommand::SetVolume { volume: 32 }))
         );
-
-        // Back pops out of the subpage to Status, where the volume buttons are
-        // no longer on screen.
-        app.update(Event::ButtonPressed(Button::Back));
-        assert_eq!(app.screen(), Screen::HifiControl);
-        let outcome = app.update(Event::TouchDown(hifi_volume_decrement_touch()));
-        assert_eq!(outcome.command, None);
+        let outcome = app.update(Event::ButtonPressed(Button::Down));
+        assert_eq!(
+            outcome.command,
+            Some(Command::Hifi(HifiCommand::SetVolume { volume: 30 }))
+        );
     }
 
     #[test]
-    fn back_from_hifi_status_leaves_for_the_launcher() {
+    fn hifi_pad_moves_between_the_two_screens_and_never_leaves() {
         let mut app = App::new_on_screen(Screen::HifiControl);
+
+        // Back goes to Choices rather than out to the launcher.
         app.update(Event::ButtonPressed(Button::Back));
-        assert_eq!(app.screen(), Screen::Launcher);
+        assert_eq!(app.screen(), Screen::HifiControl);
+
+        // On Choices the pad moves the ring; volume is not reachable there.
+        let outcome = app.update(Event::ButtonPressed(Button::Up));
+        assert_eq!(outcome.command, None);
+
+        // And Back comes home again.
+        app.update(Event::ButtonPressed(Button::Back));
+        assert_eq!(app.screen(), Screen::HifiControl);
+        let outcome = app.update(Event::ButtonPressed(Button::Up));
+        assert!(matches!(
+            outcome.command,
+            Some(Command::Hifi(HifiCommand::SetVolume { .. }))
+        ));
+    }
+
+    #[test]
+    fn hifi_choices_select_plays_the_focused_tile() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        let mut pins = HifiPins::new();
+        pins.set(0, loaded_pin(4711, "Radio"));
+        app.update(Event::HifiPins(pins));
+        hifi_to_choices(&mut app);
+
+        // First press reveals the ring on the first tile, second activates it.
+        app.update(Event::ButtonPressed(Button::Select));
+        let outcome = app.update(Event::ButtonPressed(Button::Select));
+        assert_eq!(
+            outcome.command,
+            Some(Command::Hifi(HifiCommand::InvokePinId { id: 4711 }))
+        );
     }
 
     #[test]
@@ -950,10 +973,8 @@ mod tests {
         let mut app = App::new_on_screen(Screen::HifiControl);
         app.update(Event::HifiStatus(hifi_status(PlaybackState::Paused)));
 
-        // Ring lands on the first transport control, then steps right onto
-        // play/pause in the middle.
-        app.update(Event::ButtonPressed(Button::Right));
-        app.update(Event::ButtonPressed(Button::Right));
+        // Straight to it: Now Playing binds Select to play/pause rather than
+        // to "activate whatever the ring is on".
         let outcome = app.update(Event::ButtonPressed(Button::Select));
 
         assert_eq!(
@@ -963,48 +984,44 @@ mod tests {
     }
 
     #[test]
-    fn hifi_play_touch_requests_toggle_command_when_paused() {
-        let mut app = App::new_on_screen(Screen::HifiControl);
-        let status = hifi_status(PlaybackState::Paused);
-        app.update(Event::HifiStatus(status));
-
-        let outcome = app.update(Event::TouchDown(hifi_play_touch()));
-
-        assert!(outcome.render_requested);
-        assert_eq!(
-            outcome.command,
-            Some(Command::Hifi(HifiCommand::TogglePlayback))
-        );
-    }
-
-    #[test]
-    fn hifi_play_touch_requests_toggle_command_while_playing() {
-        let mut app = App::new_on_screen(Screen::HifiControl);
-        let status = hifi_status(PlaybackState::Playing);
-        app.update(Event::HifiStatus(status));
-
-        let outcome = app.update(Event::TouchDown(hifi_play_touch()));
-
-        assert!(outcome.render_requested);
-        assert_eq!(
-            outcome.command,
-            Some(Command::Hifi(HifiCommand::TogglePlayback))
-        );
-    }
-
-    #[test]
-    fn hifi_track_touches_request_track_commands() {
+    fn now_playing_ignores_taps_so_the_remote_can_be_carried() {
         let mut app = App::new_on_screen(Screen::HifiControl);
         app.update(Event::HifiStatus(hifi_status(PlaybackState::Playing)));
 
-        let previous = app.update(Event::TouchDown(hifi_previous_touch()));
-        let next = app.update(Event::TouchDown(hifi_next_touch()));
+        let outcome = app.update(Event::TouchDown(hifi_artwork_touch()));
 
+        assert_eq!(outcome.command, None);
+    }
+
+    #[test]
+    fn hifi_track_buttons_request_track_commands() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        let mut status = hifi_status(PlaybackState::Playing);
+        status.duration_seconds = 200;
+        app.update(Event::HifiStatus(status));
+
+        let next = app.update(Event::ButtonPressed(Button::Right));
+        assert_eq!(next.command, Some(Command::Hifi(HifiCommand::NextTrack)));
+
+        // Right cleared the track, so elapsed is 0 and Left goes straight back
+        // rather than restarting.
+        let previous = app.update(Event::ButtonPressed(Button::Left));
         assert_eq!(
             previous.command,
             Some(Command::Hifi(HifiCommand::PreviousTrack))
         );
-        assert_eq!(next.command, Some(Command::Hifi(HifiCommand::NextTrack)));
+    }
+
+    #[test]
+    fn hifi_left_restarts_a_track_that_is_already_under_way() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        let mut status = hifi_status(PlaybackState::Playing);
+        status.elapsed_seconds = 30;
+        status.duration_seconds = 200;
+        app.update(Event::HifiStatus(status));
+
+        let outcome = app.update(Event::ButtonPressed(Button::Left));
+        assert_eq!(outcome.command, Some(Command::Hifi(HifiCommand::Restart)));
     }
 
     #[test]

@@ -55,8 +55,15 @@ fn cost(from: Point, to: Point, direction: Direction) -> Option<i64> {
 /// The index to focus after pressing `direction`.
 ///
 /// Returns `None` when there is nothing in that direction, which callers treat
-/// as "stay put" rather than wrapping — wrapping makes it easy to lose track of
-/// where the ring is on a small panel.
+/// as "stay put". There is one exception: horizontal movement off the end of a
+/// row continues to the neighbour in reading order, which on a grid is the
+/// start of the next line or the end of the previous one. That is what every
+/// grid does, and it means a left/right-only user can still reach every tile.
+///
+/// It deliberately stops at the ends of the list rather than wrapping around
+/// to the far corner — line wrapping follows the reading order a user already
+/// has in their head, while corner wrapping makes it easy to lose the ring on
+/// a small panel.
 pub(crate) fn step(
     targets: &FocusTargets,
     current: Option<usize>,
@@ -73,13 +80,24 @@ pub(crate) fn step(
 
     let origin = center(&targets[current]);
 
-    targets
+    let nearest = targets
         .iter()
         .enumerate()
         .filter(|(index, _)| *index != current)
         .filter_map(|(index, rect)| cost(origin, center(rect), direction).map(|cost| (cost, index)))
         .min_by_key(|(cost, index)| (*cost, *index))
-        .map(|(_, index)| index)
+        .map(|(_, index)| index);
+
+    if nearest.is_some() {
+        return nearest;
+    }
+
+    // Off the end of a row: continue in reading order onto the adjacent line.
+    match direction {
+        Direction::Right => (current + 1 < targets.len()).then_some(current + 1),
+        Direction::Left => current.checked_sub(1),
+        Direction::Up | Direction::Down => None,
+    }
 }
 
 /// The control containing `point`, used to keep the ring in step with touches
@@ -116,10 +134,29 @@ mod tests {
     }
 
     #[test]
-    fn does_not_wrap_at_the_edges() {
+    fn does_not_wrap_around_the_ends_of_the_list() {
         let targets = targets(&[rect(0, 0), rect(100, 0)]);
         assert_eq!(step(&targets, Some(1), Direction::Right), None);
         assert_eq!(step(&targets, Some(0), Direction::Left), None);
+    }
+
+    #[test]
+    fn horizontal_movement_wraps_onto_the_adjacent_line() {
+        // 2x2 grid in reading order, as the music picker publishes it.
+        let targets = targets(&[rect(0, 0), rect(100, 0), rect(0, 100), rect(100, 100)]);
+
+        // Off the right of the top row, on to the start of the bottom one.
+        assert_eq!(step(&targets, Some(1), Direction::Right), Some(2));
+        // And back again.
+        assert_eq!(step(&targets, Some(2), Direction::Left), Some(1));
+
+        // The ends of the whole grid still stop rather than wrapping round.
+        assert_eq!(step(&targets, Some(3), Direction::Right), None);
+        assert_eq!(step(&targets, Some(0), Direction::Left), None);
+
+        // Vertical movement is unaffected: no line to wrap on to.
+        assert_eq!(step(&targets, Some(1), Direction::Up), None);
+        assert_eq!(step(&targets, Some(2), Direction::Down), None);
     }
 
     #[test]

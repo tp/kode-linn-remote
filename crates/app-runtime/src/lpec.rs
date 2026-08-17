@@ -64,7 +64,9 @@ use crate::{
     net::{ByteStream, Endpoint, TcpConnector},
 };
 
-const MAX_ARTWORK_BYTES: usize = 128 * 1024;
+/// Largest compressed JPEG accepted. Sized for a ~600 px cover, which is what
+/// a 330 px artwork slot needs as a source.
+const MAX_ARTWORK_BYTES: usize = 192 * 1024;
 const MAX_HTTP_HEADER_BYTES: usize = 8 * 1024;
 const SESSION_ACTION_LINE_BUDGET: usize = 16;
 /// Upper bound on event lines drained from a single `poll()`. Stops a misbehaving
@@ -76,8 +78,21 @@ const SESSION_POLL_LINE_BUDGET: usize = 32;
 /// pushes initial-state events for every subscribed service, but the burst may
 /// not have started by the time the first read fires.
 const SESSION_SUBSCRIBE_PATIENCE: usize = 10;
-pub const ARTWORK_HTTP_BUFFER_BYTES: usize = 32 * 1024;
-pub const ARTWORK_DECODE_BUFFER_BYTES: usize = 36 * 1024;
+/// The HTTP buffer holds the whole response, headers and body, so it has to be
+/// at least as large as the limits enforced against it. Deriving it from those
+/// limits means the two cannot drift apart — which they had.
+pub const ARTWORK_HTTP_BUFFER_BYTES: usize = MAX_ARTWORK_BYTES + MAX_HTTP_HEADER_BYTES;
+
+/// Longest source edge the decode buffer is sized for.
+///
+/// `zune-jpeg` cannot scale while decoding — `output_buffer_size()` is always
+/// `width * height * components` at full source resolution — so the buffer is
+/// governed by the *source* image, not by the artwork slot it ends up in.
+/// Anything larger fails cleanly as `ArtworkBufferTooSmall` rather than
+/// corrupting the frame.
+const MAX_ARTWORK_SOURCE_EDGE: usize = 640;
+pub const ARTWORK_DECODE_BUFFER_BYTES: usize =
+    MAX_ARTWORK_SOURCE_EDGE * MAX_ARTWORK_SOURCE_EDGE * 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error<E> {
@@ -324,6 +339,13 @@ where
             .map_err(map_client_error)
     }
 
+    fn restart_track(&mut self) -> Result<(), Error<C::Error>> {
+        self.client()?
+            .action(linn_lpec::playlist_seek_second_absolute_arg("0"))
+            .map(|_| ())
+            .map_err(map_client_error)
+    }
+
     fn next_track(&mut self) -> Result<(), Error<C::Error>> {
         self.client()?
             .action(linn_lpec::playlist_next())
@@ -347,6 +369,7 @@ where
         match command {
             HifiCommand::InvokePinId { id } => self.invoke_pin_id(id),
             HifiCommand::PreviousTrack => self.previous_track(),
+            HifiCommand::Restart => self.restart_track(),
             HifiCommand::TogglePlayback => self.toggle_playback(),
             HifiCommand::NextTrack => self.next_track(),
             HifiCommand::SetVolume { volume } => self.set_volume(volume),
@@ -376,6 +399,11 @@ where
         HifiCommand::PreviousTrack => {
             action_with_retry(&mut client, linn_lpec::playlist_previous()).map(|_| ())
         }
+        HifiCommand::Restart => action_with_retry(
+            &mut client,
+            linn_lpec::playlist_seek_second_absolute_arg("0"),
+        )
+        .map(|_| ()),
         HifiCommand::TogglePlayback => {
             let playback = read_playback_state(&mut client)?;
             if playback_can_pause(playback) {
@@ -605,6 +633,17 @@ impl LpecSession {
             }
             HifiCommand::PreviousTrack => {
                 changed |= self.action(stream, linn_lpec::playlist_previous())?.changed;
+            }
+            HifiCommand::Restart => {
+                changed |= self
+                    .action(stream, linn_lpec::playlist_seek_second_absolute_arg("0"))?
+                    .changed;
+                // The track did not change, only its position, so keep the
+                // metadata and move the clock.
+                if self.status.elapsed_seconds != 0 {
+                    self.status.elapsed_seconds = 0;
+                    changed = true;
+                }
             }
             HifiCommand::SetVolume { volume } => {
                 let clamped = volume.min(HIFI_VOLUME_MAX);
@@ -1877,13 +1916,20 @@ fn copy_tag<const N: usize>(xml: &str, tag: &str, output: &mut heapless::String<
     copy_xml_text(&xml[content_start..content_end], output);
 }
 
+/// Picks the album art resource to fetch, largest useful first.
+///
+/// This used to ask for `JPEG_TN` — the DLNA thumbnail — which was the right
+/// call when the artwork slot was 96 px. The slot is now 330 px, and a
+/// thumbnail upscaled four times looks worse than no artwork at all, so the
+/// order is inverted: take a large or medium profile if the device offers one,
+/// fall back to whatever is listed first, and accept the thumbnail only when
+/// it is all there is.
 fn copy_album_art_uri<const N: usize>(xml: &str, output: &mut heapless::String<N>) {
-    if copy_album_art_uri_for_profile(xml, "JPEG_TN", output) {
-        prefer_smaller_qobuz_art(output);
-        return;
-    }
-    if copy_album_art_uri_for_profile(xml, "", output) {
-        prefer_smaller_qobuz_art(output);
+    for profile in ["JPEG_LRG", "JPEG_MED", "", "JPEG_TN"] {
+        if copy_album_art_uri_for_profile(xml, profile, output) {
+            prefer_qobuz_art_for_slot(output);
+            return;
+        }
     }
 }
 
@@ -1937,7 +1983,32 @@ fn copy_album_art_uri_for_profile<const N: usize>(
     false
 }
 
-fn prefer_smaller_qobuz_art<const N: usize>(uri: &mut heapless::String<N>) {
+/// Sizes Qobuz publishes for cover art, ascending.
+const QOBUZ_ART_SIZES: [u32; 6] = [50, 100, 150, 230, 300, 600];
+
+/// Rewrites a Qobuz cover URI to the smallest published size that still fills
+/// the artwork slot.
+///
+/// Qobuz encodes the size in the filename (`..._600.jpg`), so the right image
+/// is one string edit away. This deliberately asks for the *smallest* size
+/// that is big enough: the source has to be decoded at full resolution before
+/// it can be scaled down, so overshooting costs decode buffer for no visible
+/// gain. It used to hard-code `_50`, which is a 50 px thumbnail — fine for the
+/// old 96 px slot, hopeless for a 330 px one.
+fn prefer_qobuz_art_for_slot<const N: usize>(uri: &mut heapless::String<N>) {
+    let Some(size) = QOBUZ_ART_SIZES
+        .iter()
+        .copied()
+        .find(|size| *size >= app_core::HIFI_ARTWORK_SIZE)
+    else {
+        // Bigger than anything Qobuz publishes: leave the URI alone rather
+        // than downgrade it.
+        return;
+    };
+    set_qobuz_art_size(uri, size);
+}
+
+fn set_qobuz_art_size<const N: usize>(uri: &mut heapless::String<N>, size: u32) {
     if !uri.starts_with("https://static.qobuz.com/") && !uri.starts_with("http://static.qobuz.com/")
     {
         return;
@@ -1957,15 +2028,20 @@ fn prefer_smaller_qobuz_art<const N: usize>(uri: &mut heapless::String<N>) {
         return;
     }
 
-    let mut smaller = heapless::String::<N>::new();
-    if smaller.push_str(&uri[..size_start]).is_err()
-        || smaller.push_str("_50").is_err()
-        || smaller.push_str(&uri[extension_start..]).is_err()
+    let mut suffix = heapless::String::<8>::new();
+    if core::fmt::write(&mut suffix, format_args!("_{size}")).is_err() {
+        return;
+    }
+
+    let mut resized = heapless::String::<N>::new();
+    if resized.push_str(&uri[..size_start]).is_err()
+        || resized.push_str(suffix.as_str()).is_err()
+        || resized.push_str(&uri[extension_start..]).is_err()
     {
         return;
     }
 
-    *uri = smaller;
+    *uri = resized;
 }
 
 fn find_tag_content(xml: &str, tag: &str) -> Option<(usize, usize)> {
@@ -2172,9 +2248,11 @@ mod tests {
         assert_eq!(status.title.as_str(), "Caroline");
         assert_eq!(status.artist.as_str(), "Jacob Banks");
         assert_eq!(status.album.as_str(), "Village");
+        // The device offers a medium and a thumbnail; the 330 px slot wants
+        // the medium, even though the thumbnail is listed later.
         assert_eq!(
             status.album_art_uri.as_str(),
-            "http://192.168.7.218/art/thumb.jpg"
+            "http://192.168.7.218/art/medium.jpg"
         );
     }
 
@@ -2211,7 +2289,7 @@ mod tests {
     }
 
     #[test]
-    fn prefers_smaller_qobuz_artwork_uri() {
+    fn keeps_a_qobuz_size_that_already_fills_the_slot() {
         let mut status = HifiStatus::empty();
 
         apply_metadata(
@@ -2219,14 +2297,16 @@ mod tests {
             r#"<DIDL-Lite><item><upnp:albumArtURI>https://static.qobuz.com/images/covers/zl/mi/go7xvf8bnmizl_600.jpg</upnp:albumArtURI></item></DIDL-Lite>"#,
         );
 
+        // 600 is the smallest published size at or above the 330 px slot, so
+        // there is nothing to rewrite.
         assert_eq!(
             status.album_art_uri.as_str(),
-            "https://static.qobuz.com/images/covers/zl/mi/go7xvf8bnmizl_50.jpg"
+            "https://static.qobuz.com/images/covers/zl/mi/go7xvf8bnmizl_600.jpg"
         );
     }
 
     #[test]
-    fn prefers_tiny_qobuz_artwork_uri_from_existing_thumbnail() {
+    fn upgrades_a_qobuz_thumbnail_that_would_not_fill_the_slot() {
         let mut status = HifiStatus::empty();
 
         apply_metadata(
@@ -2234,9 +2314,26 @@ mod tests {
             r#"<DIDL-Lite><item><upnp:albumArtURI>https://static.qobuz.com/images/covers/52/35/0724357473552_230.jpg</upnp:albumArtURI></item></DIDL-Lite>"#,
         );
 
+        // 230 px stretched over a 330 px slot is visibly soft, and the size is
+        // one string edit away, so ask for the next one up.
         assert_eq!(
             status.album_art_uri.as_str(),
-            "https://static.qobuz.com/images/covers/52/35/0724357473552_50.jpg"
+            "https://static.qobuz.com/images/covers/52/35/0724357473552_600.jpg"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_a_thumbnail_when_it_is_the_only_resource() {
+        let mut status = HifiStatus::empty();
+
+        apply_metadata(
+            &mut status,
+            r#"<DIDL-Lite><item><upnp:albumArtURI dlna:profileID="JPEG_TN">http://192.168.7.218/art/thumb.jpg</upnp:albumArtURI></item></DIDL-Lite>"#,
+        );
+
+        assert_eq!(
+            status.album_art_uri.as_str(),
+            "http://192.168.7.218/art/thumb.jpg"
         );
     }
 

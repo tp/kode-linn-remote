@@ -196,6 +196,14 @@ pub fn playlist_next() -> Action<'static> {
     Action::new(Service::Playlist, 1, "Next", &[])
 }
 
+/// Seeks within the current track, in whole seconds from its start.
+///
+/// Used to restart a track without changing it, which is what the remote's
+/// left button does once a track is properly under way.
+pub fn playlist_seek_second_absolute_arg(seconds: &str) -> Action<'_> {
+    Action::one(Service::Playlist, 1, "SeekSecondAbsolute", seconds)
+}
+
 pub fn playlist_previous() -> Action<'static> {
     Action::new(Service::Playlist, 1, "Previous", &[])
 }

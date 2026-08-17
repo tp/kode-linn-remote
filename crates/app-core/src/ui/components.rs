@@ -143,30 +143,6 @@ where
     aa::rounded_rect(display, rect, radius, fill, stroke, 1, OLED_BLACK).map_err(RenderError::Draw)
 }
 
-pub(super) fn draw_progress_bar<D>(
-    display: &mut D,
-    track: Rectangle,
-    remaining_seconds: u64,
-    total_seconds: u64,
-) -> Result<(), RenderError<D::Error>>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    draw_panel(display, track, 8, ACTION_INACTIVE, ACTION_INACTIVE_BORDER)?;
-
-    // `checked_div` rather than a guard: a track with no total duration simply
-    // has nothing to fill.
-    let filled_width = (track.size.width as u64 * remaining_seconds)
-        .checked_div(total_seconds)
-        .unwrap_or(0) as u32;
-    if filled_width == 0 {
-        return Ok(());
-    }
-
-    let fill = Rectangle::new(track.top_left, Size::new(filled_width, track.size.height));
-    draw_panel(display, fill, 8, ACTION_START, ACTION_START_BORDER)
-}
-
 pub(super) fn draw_duration<D>(
     display: &mut D,
     origin: Point,

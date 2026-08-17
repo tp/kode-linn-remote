@@ -18,9 +18,10 @@ The simulator no longer uses SDL2. It uses a native macOS AppKit window through 
 - Click anywhere inside the display area to simulate a tap.
 - Use the on-screen Start and Stop controls to run or pause the stopwatch.
 - The simulator-only tap highlight stays bright for one second and then fades.
-- Use the on-screen directional pad, or the **arrow keys**, to move the focus ring between the controls on the current screen.
-- Use **Select** (or Return) to activate the focused control, and **Back** (or Escape) to go up one level.
-- Running the pad off the top or bottom of a HiFi page turns to the next page.
+- Use the on-screen directional pad, or the **arrow keys**. On the launcher and the music picker this moves a focus ring between controls; **Select** (or Return) activates the focused one.
+- The HiFi remote has two screens and binds the pad directly on the first: **up/down** is volume, **left/right** is the track, and **Select** is play/pause. **Left** restarts the current track once it is more than three seconds in, so pressing it twice goes back.
+- **Back** (or Escape) goes up one level, and on the HiFi remote switches between Now Playing and the music picker.
+- Volume has no permanent bar: it appears over the artwork while it is changing and then goes away.
 - Use the network dropdown to choose the mocked network status.
 - Time advances automatically; use `Advance +1s` when you want an extra manual tick.
 - Use the debug panel to compare core render requests with simulator redraws.

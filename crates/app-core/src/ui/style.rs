@@ -29,6 +29,9 @@ pub(super) mod dot {
     pub(in crate::ui) const SHELL: Rgb565 = Rgb565::new(29, 59, 28);
     /// `#54697A` — the slate of the on-device UI chrome.
     pub(in crate::ui) const SLATE: Rgb565 = Rgb565::new(10, 26, 15);
+    /// `#9DAAB6` — slate lifted until it reads as body text on black. Dim
+    /// enough to sit below the title, bright enough not to look disabled.
+    pub(in crate::ui) const SLATE_LIGHT: Rgb565 = Rgb565::new(19, 42, 22);
     /// `#35434E` — slate dimmed, for borders.
     pub(in crate::ui) const SLATE_DIM: Rgb565 = Rgb565::new(6, 17, 9);
     /// `#141A1F` — slate at panel depth, barely lifted off black.
@@ -46,7 +49,13 @@ pub(super) const SURFACE_BORDER: Rgb565 = dot::SLATE_DIM;
 /// Warm off-white rather than pure white, matching the shell. Pure white on
 /// true black is harsh at this pixel density.
 pub(super) const TEXT_PRIMARY: Rgb565 = dot::SHELL;
-pub(super) const TEXT_SECONDARY: Rgb565 = dot::SHELL;
+/// Secondary text is dimmer than primary, which is what separates a track
+/// title from its artist without a second font or a second size.
+///
+/// This costs nothing: `BitmapFontStyleBuilder` takes the colour at draw time
+/// and blends against the generated glyph coverage, so both tones share one
+/// rasterised font. Only the blend changes.
+pub(super) const TEXT_SECONDARY: Rgb565 = dot::SLATE_LIGHT;
 pub(super) const TEXT_DISABLED: Rgb565 = dot::SLATE;
 
 /// Primary action, carrying the blue button's colour.
@@ -64,6 +73,14 @@ pub(super) const ACTION_INACTIVE_BORDER: Rgb565 = dot::SLATE_DIM;
 /// full bar at zero volume.
 pub(super) const VOLUME_TRACK: Rgb565 = dot::SLATE_DIM;
 pub(super) const VOLUME_ACTIVE: Rgb565 = dot::BLUE;
+
+/// Track progress. Deliberately *not* the same pair as the volume readout:
+/// the two used to sit twelve pixels apart looking identical, one tracking the
+/// track and one tracking the level, and read as a single confusing pair. The
+/// volume bar is gone now, but keeping the colours distinct means a future
+/// reader cannot reintroduce the confusion by accident.
+pub(super) const PROGRESS_TRACK: Rgb565 = dot::SLATE_DEEP;
+pub(super) const PROGRESS_FILL: Rgb565 = dot::SHELL;
 
 /// Ring drawn around the control the D-pad is currently on.
 pub(super) const FOCUS_RING: Rgb565 = dot::BLUE;
