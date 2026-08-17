@@ -252,6 +252,15 @@ where
         self.session.predict_skip(step, now_ms)
     }
 
+    fn next_artwork_uri(&self) -> Option<heapless::String<{ app_core::HIFI_URI_LEN }>> {
+        let next = self.session.playlist().neighbour_id(Step::Forward)?;
+        let metadata = self.session.playlist().cached(next)?;
+        if metadata.album_art_uri.is_empty() {
+            return None;
+        }
+        Some(metadata.album_art_uri.clone())
+    }
+
     fn status(&mut self) -> Result<HifiStatus, Self::Error> {
         if let Some(status) = self.pending_status.take() {
             return Ok(status);

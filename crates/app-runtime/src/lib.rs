@@ -40,6 +40,14 @@ pub trait HifiController {
     fn predict_skip(&mut self, _forward: bool, _now_ms: u64) -> Option<HifiStatus> {
         None
     }
+
+    /// The artwork URI a forward skip would land on, if it is already known.
+    ///
+    /// Lets the driver fetch and decode the next cover before it is asked for,
+    /// so a skip swaps words and picture together instead of twice.
+    fn next_artwork_uri(&self) -> Option<heapless::String<{ app_core::HIFI_URI_LEN }>> {
+        None
+    }
 }
 
 #[derive(Debug)]

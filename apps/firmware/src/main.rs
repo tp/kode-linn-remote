@@ -626,7 +626,7 @@ async fn hifi_runtime_loop(mut driver: HifiDriver<FirmwareHifi<'static>>) -> ! {
                     driver.set_active(active, EmbassyInstant::now().as_millis());
                 }
                 HifiRequest::Command(command) => {
-                    apply_hifi_driver_result(driver.handle_command(command)).await;
+                    apply_hifi_driver_events(driver.handle_command(command)).await;
                 }
             }
         }
@@ -787,6 +787,23 @@ impl HifiController for FirmwareHifi<'_> {
     fn mark_track_changed(&mut self) {
         self.pending_status = None;
         self.session.clear_track_metadata();
+    }
+}
+
+/// Same as [`apply_hifi_driver_result`], for the command path, which can now
+/// produce a track and its already-decoded cover together.
+async fn apply_hifi_driver_events(
+    result: Result<app_runtime::hifi::TrackChangeEvents, HifiDriverError<FirmwareHifiError>>,
+) {
+    match result {
+        Ok(events) => {
+            for event in events {
+                send_app_event(event).await;
+            }
+        }
+        Err(HifiDriverError::Status(RuntimeError::Hifi(FirmwareHifiError::Idle)))
+        | Err(HifiDriverError::Pins(RuntimeError::Hifi(FirmwareHifiError::Idle))) => {}
+        Err(error) => log_hifi_driver_error(error),
     }
 }
 
