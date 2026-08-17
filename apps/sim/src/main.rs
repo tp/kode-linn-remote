@@ -10,8 +10,8 @@ use std::{
 
 use app_config::AppConfig;
 use app_core::{
-    App, Button, Command, DISPLAY_SIZE, Event, NetworkStatus, RECOMMENDED_SCRATCH_PIXELS, Screen,
-    TouchPoint,
+    App, Button, Command, DISPLAY_SIZE, Event, NetworkStatus, RECOMMENDED_SCRATCH_PIXELS,
+    RenderSession, Screen, TouchPoint,
 };
 use app_runtime::{
     hifi::{
@@ -184,6 +184,10 @@ impl OriginDimensions for Framebuffer {
 struct NativeSimulator {
     app: App,
     app_framebuffer: Framebuffer,
+    /// Paired with `app_framebuffer`: one session per target, for that
+    /// target's lifetime. `output_framebuffer` needs none — it is a copy
+    /// destination, never rendered into by the app.
+    app_session: RenderSession,
     output_framebuffer: Framebuffer,
     scratch: Vec<Rgb565>,
     app_frame_dirty: bool,
@@ -203,6 +207,7 @@ impl NativeSimulator {
         Self {
             app,
             app_framebuffer: Framebuffer::new(DISPLAY_SIZE),
+            app_session: RenderSession::new(),
             output_framebuffer: Framebuffer::new(DISPLAY_SIZE),
             scratch: vec![Rgb565::BLACK; RECOMMENDED_SCRATCH_PIXELS],
             app_frame_dirty: true,
@@ -304,7 +309,11 @@ impl NativeSimulator {
 
         if self.app_frame_dirty {
             self.app
-                .render(&mut self.app_framebuffer, &mut self.scratch)
+                .render(
+                    &mut self.app_framebuffer,
+                    &mut self.scratch,
+                    &mut self.app_session,
+                )
                 .expect("app rendering should succeed");
             self.app_frame_dirty = false;
             self.render_stats.record_core_frame_rendered();
@@ -1090,7 +1099,8 @@ fn write_snapshots(directory: &Path) -> std::io::Result<()> {
         }
 
         let mut framebuffer = Framebuffer::new(DISPLAY_SIZE);
-        app.render(&mut framebuffer, &mut scratch)
+        let mut session = RenderSession::new();
+        app.render(&mut framebuffer, &mut scratch, &mut session)
             .expect("snapshot rendering should succeed");
 
         let path = directory.join(format!("{name}.png"));

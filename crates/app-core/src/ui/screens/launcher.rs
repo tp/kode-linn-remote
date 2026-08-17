@@ -42,13 +42,18 @@ pub(crate) struct Layout {
     pub(super) network_status_center: Point,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct State {
-    render_cache: RenderCache,
+    /// Spinner phase as of the last tick. Animation position is app state —
+    /// it is what the clock says, not what the panel shows — so it stays here
+    /// while `spinner_phase_drawn` lives in [`RenderCache`].
+    spinner_phase_ticked: Option<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RenderCache {
+/// What this screen knows about one render target. Owned by
+/// [`crate::RenderSession`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RenderCache {
     static_drawn: bool,
     network_status_drawn: Option<NetworkStatus>,
     spinner_phase_drawn: Option<u8>,
@@ -57,30 +62,27 @@ struct RenderCache {
 impl State {
     pub(crate) const fn new() -> Self {
         Self {
-            render_cache: RenderCache::new(),
+            spinner_phase_ticked: None,
         }
     }
 
-    /// Drops every cached "already drawn" flag so the next render repaints
-    /// from scratch. Used when the focus ring moves and the old outline has to
-    /// disappear along with it.
-    pub(crate) fn invalidate(&mut self) {
-        self.render_cache = RenderCache::new();
-    }
-
-    pub(crate) fn on_tick(&self, context: AppContext) -> bool {
-        matches!(context.network_status, NetworkStatus::Connecting)
-            && self.render_cache.spinner_phase_drawn != Some(spinner_phase(context.uptime_ms))
-    }
-}
-
-impl RenderCache {
-    const fn new() -> Self {
-        Self {
-            static_drawn: false,
-            network_status_drawn: None,
-            spinner_phase_drawn: None,
+    /// Whether this tick advanced the connecting spinner.
+    ///
+    /// Asks the clock rather than the panel: consulting what was last *drawn*
+    /// would mean the update path reading render state, which is exactly the
+    /// coupling [`crate::RenderSession`] exists to remove.
+    pub(crate) fn on_tick(&mut self, context: AppContext) -> bool {
+        if !matches!(context.network_status, NetworkStatus::Connecting) {
+            self.spinner_phase_ticked = None;
+            return false;
         }
+
+        let phase = spinner_phase(context.uptime_ms);
+        if self.spinner_phase_ticked == Some(phase) {
+            return false;
+        }
+        self.spinner_phase_ticked = Some(phase);
+        true
     }
 }
 
@@ -130,7 +132,7 @@ fn hit_test(layout: &Layout, point: Point) -> Option<Screen> {
 }
 
 pub(crate) fn render<D>(
-    state: &mut State,
+    cache: &mut RenderCache,
     context: AppContext,
     display: &mut D,
     scratch: &mut [Rgb565],
@@ -142,10 +144,10 @@ where
     let mut painter = Painter::new(display, scratch);
     let static_chrome = StaticChrome {
         layout: *ui_layout,
-        already_drawn: state.render_cache.static_drawn,
+        already_drawn: cache.static_drawn,
     };
     painter.draw(&static_chrome).map_err(RenderError::Draw)?;
-    state.render_cache.static_drawn = true;
+    cache.static_drawn = true;
 
     let status_center = ui_layout.network_status_center;
     let spinner_phase = spinner_phase(context.uptime_ms);
@@ -153,12 +155,12 @@ where
         center: status_center,
         status: context.network_status,
         spinner_phase,
-        previous_status: state.render_cache.network_status_drawn,
-        previous_spinner_phase: state.render_cache.spinner_phase_drawn,
+        previous_status: cache.network_status_drawn,
+        previous_spinner_phase: cache.spinner_phase_drawn,
     };
     painter.draw(&network_status).map_err(RenderError::Draw)?;
-    state.render_cache.network_status_drawn = Some(context.network_status);
-    state.render_cache.spinner_phase_drawn = match context.network_status {
+    cache.network_status_drawn = Some(context.network_status);
+    cache.spinner_phase_drawn = match context.network_status {
         NetworkStatus::Connecting => Some(spinner_phase),
         NetworkStatus::Online | NetworkStatus::Offline => None,
     };

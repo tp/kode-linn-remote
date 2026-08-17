@@ -101,9 +101,6 @@ impl State {
         }
     }
 
-    /// This screen repaints in full every frame, so there is no cache to drop.
-    pub(crate) fn invalidate(&mut self) {}
-
     pub(crate) fn on_tick(&mut self, uptime_ms: u64) -> bool {
         if !self.running {
             return false;

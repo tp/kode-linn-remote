@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use app_config::{AppConfig, WifiConfig};
 use app_core::{
     App, Button, Command, Event, HifiArtwork, HifiCommand, HifiPins, HifiStatus, NetworkStatus,
-    RECOMMENDED_SCRATCH_PIXELS, Screen,
+    RECOMMENDED_SCRATCH_PIXELS, RenderSession, Screen,
 };
 use app_runtime::hifi::{DriverError as HifiDriverError, HifiDriver};
 use app_runtime::lpec::{
@@ -183,6 +183,10 @@ async fn main(spawner: Spawner) -> ! {
         println!("display: initial clear failed: {}", error);
     }
 
+    // One session per render target, living as long as the display does. It
+    // starts empty, which matches the panel we just cleared.
+    let mut session = RenderSession::new();
+
     // Scratch buffer for the painter's text-band fast path. Lives on the heap
     // — vec! goes straight to the allocator, avoiding a 30+ KB stack alloc.
     let mut scratch: Vec<Rgb565> = vec![Rgb565::BLACK; RECOMMENDED_SCRATCH_PIXELS];
@@ -192,7 +196,7 @@ async fn main(spawner: Spawner) -> ! {
         scratch.len() * 2
     );
 
-    match app.render(&mut display, &mut scratch) {
+    match app.render(&mut display, &mut scratch, &mut session) {
         Ok(()) => {
             println!("display: initial frame rendered");
             match display.set_brightness(0xff) {
@@ -219,7 +223,13 @@ async fn main(spawner: Spawner) -> ! {
         let render_requested = app
             .update(Event::NetworkStatus(NetworkStatus::Connecting))
             .render_requested;
-        let _ = render_app(&mut app, &mut display, &mut scratch, render_requested);
+        let _ = render_app(
+            &mut app,
+            &mut display,
+            &mut scratch,
+            &mut session,
+            render_requested,
+        );
         spawner.spawn(
             firmware_runtime_task(
                 spawner,
@@ -306,7 +316,13 @@ async fn main(spawner: Spawner) -> ! {
         render_requested |= outcome.render_requested;
         sync_hifi_screen_focus(&app, &mut hifi_screen_active);
 
-        frame_rendered |= render_app(&mut app, &mut display, &mut scratch, render_requested);
+        frame_rendered |= render_app(
+            &mut app,
+            &mut display,
+            &mut scratch,
+            &mut session,
+            render_requested,
+        );
 
         if let Some(command) = pending_command {
             send_hifi_command(command);
@@ -813,6 +829,7 @@ fn render_app<D>(
     app: &mut App,
     display: &mut D,
     scratch: &mut [Rgb565],
+    session: &mut RenderSession,
     render_requested: bool,
 ) -> bool
 where
@@ -823,7 +840,7 @@ where
     }
 
     // Screen-change clear is handled inside App::render now.
-    match app.render(display, scratch) {
+    match app.render(display, scratch, session) {
         Ok(()) => true,
         Err(_) => {
             println!("display: render failed");

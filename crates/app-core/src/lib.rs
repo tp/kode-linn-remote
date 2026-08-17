@@ -10,6 +10,7 @@ use heapless::String;
 mod ui;
 
 pub use ui::RECOMMENDED_SCRATCH_PIXELS;
+pub use ui::RenderSession;
 pub use ui::screens::hifi::Command as HifiCommand;
 
 pub type ArtworkPixel = Rgb565;
@@ -287,7 +288,6 @@ pub struct App {
     interaction_count: u32,
     ui_layouts: ui::ScreenLayouts,
     active_screen: ActiveScreen,
-    pub(crate) last_rendered_screen: Option<Screen>,
     /// Index into the active screen's focus targets: the control the D-pad is
     /// on. `None` until the pad is first used, so a touch-only session never
     /// shows a ring it did not ask for.
@@ -317,14 +317,6 @@ impl ActiveScreen {
             Self::HifiControl(_) => Screen::HifiControl,
         }
     }
-
-    fn invalidate(&mut self) {
-        match self {
-            Self::Launcher(state) => state.invalidate(),
-            Self::Stopwatch(state) => state.invalidate(),
-            Self::HifiControl(state) => state.invalidate(),
-        }
-    }
 }
 
 impl App {
@@ -339,7 +331,6 @@ impl App {
             interaction_count: 0,
             ui_layouts: ui::ScreenLayouts::new(ui::SCREEN_BOUNDS),
             active_screen: ActiveScreen::new(screen, 0),
-            last_rendered_screen: None,
             focus: None,
         }
     }
@@ -432,16 +423,17 @@ impl App {
         self.focus.and_then(|index| targets.get(index).copied())
     }
 
-    /// Moves the ring, forcing a full repaint so the previous outline is not
-    /// left behind by the per-screen dirty-region caches.
+    /// Moves the ring. Returns whether it actually moved.
+    ///
+    /// No cache poking here: [`RenderSession`] compares the ring's bounds
+    /// against what it last drew and clears the target itself. Input handling
+    /// has no business knowing how a screen repaints.
     fn set_focus(&mut self, focus: Option<usize>) -> bool {
         if self.focus == focus {
             return false;
         }
 
         self.focus = focus;
-        self.active_screen.invalidate();
-        self.last_rendered_screen = None;
         true
     }
 
@@ -730,8 +722,10 @@ mod tests {
         display.set_allow_overdraw(true);
         display.set_allow_out_of_bounds_drawing(true);
         let mut scratch = test_scratch();
+        let mut session = RenderSession::new();
 
-        app.render(&mut display, &mut scratch).unwrap();
+        app.render(&mut display, &mut scratch, &mut session)
+            .unwrap();
     }
 
     #[test]
@@ -1082,8 +1076,10 @@ mod tests {
             display.set_allow_overdraw(true);
             display.set_allow_out_of_bounds_drawing(true);
             let mut scratch = test_scratch();
+            let mut session = RenderSession::new();
 
-            app.render(&mut display, &mut scratch).unwrap();
+            app.render(&mut display, &mut scratch, &mut session)
+                .unwrap();
         }
     }
 
@@ -1095,9 +1091,165 @@ mod tests {
             display.set_allow_overdraw(true);
             display.set_allow_out_of_bounds_drawing(true);
             let mut scratch = test_scratch();
+            let mut session = RenderSession::new();
 
-            app.render(&mut display, &mut scratch).unwrap();
+            app.render(&mut display, &mut scratch, &mut session)
+                .unwrap();
         }
+    }
+
+    /// A display that can be told to fail, and that counts the pixels it took.
+    ///
+    /// `MockDisplay` cannot fail on demand, and these two tests are entirely
+    /// about what happens when a frame does not complete.
+    struct FlakyDisplay {
+        fail_after: Option<usize>,
+        drawn: usize,
+    }
+
+    impl FlakyDisplay {
+        fn new() -> Self {
+            Self {
+                fail_after: None,
+                drawn: 0,
+            }
+        }
+
+        fn failing_after(pixels: usize) -> Self {
+            Self {
+                fail_after: Some(pixels),
+                drawn: 0,
+            }
+        }
+    }
+
+    impl DrawTarget for FlakyDisplay {
+        type Color = Rgb565;
+        type Error = ();
+
+        fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+        where
+            I: IntoIterator<Item = embedded_graphics::Pixel<Self::Color>>,
+        {
+            for _ in pixels {
+                if let Some(limit) = self.fail_after
+                    && self.drawn >= limit
+                {
+                    return Err(());
+                }
+                self.drawn += 1;
+            }
+            Ok(())
+        }
+    }
+
+    impl embedded_graphics::geometry::OriginDimensions for FlakyDisplay {
+        fn size(&self) -> Size {
+            DISPLAY_SIZE
+        }
+    }
+
+    #[test]
+    fn rendering_to_a_second_target_is_not_suppressed_by_the_first() {
+        // The bug this guards: with the cache inside App, the first target's
+        // "already drawn" flags made the second target come out mostly blank.
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        app.update(Event::Tick { uptime_ms: 6_000 });
+        let mut scratch = test_scratch();
+
+        let mut first_session = RenderSession::new();
+        let mut first = FlakyDisplay::new();
+        app.render(&mut first, &mut scratch, &mut first_session)
+            .unwrap();
+
+        let mut second_session = RenderSession::new();
+        let mut second = FlakyDisplay::new();
+        app.render(&mut second, &mut scratch, &mut second_session)
+            .unwrap();
+
+        assert!(first.drawn > 0, "first target received pixels");
+        assert_eq!(
+            first.drawn, second.drawn,
+            "a fresh session must paint the second target as fully as the first"
+        );
+    }
+
+    #[test]
+    fn reusing_one_session_across_targets_still_smart_skips() {
+        // The other half of the contract: a session is per-target *because*
+        // reusing one legitimately suppresses redundant drawing.
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        app.update(Event::Tick { uptime_ms: 6_000 });
+        let mut scratch = test_scratch();
+        let mut session = RenderSession::new();
+
+        let mut first = FlakyDisplay::new();
+        app.render(&mut first, &mut scratch, &mut session).unwrap();
+
+        let mut second = FlakyDisplay::new();
+        app.render(&mut second, &mut scratch, &mut session).unwrap();
+
+        assert!(
+            second.drawn < first.drawn,
+            "unchanged widgets should be skipped on the second frame"
+        );
+    }
+
+    #[test]
+    fn a_failed_frame_does_not_leave_the_cache_claiming_pixels() {
+        // The bug this guards: a frame that failed part-way had already
+        // updated some cache fields, so the retry skipped widgets that never
+        // reached the panel.
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        app.update(Event::Tick { uptime_ms: 6_000 });
+        let mut scratch = test_scratch();
+
+        // Baseline: what a clean frame costs.
+        let mut reference_session = RenderSession::new();
+        let mut reference = FlakyDisplay::new();
+        app.render(&mut reference, &mut scratch, &mut reference_session)
+            .unwrap();
+        let full_frame = reference.drawn;
+        assert!(full_frame > 100, "sanity: a full frame draws a lot");
+
+        // Now fail partway through, then retry on the same session.
+        let mut session = RenderSession::new();
+        let mut failing = FlakyDisplay::failing_after(full_frame / 2);
+        assert!(
+            app.render(&mut failing, &mut scratch, &mut session)
+                .is_err(),
+            "the display was told to fail"
+        );
+
+        let mut retry = FlakyDisplay::new();
+        app.render(&mut retry, &mut scratch, &mut session).unwrap();
+
+        assert_eq!(
+            retry.drawn, full_frame,
+            "the retry must repaint in full, not skip what the failed frame never drew"
+        );
+    }
+
+    #[test]
+    fn external_clear_forces_a_full_repaint() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        app.update(Event::Tick { uptime_ms: 6_000 });
+        let mut scratch = test_scratch();
+        let mut session = RenderSession::new();
+
+        let mut first = FlakyDisplay::new();
+        app.render(&mut first, &mut scratch, &mut session).unwrap();
+
+        // Something outside App::render wiped the panel.
+        session.note_external_clear();
+
+        let mut after = FlakyDisplay::new();
+        app.render(&mut after, &mut scratch, &mut session).unwrap();
+
+        assert_eq!(
+            after.drawn, first.drawn,
+            "after an external clear the next frame must repaint everything"
+        );
     }
 
     fn test_scratch() -> std::vec::Vec<Rgb565> {

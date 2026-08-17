@@ -162,7 +162,6 @@ pub(super) struct VolumePageLayout {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct State {
     page: HifiPage,
-    last_rendered_page: Option<HifiPage>,
     status: HifiStatus,
     artwork: Option<HifiArtwork>,
     pins: HifiPins,
@@ -171,10 +170,41 @@ pub(crate) struct State {
     last_second: u64,
     current_ms: u64,
     current_second: u64,
+    marquee: MarqueeState,
+    /// Set when the pin set changes, cleared once the Pins page repaints.
+    /// Content changes reach the display cache through a flag, because state
+    /// no longer has access to it.
+    pins_dirty: bool,
+}
+
+/// Everything this screen knows about what is currently on one render target.
+///
+/// Owned by [`crate::RenderSession`] rather than by [`State`]: it describes
+/// the relationship between the app and one display, so two targets need two
+/// of them, and a failed frame must be able to throw one away.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RenderCache {
+    last_rendered_page: Option<HifiPage>,
     status_cache: StatusCache,
     pins_cache: PinsCache,
     volume_cache: VolumeCache,
     play_slot: Slot,
+}
+
+impl RenderCache {
+    pub(crate) fn new(layout: &Layout) -> Self {
+        Self {
+            last_rendered_page: None,
+            status_cache: StatusCache::default(),
+            pins_cache: PinsCache::default(),
+            volume_cache: VolumeCache::default(),
+            play_slot: Slot::new(layout.status.play_button),
+        }
+    }
+
+    pub(crate) fn reset(&mut self, layout: &Layout) {
+        *self = Self::new(layout);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
@@ -189,13 +219,23 @@ struct StatusCache {
     artist: String<HIFI_TEXT_LEN>,
     artwork_uri: String<HIFI_URI_LEN>,
     loading_visible: bool,
-    title_overflow_px: u32,
-    title_anim_base_ms: u64,
     title_marquee_offset_px: Option<i32>,
-    artist_overflow_px: u32,
-    artist_anim_base_ms: u64,
     artist_marquee_offset_px: Option<i32>,
     transport_controls_drawn: bool,
+}
+
+/// Marquee bookkeeping for the two scrolling text bands.
+///
+/// Deliberately *not* part of [`RenderCache`]. The overflow widths are
+/// measured from the font and describe the text, not the panel, and
+/// [`State::on_tick`] reads them to decide whether a frame is needed at all —
+/// which happens on the update path, where no render session is in scope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MarqueeState {
+    title_overflow_px: u32,
+    title_anim_base_ms: u64,
+    artist_overflow_px: u32,
+    artist_anim_base_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
@@ -236,7 +276,6 @@ impl State {
 
         Self {
             page: HifiPage::Status,
-            last_rendered_page: None,
             status: HifiStatus::waiting(),
             artwork: None,
             pins: HifiPins::new(),
@@ -245,12 +284,8 @@ impl State {
             last_second: current_second,
             current_ms: uptime_ms,
             current_second,
-            status_cache: StatusCache::default(),
-            pins_cache: PinsCache::default(),
-            volume_cache: VolumeCache::default(),
-            // Bounds is filled in lazily — Layout is screen-fixed but State is
-            // created before we know it.
-            play_slot: Slot::new(Rectangle::new(Point::zero(), Size::zero())),
+            marquee: MarqueeState::default(),
+            pins_dirty: false,
         }
     }
 
@@ -301,17 +336,6 @@ impl State {
         targets
     }
 
-    /// Drops every cached "already drawn" flag so the next render repaints from
-    /// scratch. Used when the focus ring moves and the old outline has to
-    /// disappear along with it.
-    pub(crate) fn invalidate(&mut self) {
-        self.last_rendered_page = None;
-        self.status_cache = StatusCache::default();
-        self.pins_cache = PinsCache::default();
-        self.volume_cache = VolumeCache::default();
-        self.play_slot.previous_kind = None;
-    }
-
     pub(crate) fn on_tick(&mut self, uptime_ms: u64) -> bool {
         self.current_ms = uptime_ms;
         if self.loading {
@@ -325,8 +349,7 @@ impl State {
         }
 
         let marquee_active = matches!(self.page, HifiPage::Status)
-            && (self.status_cache.title_overflow_px > 0
-                || self.status_cache.artist_overflow_px > 0);
+            && (self.marquee.title_overflow_px > 0 || self.marquee.artist_overflow_px > 0);
 
         if self.status.playback == PlaybackState::Buffering {
             return true;
@@ -403,8 +426,8 @@ impl State {
             return false;
         }
         self.pins = pins;
-        // Force a Pins-page redraw next time we're on it.
-        self.pins_cache = PinsCache::default();
+        // Force a Pins-page redraw next time we are on it.
+        self.pins_dirty = true;
         true
     }
 
@@ -657,6 +680,7 @@ fn hit_test_volume(layout: &VolumePageLayout, point: Point) -> Option<Action> {
 
 pub(crate) fn render<D>(
     state: &mut State,
+    cache: &mut RenderCache,
     display: &mut D,
     scratch: &mut [Rgb565],
     ui_layout: &Layout,
@@ -664,13 +688,18 @@ pub(crate) fn render<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    state.play_slot.bounds = ui_layout.status.play_button;
+    cache.play_slot.bounds = ui_layout.status.play_button;
 
-    if state.last_rendered_page != Some(state.page) {
-        let page_to_clear = state.last_rendered_page.unwrap_or(state.page);
+    if state.pins_dirty {
+        cache.pins_cache = PinsCache::default();
+        state.pins_dirty = false;
+    }
+
+    if cache.last_rendered_page != Some(state.page) {
+        let page_to_clear = cache.last_rendered_page.unwrap_or(state.page);
         clear_rect(display, ui_layout.body_for_page(page_to_clear))?;
-        invalidate_caches_on_page_change(state);
-        state.last_rendered_page = Some(state.page);
+        invalidate_caches_on_page_change(cache);
+        cache.last_rendered_page = Some(state.page);
     }
 
     let mut painter = Painter::new(display, scratch);
@@ -682,29 +711,34 @@ where
         track_color: VOLUME_TRACK,
         active_color: VOLUME_ACTIVE,
         percent: state.status.volume_percent,
-        previous_percent: state.status_cache.volume_percent,
+        previous_percent: cache.status_cache.volume_percent,
     };
     painter.draw(&volume).map_err(RenderError::Draw)?;
-    state.status_cache.volume_percent = Some(state.status.volume_percent);
+    cache.status_cache.volume_percent = Some(state.status.volume_percent);
 
     drop(painter);
 
     match state.page {
-        HifiPage::Status => render_status(state, display, scratch, &ui_layout.status),
-        HifiPage::Pins => render_pins(state, display, scratch, &ui_layout.pins),
-        HifiPage::Volume => render_volume_page(state, display, scratch, &ui_layout.volume_page),
+        HifiPage::Status => render_status(state, cache, display, scratch, &ui_layout.status),
+        HifiPage::Pins => render_pins(state, cache, display, scratch, &ui_layout.pins),
+        HifiPage::Volume => {
+            render_volume_page(state, cache, display, scratch, &ui_layout.volume_page)
+        }
     }
 }
 
-fn invalidate_caches_on_page_change(state: &mut State) {
-    state.status_cache = StatusCache::default();
-    state.pins_cache = PinsCache::default();
-    state.volume_cache = VolumeCache::default();
-    state.play_slot.previous_kind = None;
+/// Slot transitions and page-local cache resets stay here rather than moving
+/// to the session: only this module knows what a page change invalidates.
+fn invalidate_caches_on_page_change(cache: &mut RenderCache) {
+    cache.status_cache = StatusCache::default();
+    cache.pins_cache = PinsCache::default();
+    cache.volume_cache = VolumeCache::default();
+    cache.play_slot.previous_kind = None;
 }
 
 fn render_status<D>(
     state: &mut State,
+    cache: &mut RenderCache,
     display: &mut D,
     scratch: &mut [Rgb565],
     ui_layout: &StatusLayout,
@@ -717,7 +751,7 @@ where
     // The play-button area is a slot: spinner / play icon / pause bars / buffering / artwork
     // are mutually exclusive and the slot clears on kind transitions.
     let play_kind = compute_play_kind(state);
-    state
+    cache
         .play_slot
         .clear_if_kind_changed(painter.display(), play_kind)
         .map_err(RenderError::Draw)?;
@@ -729,34 +763,34 @@ where
         let spinner = Spinner {
             center: rect_visual_center(ui_layout.play_button),
             phase: spinner_phase(state.current_ms),
-            previous_phase: if state.play_slot.previous_kind == Some(PLAY_SLOT_SPINNER) {
-                state.status_cache.spinner_phase
+            previous_phase: if cache.play_slot.previous_kind == Some(PLAY_SLOT_SPINNER) {
+                cache.status_cache.spinner_phase
             } else {
                 None
             },
         };
         painter.draw(&spinner).map_err(RenderError::Draw)?;
-        state.status_cache.spinner_phase = Some(spinner.phase);
-        state.play_slot.previous_kind = Some(play_kind);
-        state.status_cache.loading_visible = true;
-        state.status_cache.has_rendered = true;
+        cache.status_cache.spinner_phase = Some(spinner.phase);
+        cache.play_slot.previous_kind = Some(play_kind);
+        cache.status_cache.loading_visible = true;
+        cache.status_cache.has_rendered = true;
         return Ok(());
     }
 
-    if state.status_cache.loading_visible {
+    if cache.status_cache.loading_visible {
         // Transitioning out of loading: invalidate caches so all widgets we
         // skipped during the spinner-only phase get a fresh first frame.
-        state.status_cache.title.clear();
-        state.status_cache.artist.clear();
-        state.status_cache.title_marquee_offset_px = None;
-        state.status_cache.artist_marquee_offset_px = None;
-        state.status_cache.elapsed_seconds = None;
-        state.status_cache.duration_seconds = None;
-        state.status_cache.progress_filled_px = None;
-        state.status_cache.loading_visible = false;
+        cache.status_cache.title.clear();
+        cache.status_cache.artist.clear();
+        cache.status_cache.title_marquee_offset_px = None;
+        cache.status_cache.artist_marquee_offset_px = None;
+        cache.status_cache.elapsed_seconds = None;
+        cache.status_cache.duration_seconds = None;
+        cache.status_cache.progress_filled_px = None;
+        cache.status_cache.loading_visible = false;
     }
 
-    if !state.status_cache.transport_controls_drawn {
+    if !cache.status_cache.transport_controls_drawn {
         draw_transport_button(
             painter.display(),
             ui_layout.previous_button,
@@ -769,7 +803,7 @@ where
             ">>",
             ButtonTone::Start,
         )?;
-        state.status_cache.transport_controls_drawn = true;
+        cache.status_cache.transport_controls_drawn = true;
     }
 
     match play_kind {
@@ -777,28 +811,28 @@ where
             let spinner = Spinner {
                 center: rect_visual_center(ui_layout.play_button),
                 phase: spinner_phase(state.current_ms),
-                previous_phase: if state.play_slot.previous_kind == Some(PLAY_SLOT_BUFFERING) {
-                    state.status_cache.spinner_phase
+                previous_phase: if cache.play_slot.previous_kind == Some(PLAY_SLOT_BUFFERING) {
+                    cache.status_cache.spinner_phase
                 } else {
                     None
                 },
             };
             painter.draw(&spinner).map_err(RenderError::Draw)?;
-            state.status_cache.spinner_phase = Some(spinner.phase);
+            cache.status_cache.spinner_phase = Some(spinner.phase);
         }
         PLAY_SLOT_ARTWORK => {
             let artwork = state.artwork.as_ref().expect("artwork present");
-            let already_drawn = state.status_cache.artwork_uri.as_str()
+            let already_drawn = cache.status_cache.artwork_uri.as_str()
                 == artwork.source_uri.as_str()
-                && state.play_slot.previous_kind == Some(PLAY_SLOT_ARTWORK);
+                && cache.play_slot.previous_kind == Some(PLAY_SLOT_ARTWORK);
             let widget = ArtworkWidget {
                 rect: ui_layout.play_button,
                 artwork,
                 already_drawn,
             };
             painter.draw(&widget).map_err(RenderError::Draw)?;
-            state.status_cache.artwork_uri.clear();
-            let _ = state
+            cache.status_cache.artwork_uri.clear();
+            let _ = cache
                 .status_cache
                 .artwork_uri
                 .push_str(artwork.source_uri.as_str());
@@ -806,60 +840,60 @@ where
         PLAY_SLOT_PAUSE_BARS => {
             let widget = PauseBars {
                 rect: ui_layout.play_button,
-                already_drawn: state.play_slot.previous_kind == Some(PLAY_SLOT_PAUSE_BARS),
+                already_drawn: cache.play_slot.previous_kind == Some(PLAY_SLOT_PAUSE_BARS),
             };
             painter.draw(&widget).map_err(RenderError::Draw)?;
         }
         PLAY_SLOT_PLAY_ICON => {
             let widget = PlayTriangle {
                 rect: ui_layout.play_button,
-                already_drawn: state.play_slot.previous_kind == Some(PLAY_SLOT_PLAY_ICON),
+                already_drawn: cache.play_slot.previous_kind == Some(PLAY_SLOT_PLAY_ICON),
             };
             painter.draw(&widget).map_err(RenderError::Draw)?;
         }
         _ => {}
     }
-    state.play_slot.previous_kind = Some(play_kind);
+    cache.play_slot.previous_kind = Some(play_kind);
 
     let timer = TimerDisplay {
         origin: ui_layout.timer_origin,
         bounds: ui_layout.timer_bounds,
         elapsed: state.status.elapsed_seconds,
-        previous_elapsed: state.status_cache.elapsed_seconds,
+        previous_elapsed: cache.status_cache.elapsed_seconds,
     };
     painter.draw(&timer).map_err(RenderError::Draw)?;
-    state.status_cache.elapsed_seconds = Some(state.status.elapsed_seconds);
+    cache.status_cache.elapsed_seconds = Some(state.status.elapsed_seconds);
 
     let new_filled_px =
         progress_filled_px(state.status.elapsed_seconds, state.status.duration_seconds);
     let progress = ProgressBarWidget {
         rect: ui_layout.progress,
         filled_px: new_filled_px,
-        previous_filled_px: state.status_cache.progress_filled_px,
-        previous_duration: state.status_cache.duration_seconds,
+        previous_filled_px: cache.status_cache.progress_filled_px,
+        previous_duration: cache.status_cache.duration_seconds,
         duration: state.status.duration_seconds,
     };
     painter.draw(&progress).map_err(RenderError::Draw)?;
-    state.status_cache.progress_filled_px = Some(new_filled_px);
-    state.status_cache.duration_seconds = Some(state.status.duration_seconds);
+    cache.status_cache.progress_filled_px = Some(new_filled_px);
+    cache.status_cache.duration_seconds = Some(state.status.duration_seconds);
 
     let song_text = non_empty_or(&state.status.title, "No track");
-    let song_text_changed = state.status_cache.title.as_str() != song_text;
+    let song_text_changed = cache.status_cache.title.as_str() != song_text;
     if song_text_changed {
-        state.status_cache.title_anim_base_ms = state.current_ms;
-        state.status_cache.title_marquee_offset_px = None;
+        state.marquee.title_anim_base_ms = state.current_ms;
+        cache.status_cache.title_marquee_offset_px = None;
     }
     let song_text_width = measure_band_text_width(song_text);
     let song_overflow_px = song_text_width.saturating_sub(ui_layout.song_band.size.width);
     let song_offset_px = compute_marquee_offset(
         state
             .current_ms
-            .saturating_sub(state.status_cache.title_anim_base_ms),
+            .saturating_sub(state.marquee.title_anim_base_ms),
         song_overflow_px,
     );
-    let song_unchanged = state.status_cache.has_rendered
+    let song_unchanged = cache.status_cache.has_rendered
         && !song_text_changed
-        && state.status_cache.title_marquee_offset_px == Some(song_offset_px);
+        && cache.status_cache.title_marquee_offset_px == Some(song_offset_px);
     let song = MarqueeBand {
         band: ui_layout.song_band,
         centered_origin: ui_layout.song_origin,
@@ -870,28 +904,28 @@ where
         offset_px: song_offset_px,
     };
     painter.draw(&song).map_err(RenderError::Draw)?;
-    state.status_cache.title.clear();
-    let _ = state.status_cache.title.push_str(song_text);
-    state.status_cache.title_overflow_px = song_overflow_px;
-    state.status_cache.title_marquee_offset_px = Some(song_offset_px);
+    cache.status_cache.title.clear();
+    let _ = cache.status_cache.title.push_str(song_text);
+    state.marquee.title_overflow_px = song_overflow_px;
+    cache.status_cache.title_marquee_offset_px = Some(song_offset_px);
 
     let artist_text = non_empty_or(&state.status.artist, "Not playing");
-    let artist_text_changed = state.status_cache.artist.as_str() != artist_text;
+    let artist_text_changed = cache.status_cache.artist.as_str() != artist_text;
     if artist_text_changed {
-        state.status_cache.artist_anim_base_ms = state.current_ms;
-        state.status_cache.artist_marquee_offset_px = None;
+        state.marquee.artist_anim_base_ms = state.current_ms;
+        cache.status_cache.artist_marquee_offset_px = None;
     }
     let artist_text_width = measure_band_text_width(artist_text);
     let artist_overflow_px = artist_text_width.saturating_sub(ui_layout.artist_band.size.width);
     let artist_offset_px = compute_marquee_offset(
         state
             .current_ms
-            .saturating_sub(state.status_cache.artist_anim_base_ms),
+            .saturating_sub(state.marquee.artist_anim_base_ms),
         artist_overflow_px,
     );
-    let artist_unchanged = state.status_cache.has_rendered
+    let artist_unchanged = cache.status_cache.has_rendered
         && !artist_text_changed
-        && state.status_cache.artist_marquee_offset_px == Some(artist_offset_px);
+        && cache.status_cache.artist_marquee_offset_px == Some(artist_offset_px);
     let artist = MarqueeBand {
         band: ui_layout.artist_band,
         centered_origin: ui_layout.artist_origin,
@@ -902,12 +936,12 @@ where
         offset_px: artist_offset_px,
     };
     painter.draw(&artist).map_err(RenderError::Draw)?;
-    state.status_cache.artist.clear();
-    let _ = state.status_cache.artist.push_str(artist_text);
-    state.status_cache.artist_overflow_px = artist_overflow_px;
-    state.status_cache.artist_marquee_offset_px = Some(artist_offset_px);
+    cache.status_cache.artist.clear();
+    let _ = cache.status_cache.artist.push_str(artist_text);
+    state.marquee.artist_overflow_px = artist_overflow_px;
+    cache.status_cache.artist_marquee_offset_px = Some(artist_offset_px);
 
-    state.status_cache.has_rendered = true;
+    cache.status_cache.has_rendered = true;
     Ok(())
 }
 
@@ -929,6 +963,7 @@ where
 
 fn render_pins<D>(
     state: &mut State,
+    cache: &mut RenderCache,
     display: &mut D,
     _scratch: &mut [Rgb565],
     ui_layout: &PinsLayout,
@@ -941,9 +976,9 @@ where
         let active = pin.is_some();
         let label = pin_button_label(slot, pin);
 
-        let label_changed = state.pins_cache.drawn_titles[slot].as_str() != label.as_str();
-        let active_changed = state.pins_cache.drawn_active[slot] != active;
-        if state.pins_cache.has_rendered && !label_changed && !active_changed {
+        let label_changed = cache.pins_cache.drawn_titles[slot].as_str() != label.as_str();
+        let active_changed = cache.pins_cache.drawn_active[slot] != active;
+        if cache.pins_cache.has_rendered && !label_changed && !active_changed {
             continue;
         }
 
@@ -959,11 +994,11 @@ where
                 RenderError::TextFormat => Ok(()),
             };
         }
-        state.pins_cache.drawn_titles[slot].clear();
-        let _ = state.pins_cache.drawn_titles[slot].push_str(label.as_str());
-        state.pins_cache.drawn_active[slot] = active;
+        cache.pins_cache.drawn_titles[slot].clear();
+        let _ = cache.pins_cache.drawn_titles[slot].push_str(label.as_str());
+        cache.pins_cache.drawn_active[slot] = active;
     }
-    state.pins_cache.has_rendered = true;
+    cache.pins_cache.has_rendered = true;
     Ok(())
 }
 
@@ -984,6 +1019,7 @@ fn pin_button_label(slot: usize, pin: Option<&crate::HifiPin>) -> String<HIFI_TE
 
 fn render_volume_page<D>(
     state: &mut State,
+    cache: &mut RenderCache,
     display: &mut D,
     _scratch: &mut [Rgb565],
     ui_layout: &VolumePageLayout,
@@ -991,7 +1027,7 @@ fn render_volume_page<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    if !state.volume_cache.static_drawn {
+    if !cache.volume_cache.static_drawn {
         let title_font = ui_font!(BOLD);
         let title_style = BitmapFontStyleBuilder::new()
             .text_color(TEXT_PRIMARY)
@@ -1033,11 +1069,11 @@ where
                 RenderError::TextFormat => Ok(()),
             };
         }
-        state.volume_cache.static_drawn = true;
+        cache.volume_cache.static_drawn = true;
     }
 
     let value = state.status.volume_percent.min(HIFI_VOLUME_MAX);
-    if state.volume_cache.digit_value == Some(value) {
+    if cache.volume_cache.digit_value == Some(value) {
         return Ok(());
     }
     clear_rect(display, ui_layout.value_slot)?;
@@ -1070,7 +1106,7 @@ where
     )
     .draw(display)
     .map_err(RenderError::Draw)?;
-    state.volume_cache.digit_value = Some(value);
+    cache.volume_cache.digit_value = Some(value);
     Ok(())
 }
 
@@ -2008,6 +2044,7 @@ mod tests {
     #[test]
     fn song_text_lands_non_black_pixels_in_band() {
         let layout = layout(SCREEN_BOUNDS);
+        let mut cache = RenderCache::new(&layout);
         let mut state = State::new(0);
         let mut status = HifiStatus::empty();
         status.title.push_str("Caroline").unwrap();
@@ -2017,7 +2054,7 @@ mod tests {
         let mut display = TestDisplay::new(466, 466);
         let mut scratch = std::vec![Rgb565::BLACK; crate::ui::RECOMMENDED_SCRATCH_PIXELS];
 
-        render(&mut state, &mut display, &mut scratch, &layout).unwrap();
+        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
 
         let band = layout.status.song_band;
         let mut non_black = 0_u32;
@@ -2038,6 +2075,7 @@ mod tests {
     #[test]
     fn song_text_persists_across_unchanged_renders() {
         let layout = layout(SCREEN_BOUNDS);
+        let mut cache = RenderCache::new(&layout);
         let mut state = State::new(0);
         let mut status = HifiStatus::empty();
         status.title.push_str("Caroline").unwrap();
@@ -2047,11 +2085,11 @@ mod tests {
         let mut display = TestDisplay::new(466, 466);
         let mut scratch = std::vec![Rgb565::BLACK; crate::ui::RECOMMENDED_SCRATCH_PIXELS];
 
-        render(&mut state, &mut display, &mut scratch, &layout).unwrap();
+        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
         let after_first = count_non_black(&display, layout.status.song_band);
         assert!(after_first > 0, "first render should draw the title");
 
-        render(&mut state, &mut display, &mut scratch, &layout).unwrap();
+        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
         let after_second = count_non_black(&display, layout.status.song_band);
         assert_eq!(
             after_first, after_second,
@@ -2062,11 +2100,12 @@ mod tests {
     #[test]
     fn loading_spinner_pixels_are_cleared_on_transition_out_of_loading() {
         let layout = layout(SCREEN_BOUNDS);
+        let mut cache = RenderCache::new(&layout);
         let mut state = State::new(0);
         let mut display = TestDisplay::new(466, 466);
         let mut scratch = std::vec![Rgb565::BLACK; crate::ui::RECOMMENDED_SCRATCH_PIXELS];
 
-        render(&mut state, &mut display, &mut scratch, &layout).unwrap();
+        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
         assert!(state.loading);
 
         let mut status = HifiStatus::empty();
@@ -2074,7 +2113,7 @@ mod tests {
         status.artist.push_str("Jacob Banks").unwrap();
         status.playback = PlaybackState::Paused;
         state.apply_status(status, 200);
-        render(&mut state, &mut display, &mut scratch, &layout).unwrap();
+        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
         assert!(!state.loading);
 
         let slot_bottom =
@@ -2101,6 +2140,7 @@ mod tests {
     #[test]
     fn volume_value_redraw_preserves_button_controls() {
         let layout = layout(SCREEN_BOUNDS);
+        let mut cache = RenderCache::new(&layout);
         let mut state = State::new(0);
         let mut status = HifiStatus::empty();
         status.volume_percent = 23;
@@ -2110,7 +2150,7 @@ mod tests {
 
         let mut display = TestDisplay::new(466, 466);
         let mut scratch = std::vec![Rgb565::BLACK; crate::ui::RECOMMENDED_SCRATCH_PIXELS];
-        render(&mut state, &mut display, &mut scratch, &layout).unwrap();
+        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
 
         let button_probe = Point::new(
             layout.volume_page.decrement_button.center().x,
@@ -2120,7 +2160,7 @@ mod tests {
 
         status.volume_percent = 24;
         state.apply_status(status, 200);
-        render(&mut state, &mut display, &mut scratch, &layout).unwrap();
+        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
 
         assert_ne!(display.pixel_at(button_probe), Rgb565::BLACK);
     }
@@ -2141,6 +2181,7 @@ mod tests {
     #[test]
     fn artist_text_lands_non_black_pixels_in_band() {
         let layout = layout(SCREEN_BOUNDS);
+        let mut cache = RenderCache::new(&layout);
         let mut state = State::new(0);
         let mut status = HifiStatus::empty();
         status.title.push_str("Caroline").unwrap();
@@ -2151,7 +2192,7 @@ mod tests {
         let mut display = TestDisplay::new(466, 466);
         let mut scratch = std::vec![Rgb565::BLACK; crate::ui::RECOMMENDED_SCRATCH_PIXELS];
 
-        render(&mut state, &mut display, &mut scratch, &layout).unwrap();
+        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
 
         let band = layout.status.artist_band;
         let mut non_black = 0_u32;
