@@ -2,6 +2,7 @@ mod aa;
 mod components;
 pub(crate) mod focus;
 mod geometry;
+mod optimistic;
 mod painter;
 mod render;
 pub(crate) mod screens;
