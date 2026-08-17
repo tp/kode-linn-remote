@@ -54,5 +54,5 @@ ESP32-C6 board and is kept only for its display driver — its 466 x 466 geometr
 no longer matches what `app-core` renders, so flashing it would produce a
 misaligned screen.
 
-See `docs/KODE_DOT_PORT_TICKET.md` for the blocker and the hardware facts to
-confirm on first bring-up.
+The board facts still to confirm on first bring-up are the ones tagged
+`Confidence::Provisional` in `crates/board-kode-dot`.

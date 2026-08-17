@@ -167,7 +167,7 @@ impl DrawTarget for Framebuffer {
     /// frame in memory and blit it, and can align the blit window without
     /// disturbing what it contains. Modelling the old constraint here would
     /// mean designing against a limitation this hardware does not have. See
-    /// docs/DISPLAY_SPEEDUP_TICKET.md.
+    /// docs/ARCHITECTURE.md.
     fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
         self.pixels.fill(color);
         Ok(())

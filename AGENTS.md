@@ -6,7 +6,8 @@
 - Keep macOS/AppKit-only code in `apps/sim`; simulator conveniences should enter the core only as `Event` values.
 - Every screen must be operable from the directional pad, not just touch. Publish focusable controls via `focus_targets` rather than writing per-screen navigation tables.
 - The panel is 410 px wide, so its centre is at an odd x. Give centred widgets even half-widths or the painter's 2-px alignment assertion will fire.
-- `apps/firmware` and `crates/board-waveshare-c6` are legacy: they target the retired round Waveshare board. `esp-hal` has no ESP32-P4 support yet, so there is no Kode Dot firmware. See `docs/KODE_DOT_PORT_TICKET.md`.
+- `apps/firmware` and `crates/board-waveshare-c6` are legacy: they target the retired round Waveshare board. `esp-hal` has no ESP32-P4 support yet, so there is no Kode Dot firmware.
+- The display driver must compose frames in PSRAM and blit them; never satisfy the panel's even-window rule by widening individual fills, which destroys the row above.
 - Prefer deterministic embedded rendering paths over host-only APIs in shared code.
 
 ## Verification

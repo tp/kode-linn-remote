@@ -12,7 +12,7 @@ The workspace separates app behavior from hardware access.
 - `board-kode-dot` records Kode Dot hardware facts and owns the input model. It is the single source of truth for display geometry: `app-core` re-exports `DISPLAY_SIZE` from it rather than repeating the number. Facts inherited from the vendor's ESP32-S3 documentation are tagged `Confidence::Provisional` because the board this project targets is the ESP32-P4 revision.
 - `board-waveshare-c6` records hardware facts for the retired round board the project started on, used only by the legacy firmware.
 - `sim` adapts native macOS controls into app events, renders the app into an AppKit window, and provides host networking adapters to `app-runtime`.
-- `firmware` initializes ESP32-C6 hardware for the retired Waveshare board. It is legacy: `esp-hal` has no ESP32-P4 support, so there is no Kode Dot firmware yet. See `docs/KODE_DOT_PORT_TICKET.md`.
+- `firmware` initializes ESP32-C6 hardware for the retired Waveshare board. It is legacy: `esp-hal` has no ESP32-P4 support, so there is no Kode Dot firmware yet.
 
 ## Event Flow
 
@@ -61,6 +61,8 @@ Simulator zoom changes the AppKit image view size only. The embedded framebuffer
 
 The simulator can also render every screen to PNG and exit (`--snapshot`), which is how layout work gets reviewed without a window or hardware.
 
+The display driver **must compose whole frames in PSRAM and blit them**, aligning the blit window without disturbing its contents. It must not satisfy the panel's even-aligned window requirement by widening individual fills, which is what the round board's framebuffer-less driver did. That is lossy: a fill starting on an odd row grows upward over the row above it, and since the font emits glyph-background fills on odd rows, it silently ate the bottom row of every glyph whose ink ended on an even row — bars and stems rendered about a pixel thin. With 32 MB of PSRAM a full framebuffer costs nothing and removes the whole class of bug.
+
 Because the panel is 410 px wide, its centre line falls on an odd x. Centred widgets therefore need even half-widths to stay on the display controller's 2-px write grid; `Painter` asserts this for scratch-blitted bounds, and `Framebuffer::fill_solid` reproduces the controller's window expansion so the simulator catches drift before hardware does.
 
 ## Hardware Direction
@@ -72,7 +74,7 @@ The firmware is set up for the no_std Espressif stack:
 - `embassy-net` for the no_std TCP/IP stack, with TCP sockets implementing embedded async I/O traits.
 - `reqwless` or an equivalent embedded HTTP/WebSocket-capable client for HTTP-facing integrations.
 
-The first real board task is confirming the panel resolution, display controller and interface for the ESP32-P4 revision, since the vendor documentation still describes the ESP32-S3 revision. See `docs/KODE_DOT_PORT_TICKET.md`.
+The first real board task is confirming the display controller and interface, the touch part, and the button wiring for the ESP32-P4 revision, since the vendor documentation still describes the ESP32-S3 revision. Everything tagged `Confidence::Provisional` in `crates/board-kode-dot` is inherited from those older docs and needs checking against hardware.
 
 ## Network Direction
 

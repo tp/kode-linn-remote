@@ -25,7 +25,7 @@ Read this before touching anything under `crates/app-core/src/ui/`.
      edge pixels (CO5300 write-window expansion).
   3. Updating a `last_rendered` field before drawing succeeds means a failed
      frame leaves the cache lying about what's on screen. (See
-     `RENDER_CACHE_TICKET.md` for the planned fix.)
+     https://github.com/tp/kode-linn-remote/issues/1 for the planned fix.)
 
 ## Files at a glance
 
@@ -67,7 +67,7 @@ State, layout, and presentation are kept apart on purpose:
 - **`LastRendered`** (a substruct of `State` today) holds *presentation*
   facts: "we already drew this title", "the volume wedge sits at 42%", etc.
   This is the "render cache". Long-term it should move out of `State` (see
-  `RENDER_CACHE_TICKET.md`) but for now treat it as write-only inside
+  https://github.com/tp/kode-linn-remote/issues/1) but for now treat it as write-only inside
   `render` and read-only outside.
 
 ## The `Widget` trait
@@ -175,16 +175,20 @@ on screen entry — check this when adding a new screen).
 
 ### 2. Diff-rendered region (paint only the delta)
 
-`VolumeArc` in [hifi.rs](../crates/app-core/src/ui/screens/hifi.rs:577): when
-volume goes 40 → 42, paint a 2-percentage-point arc in the *active* colour;
-when it goes 42 → 40, paint that arc in the *track* colour. First frame paints
-the whole arc.
+`VolumeBar` in [hifi.rs](../crates/app-core/src/ui/screens/hifi.rs): when
+volume goes 40 → 42, paint just that two-point span in the *active* colour;
+when it goes 42 → 40, paint the same span in the *track* colour. The first
+frame paints the whole bar.
+
+(This was a `VolumeArc` tracing the edge of the round 466 x 466 panel. A
+rectangle has no edge to trace, so it became a bar pinned along the bottom;
+the delta-painting behaviour carried over unchanged.)
 
 ```rust
 match self.previous_percent {
-    None             => /* full arc */,
+    None             => /* full bar */,
     Some(p) if p == self.percent => /* skip */,
-    Some(p)          => /* paint just the delta sub-arc */,
+    Some(p)          => /* paint just the delta span */,
 }
 ```
 
@@ -192,7 +196,7 @@ Use this when the widget is much bigger than the typical change region.
 
 ### 3. Animated overdraw (no clear, dots cover dots)
 
-The eight-dot spinner in [components.rs](../crates/app-core/src/ui/components.rs:213).
+The eight-dot spinner in [components.rs](../crates/app-core/src/ui/components.rs).
 Each phase paints dots at the same eight positions; new dots cover old dots
 exactly. **Skip the clear** — clearing causes visible flicker.
 
@@ -253,7 +257,7 @@ Each screen owns a `LastRendered` struct in its `State`. Convention:
 - **Read** the field when constructing the widget. Pass it in as
   `previous_*`.
 - **Write** the field *after* the painter call returns. (This is the bug
-  `RENDER_CACHE_TICKET.md` plans to fix — today we update the cache even on
+  https://github.com/tp/kode-linn-remote/issues/1 plans to fix — today we update the cache even on
   partial-failure paths. Be aware of it; don't make it worse.)
 - **Invalidate** when assumptions change. The hi-fi loading→content
   transition clears every cache field because the spinner-only frame

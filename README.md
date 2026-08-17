@@ -38,9 +38,8 @@ The **ESP32-P4 revision** (November 2026 batch):
   model, peripheral part numbers, each tagged with how far it can be trusted.
 - `apps/sim`: native macOS simulator using AppKit through `objc2`.
 - `apps/firmware`: **legacy** ESP32-C6 firmware for the retired Waveshare
-  board, kept for its CO5300 QSPI display driver. See
-  [docs/KODE_DOT_PORT_TICKET.md](docs/KODE_DOT_PORT_TICKET.md) before touching
-  it — Rust firmware for the ESP32-P4 is currently blocked upstream.
+  board, kept for its CO5300 QSPI display driver. There is no Kode Dot
+  firmware yet.
 - `crates/board-waveshare-c6`: board facts for that retired board.
 
 ## Run The Simulator
