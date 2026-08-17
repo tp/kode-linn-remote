@@ -5,10 +5,12 @@ mod geometry;
 mod painter;
 mod render;
 pub(crate) mod screens;
+mod session;
 mod style;
 mod widget;
 
 pub use painter::RECOMMENDED_SCRATCH_PIXELS;
+pub use session::RenderSession;
 
 use embedded_graphics::primitives::Rectangle;
 pub(crate) use geometry::SCREEN_BOUNDS;
@@ -23,7 +25,7 @@ pub(crate) struct AppContext {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ScreenLayouts {
+pub struct ScreenLayouts {
     launcher: screens::launcher::Layout,
     stopwatch: screens::stopwatch::Layout,
     hifi: screens::hifi::Layout,
