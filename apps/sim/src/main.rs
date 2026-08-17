@@ -3,13 +3,14 @@
 use std::{
     cell::{Cell, OnceCell, RefCell},
     convert::Infallible,
+    path::Path,
     sync::mpsc::TryRecvError,
     time::Instant,
 };
 
 use app_config::AppConfig;
 use app_core::{
-    App, Command, DISPLAY_SIZE, Event, NetworkStatus, RECOMMENDED_SCRATCH_PIXELS, Screen,
+    App, Button, Command, DISPLAY_SIZE, Event, NetworkStatus, RECOMMENDED_SCRATCH_PIXELS, Screen,
     TouchPoint,
 };
 use app_runtime::{
@@ -50,10 +51,26 @@ const TAP_FULL_MS: u64 = 1_000;
 const TAP_FADE_MS: u64 = 700;
 const WINDOW_MARGIN: f64 = 24.0;
 const SIDE_GAP: f64 = 24.0;
-const SIDE_WIDTH: f64 = 210.0;
-const BUTTON_WIDTH: f64 = 178.0;
+const SIDE_WIDTH: f64 = 216.0;
+const BUTTON_WIDTH: f64 = 216.0;
 const BUTTON_HEIGHT: f64 = 32.0;
-const BUTTON_SPACING: f64 = 44.0;
+const BUTTON_SPACING: f64 = 40.0;
+/// Size of one key in the 3x3 directional-pad cross.
+const PAD_KEY_WIDTH: f64 = 68.0;
+const PAD_KEY_HEIGHT: f64 = 30.0;
+/// Width of each of the two control buttons sitting under the pad.
+const CONTROL_BUTTON_WIDTH: f64 = 104.0;
+const DEBUG_LABEL_HEIGHT: f64 = 120.0;
+/// Height the side panel needs for the full control stack. The window grows to
+/// this even when the display is shorter, so nothing overlaps the debug text.
+const SIDE_MIN_HEIGHT: f64 = 620.0;
+
+// Arrow keys as AppKit key equivalents, so the pad is drivable from the
+// keyboard. These are the NSUpArrowFunctionKey family from NSEvent.h.
+const KEY_ARROW_UP: &str = "\u{f700}";
+const KEY_ARROW_DOWN: &str = "\u{f701}";
+const KEY_ARROW_LEFT: &str = "\u{f702}";
+const KEY_ARROW_RIGHT: &str = "\u{f703}";
 const HIFI_STATUS_POLL_MS: u64 = 2_000;
 
 type SimHifiError = LpecError<std::io::Error>;
@@ -63,55 +80,6 @@ fn start_runtime_worker() -> RuntimeWorker<SimHifiError> {
     let hifi = LpecSessionHifi::new(HostTcpConnector::new(), endpoint);
     let command_hifi = LpecSessionHifi::new(HostTcpConnector::new(), endpoint);
     runtime_worker::start(HifiDriver::new(hifi, HIFI_STATUS_POLL_MS), command_hifi)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DisplayShape {
-    Circle,
-    Rectangle,
-}
-
-impl DisplayShape {
-    fn contains(self, point: TouchPoint, size: Size) -> bool {
-        if point.x < 0
-            || point.y < 0
-            || point.x >= size.width as i32
-            || point.y >= size.height as i32
-        {
-            return false;
-        }
-
-        match self {
-            Self::Circle => {
-                let radius = size.width.min(size.height) as i64 / 2;
-                let center_x = size.width as i64 / 2;
-                let center_y = size.height as i64 / 2;
-                let dx = point.x as i64 - center_x;
-                let dy = point.y as i64 - center_y;
-                dx * dx + dy * dy <= radius * radius
-            }
-            Self::Rectangle => true,
-        }
-    }
-
-    fn alpha_at(self, x: u32, y: u32, size: Size) -> u8 {
-        match self {
-            Self::Circle => {
-                let radius = size.width.min(size.height) as i64 / 2;
-                let center_x = size.width as i64 / 2;
-                let center_y = size.height as i64 / 2;
-                let dx = x as i64 - center_x;
-                let dy = y as i64 - center_y;
-
-                if dx * dx + dy * dy <= radius * radius {
-                    255
-                } else {
-                    0
-                }
-            }
-            Self::Rectangle => 255,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -128,16 +96,16 @@ impl Framebuffer {
         }
     }
 
-    fn to_png(&self, display_shape: DisplayShape) -> Vec<u8> {
+    fn to_png(&self) -> Vec<u8> {
         let mut rgba = Vec::with_capacity(self.pixels.len() * 4);
 
-        for (index, color) in self.pixels.iter().enumerate() {
-            let x = index as u32 % self.size.width;
-            let y = index as u32 / self.size.width;
+        for color in &self.pixels {
             rgba.push(scale_channel(color.r(), Rgb565::MAX_R));
             rgba.push(scale_channel(color.g(), Rgb565::MAX_G));
             rgba.push(scale_channel(color.b(), Rgb565::MAX_B));
-            rgba.push(display_shape.alpha_at(x, y, self.size));
+            // Every pixel is opaque: unlike the round board this replaced,
+            // the Kode Dot panel has no masked-off corners.
+            rgba.push(255);
         }
 
         let mut png = Vec::new();
@@ -228,7 +196,6 @@ struct NativeSimulator {
     scratch: Vec<Rgb565>,
     app_frame_dirty: bool,
     output_frame_dirty: bool,
-    display_shape: DisplayShape,
     runtime_worker: RuntimeWorker<SimHifiError>,
     started_at: Instant,
     manual_time_offset_ms: u64,
@@ -248,7 +215,6 @@ impl NativeSimulator {
             scratch: vec![Rgb565::BLACK; RECOMMENDED_SCRATCH_PIXELS],
             app_frame_dirty: true,
             output_frame_dirty: true,
-            display_shape: DisplayShape::Circle,
             runtime_worker: start_runtime_worker(),
             started_at: Instant::now(),
             manual_time_offset_ms: 0,
@@ -334,17 +300,6 @@ impl NativeSimulator {
         self.update(Event::TouchDown(point));
     }
 
-    fn set_display_shape(&mut self, display_shape: DisplayShape) {
-        if self.display_shape != display_shape {
-            self.display_shape = display_shape;
-            self.output_frame_dirty = true;
-        }
-    }
-
-    fn contains_visible_point(&self, point: TouchPoint) -> bool {
-        self.display_shape.contains(point, DISPLAY_SIZE)
-    }
-
     fn uptime_ms(&self) -> u64 {
         let real_elapsed_ms = self.started_at.elapsed().as_millis() as u64;
         real_elapsed_ms.saturating_add(self.manual_time_offset_ms)
@@ -368,7 +323,7 @@ impl NativeSimulator {
         self.output_frame_dirty = false;
         self.render_stats.record_simulator_redraw();
         self.render_stats.update_sample();
-        Some(self.output_framebuffer.to_png(self.display_shape))
+        Some(self.output_framebuffer.to_png())
     }
 
     fn render_tap_highlight(&mut self) {
@@ -544,7 +499,7 @@ define_class!(
                 )
             };
             unsafe { window.setReleasedWhenClosed(false) };
-            window.setTitle(ns_string!("ESP32-C6 Home Tools Simulator"));
+            window.setTitle(ns_string!("Kode Linn Remote Simulator"));
             window.setDelegate(Some(ProtocolObject::from_ref(self)));
 
             let layout = layout_for_window(&window, false);
@@ -571,11 +526,15 @@ define_class!(
             let side_panel = NSView::initWithFrame(NSView::alloc(mtm), layout.side_frame);
             content_view.addSubview(&side_panel);
 
+            // Controls stack downward from the top of the side panel.
+            let mut stack = ControlStack::new(layout.side_inner_height);
+
             let zoom_button = add_button(
                 &side_panel,
                 "Zoom 2x",
                 0.0,
-                layout.side_inner_height - BUTTON_HEIGHT,
+                stack.next(BUTTON_HEIGHT, BUTTON_SPACING),
+                BUTTON_WIDTH,
                 sel!(toggleZoom:),
                 self,
                 mtm,
@@ -584,34 +543,94 @@ define_class!(
                 &side_panel,
                 "Advance +1s",
                 0.0,
-                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING,
+                stack.next(BUTTON_HEIGHT, BUTTON_SPACING),
+                BUTTON_WIDTH,
                 sel!(advanceSecond:),
-                self,
-                mtm,
-            );
-            add_button(
-                &side_panel,
-                "BOOT button",
-                0.0,
-                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 2.0,
-                sel!(bootButton:),
                 self,
                 mtm,
             );
             add_network_status_popup(
                 &side_panel,
                 0.0,
-                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 3.4,
+                stack.next(BUTTON_HEIGHT, BUTTON_SPACING * 1.4),
                 self,
                 mtm,
             );
-            add_display_shape_popup(
+
+            // Directional pad, laid out as the cross it is on the hardware.
+            // Each key also answers to its arrow key so the pad can be driven
+            // from the keyboard while iterating on a layout.
+            let pad_center_x = (SIDE_WIDTH - PAD_KEY_WIDTH) / 2.0;
+            let pad_up_y = stack.next(PAD_KEY_HEIGHT, PAD_KEY_HEIGHT + 4.0);
+            let pad_middle_y = stack.next(PAD_KEY_HEIGHT, PAD_KEY_HEIGHT + 4.0);
+            let pad_down_y = stack.next(PAD_KEY_HEIGHT, PAD_KEY_HEIGHT + 16.0);
+
+            add_pad_key(
                 &side_panel,
-                0.0,
-                layout.side_inner_height - BUTTON_HEIGHT - BUTTON_SPACING * 4.4,
+                "Up",
+                pad_center_x,
+                pad_up_y,
+                KEY_ARROW_UP,
+                sel!(padUp:),
                 self,
                 mtm,
             );
+            add_pad_key(
+                &side_panel,
+                "Left",
+                pad_center_x - PAD_KEY_WIDTH,
+                pad_middle_y,
+                KEY_ARROW_LEFT,
+                sel!(padLeft:),
+                self,
+                mtm,
+            );
+            add_pad_key(
+                &side_panel,
+                "Right",
+                pad_center_x + PAD_KEY_WIDTH,
+                pad_middle_y,
+                KEY_ARROW_RIGHT,
+                sel!(padRight:),
+                self,
+                mtm,
+            );
+            add_pad_key(
+                &side_panel,
+                "Down",
+                pad_center_x,
+                pad_down_y,
+                KEY_ARROW_DOWN,
+                sel!(padDown:),
+                self,
+                mtm,
+            );
+
+            // The two control buttons flanking the pad. Return confirms and
+            // Escape goes up a level, matching the on-screen labels.
+            let control_y = stack.next(BUTTON_HEIGHT, BUTTON_SPACING);
+            let select_button = add_button(
+                &side_panel,
+                "Select \u{21b5}",
+                0.0,
+                control_y,
+                CONTROL_BUTTON_WIDTH,
+                sel!(controlSelect:),
+                self,
+                mtm,
+            );
+            select_button.setKeyEquivalent(ns_string!("\r"));
+            let back_button = add_button(
+                &side_panel,
+                "Back esc",
+                SIDE_WIDTH - CONTROL_BUTTON_WIDTH,
+                control_y,
+                CONTROL_BUTTON_WIDTH,
+                sel!(controlBack:),
+                self,
+                mtm,
+            );
+            back_button.setKeyEquivalent(ns_string!("\u{1b}"));
 
             let debug_label = NSTextField::wrappingLabelWithString(
                 &NSString::from_str(&self.debug_text()),
@@ -619,7 +638,7 @@ define_class!(
             );
             debug_label.setFrame(NSRect::new(
                 NSPoint::new(0.0, 0.0),
-                NSSize::new(SIDE_WIDTH, 148.0),
+                NSSize::new(SIDE_WIDTH, DEBUG_LABEL_HEIGHT),
             ));
             side_panel.addSubview(&debug_label);
 
@@ -698,11 +717,34 @@ define_class!(
             self.refresh_image();
         }
 
-        #[unsafe(method(bootButton:))]
-        fn boot_button(&self, _sender: &AnyObject) {
-            // The Waveshare ESP32-C6 Touch AMOLED 1.43 only exposes one
-            // software-readable button (BOOT on GPIO9). The sim mirrors that.
-            self.send_event(Event::ButtonPressed(app_core::Button::Boot));
+        #[unsafe(method(padUp:))]
+        fn pad_up(&self, _sender: &AnyObject) {
+            self.send_event(Event::ButtonPressed(Button::Up));
+        }
+
+        #[unsafe(method(padDown:))]
+        fn pad_down(&self, _sender: &AnyObject) {
+            self.send_event(Event::ButtonPressed(Button::Down));
+        }
+
+        #[unsafe(method(padLeft:))]
+        fn pad_left(&self, _sender: &AnyObject) {
+            self.send_event(Event::ButtonPressed(Button::Left));
+        }
+
+        #[unsafe(method(padRight:))]
+        fn pad_right(&self, _sender: &AnyObject) {
+            self.send_event(Event::ButtonPressed(Button::Right));
+        }
+
+        #[unsafe(method(controlSelect:))]
+        fn control_select(&self, _sender: &AnyObject) {
+            self.send_event(Event::ButtonPressed(Button::Select));
+        }
+
+        #[unsafe(method(controlBack:))]
+        fn control_back(&self, _sender: &AnyObject) {
+            self.send_event(Event::ButtonPressed(Button::Back));
         }
 
         #[unsafe(method(displayTapped:))]
@@ -719,15 +761,6 @@ define_class!(
                 .round() as i32;
 
             if x < 0 || y < 0 || x >= DISPLAY_SIZE.width as i32 || y >= DISPLAY_SIZE.height as i32 {
-                return;
-            }
-
-            if !self
-                .ivars()
-                .simulator
-                .borrow()
-                .contains_visible_point(TouchPoint { x, y })
-            {
                 return;
             }
 
@@ -749,10 +782,6 @@ define_class!(
             self.send_event(Event::NetworkStatus(status));
         }
 
-        #[unsafe(method(displayShapeChanged:))]
-        fn display_shape_changed(&self, sender: &NSPopUpButton) {
-            self.set_display_shape_from_index(sender.indexOfSelectedItem());
-        }
     }
 );
 
@@ -806,19 +835,6 @@ impl Delegate {
         self.ivars().simulator.borrow().debug_text()
     }
 
-    fn set_display_shape_from_index(&self, index: isize) {
-        let display_shape = match index {
-            0 => DisplayShape::Circle,
-            1 => DisplayShape::Rectangle,
-            _ => return,
-        };
-        self.ivars()
-            .simulator
-            .borrow_mut()
-            .set_display_shape(display_shape);
-        self.refresh_image();
-    }
-
     fn apply_zoom_layout(&self) {
         let window = self
             .ivars()
@@ -861,11 +877,13 @@ fn image_from_png(png: &[u8]) -> Retained<NSImage> {
     NSImage::initWithData(NSImage::alloc(), &data).expect("AppKit should decode simulator PNG")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_button(
     content_view: &NSView,
-    title: &'static str,
+    title: &str,
     x: f64,
     y: f64,
+    width: f64,
     action: objc2::runtime::Sel,
     target: &Delegate,
     mtm: MainThreadMarker,
@@ -880,8 +898,38 @@ fn add_button(
     };
     button.setFrame(NSRect::new(
         NSPoint::new(x, y),
-        NSSize::new(BUTTON_WIDTH, BUTTON_HEIGHT),
+        NSSize::new(width, BUTTON_HEIGHT),
     ));
+    button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
+    content_view.addSubview(&button);
+    button
+}
+
+/// One key of the directional pad, bound to its matching arrow key.
+#[allow(clippy::too_many_arguments)]
+fn add_pad_key(
+    content_view: &NSView,
+    title: &str,
+    x: f64,
+    y: f64,
+    key_equivalent: &str,
+    action: objc2::runtime::Sel,
+    target: &Delegate,
+    mtm: MainThreadMarker,
+) -> Retained<NSButton> {
+    let button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str(title),
+            Some(target.as_ref()),
+            Some(action),
+            mtm,
+        )
+    };
+    button.setFrame(NSRect::new(
+        NSPoint::new(x, y),
+        NSSize::new(PAD_KEY_WIDTH, PAD_KEY_HEIGHT),
+    ));
+    button.setKeyEquivalent(&NSString::from_str(key_equivalent));
     button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
     content_view.addSubview(&button);
     button
@@ -912,28 +960,27 @@ fn add_network_status_popup(
     popup
 }
 
-fn add_display_shape_popup(
-    content_view: &NSView,
-    x: f64,
-    y: f64,
-    target: &Delegate,
-    mtm: MainThreadMarker,
-) -> Retained<NSPopUpButton> {
-    let popup = NSPopUpButton::initWithFrame_pullsDown(
-        NSPopUpButton::alloc(mtm),
-        NSRect::new(NSPoint::new(x, y), NSSize::new(BUTTON_WIDTH, BUTTON_HEIGHT)),
-        false,
-    );
-    popup.addItemWithTitle(&NSString::from_str("Circle"));
-    popup.addItemWithTitle(&NSString::from_str("Rectangle"));
-    popup.selectItemAtIndex(0);
-    unsafe {
-        popup.setTarget(Some(target.as_ref()));
-        popup.setAction(Some(sel!(displayShapeChanged:)));
+/// Lays controls out top-down inside the side panel.
+///
+/// AppKit's origin is bottom-left, so "next" walks the cursor downward and
+/// returns the origin y for a control of the given height.
+struct ControlStack {
+    cursor_y: f64,
+}
+
+impl ControlStack {
+    fn new(side_inner_height: f64) -> Self {
+        Self {
+            cursor_y: side_inner_height,
+        }
     }
-    popup.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
-    content_view.addSubview(&popup);
-    popup
+
+    fn next(&mut self, height: f64, advance: f64) -> f64 {
+        self.cursor_y -= height;
+        let y = self.cursor_y;
+        self.cursor_y -= advance - height;
+        y
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -949,34 +996,39 @@ fn layout_for_window(window: &NSWindow, zoomed: bool) -> Layout {
 }
 
 fn layout_for_backing_scale(backing_scale: f64, zoomed: bool) -> Layout {
-    let native_display_points = DISPLAY_SIZE.width as f64 / backing_scale;
-    let zoomed_display_points = native_display_points * 2.0;
-    let display_points = if zoomed {
-        zoomed_display_points
+    // The Kode Dot panel is 410 x 502 — portrait, not square — so width and
+    // height are tracked separately rather than sharing one dimension.
+    let native_width = DISPLAY_SIZE.width as f64 / backing_scale;
+    let native_height = DISPLAY_SIZE.height as f64 / backing_scale;
+    let zoomed_width = native_width * 2.0;
+    let zoomed_height = native_height * 2.0;
+    let (display_width, display_height) = if zoomed {
+        (zoomed_width, zoomed_height)
     } else {
-        native_display_points
+        (native_width, native_height)
     };
-    let content_width =
-        WINDOW_MARGIN + zoomed_display_points + SIDE_GAP + SIDE_WIDTH + WINDOW_MARGIN;
-    let content_height = WINDOW_MARGIN * 2.0 + zoomed_display_points;
-    let reserved_display_x = WINDOW_MARGIN;
-    let reserved_display_y = WINDOW_MARGIN;
-    let display_x = reserved_display_x + (zoomed_display_points - display_points) / 2.0;
-    let display_y = reserved_display_y + (zoomed_display_points - display_points) / 2.0;
-    let side_height = content_height - WINDOW_MARGIN * 2.0;
-    let side_x = WINDOW_MARGIN + zoomed_display_points + SIDE_GAP;
+
+    // The 2x footprint is always reserved so toggling zoom never resizes the
+    // window or shuffles the controls.
+    let content_width = WINDOW_MARGIN + zoomed_width + SIDE_GAP + SIDE_WIDTH + WINDOW_MARGIN;
+    let inner_height = zoomed_height.max(SIDE_MIN_HEIGHT);
+    let content_height = WINDOW_MARGIN * 2.0 + inner_height;
+
+    let display_x = WINDOW_MARGIN + (zoomed_width - display_width) / 2.0;
+    let display_y = WINDOW_MARGIN + (inner_height - display_height) / 2.0;
+    let side_x = WINDOW_MARGIN + zoomed_width + SIDE_GAP;
 
     Layout {
         content_size: NSSize::new(content_width, content_height),
         display_frame: NSRect::new(
             NSPoint::new(display_x, display_y),
-            NSSize::new(display_points, display_points),
+            NSSize::new(display_width, display_height),
         ),
         side_frame: NSRect::new(
             NSPoint::new(side_x, WINDOW_MARGIN),
-            NSSize::new(SIDE_WIDTH, side_height),
+            NSSize::new(SIDE_WIDTH, inner_height),
         ),
-        side_inner_height: side_height,
+        side_inner_height: inner_height,
     }
 }
 
@@ -996,7 +1048,75 @@ fn tap_alpha(age_ms: u64) -> Option<u8> {
     }
 }
 
+/// Renders every screen to a PNG and exits, without opening a window.
+///
+/// Design iteration on hardware that has not shipped yet mostly means looking
+/// at layouts, and a window is an awkward thing to diff or attach to a review.
+/// This writes the same framebuffer the panel would receive.
+fn write_snapshots(directory: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(directory)?;
+
+    // Each entry is a file stem plus the button presses needed to reach that
+    // view from a freshly opened screen.
+    let views: &[(&str, Screen, &[Button])] = &[
+        ("launcher", Screen::Launcher, &[]),
+        ("launcher-focused", Screen::Launcher, &[Button::Down]),
+        ("stopwatch", Screen::Stopwatch, &[]),
+        ("stopwatch-focused", Screen::Stopwatch, &[Button::Right]),
+        ("hifi-status", Screen::HifiControl, &[]),
+        (
+            "hifi-status-focused",
+            Screen::HifiControl,
+            &[Button::Right, Button::Right],
+        ),
+        (
+            "hifi-pins",
+            Screen::HifiControl,
+            &[Button::Down, Button::Down],
+        ),
+        (
+            "hifi-volume",
+            Screen::HifiControl,
+            &[
+                Button::Down,
+                Button::Down,
+                Button::Down,
+                Button::Down,
+                Button::Down,
+            ],
+        ),
+    ];
+
+    let mut scratch = vec![Rgb565::BLACK; RECOMMENDED_SCRATCH_PIXELS];
+
+    for (name, screen, presses) in views {
+        let mut app = App::new_on_screen(*screen);
+        let _ = app.update(Event::NetworkStatus(NetworkStatus::Online));
+        let _ = app.update(Event::Tick { uptime_ms: 6_000 });
+        for button in *presses {
+            let _ = app.update(Event::ButtonPressed(*button));
+        }
+
+        let mut framebuffer = Framebuffer::new(DISPLAY_SIZE);
+        app.render(&mut framebuffer, &mut scratch)
+            .expect("snapshot rendering should succeed");
+
+        let path = directory.join(format!("{name}.png"));
+        std::fs::write(&path, framebuffer.to_png())?;
+        println!("wrote {}", path.display());
+    }
+
+    Ok(())
+}
+
 fn main() {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("--snapshot") {
+        let directory = args.next().unwrap_or_else(|| "target/snapshots".to_owned());
+        write_snapshots(Path::new(&directory)).expect("writing snapshots should succeed");
+        return;
+    }
+
     let mtm = MainThreadMarker::new().expect("simulator must run on the main thread");
     let app = NSApplication::sharedApplication(mtm);
     let delegate = Delegate::new(mtm);

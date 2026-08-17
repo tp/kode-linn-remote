@@ -14,18 +14,22 @@ use crate::{NetworkStatus, RenderError};
 use super::super::{
     AppContext,
     components::{ButtonTone, clear_rect, draw_button, draw_duration, draw_panel, ui_font},
+    focus::FocusTargets,
     geometry::{Column, horizontal_pair},
     style::*,
 };
 
-const PANEL_INSET: i32 = 24;
-const CONTENT_INSET: i32 = 44;
-const HEADER_HEIGHT: u32 = 92;
-const HEADER_TITLE_TOP: i32 = 24;
+// Tuned for the Kode Dot's 410 x 502 portrait rectangle: no round mask to
+// dodge, so the insets shrink, and the reclaimed height goes into taller
+// controls that are easier to hit with a finger.
+const PANEL_INSET: i32 = 20;
+const CONTENT_INSET: i32 = 24;
+const HEADER_HEIGHT: u32 = 96;
+const HEADER_TITLE_TOP: i32 = 26;
 const HEADER_BUTTON_GAP: i32 = 24;
-const BUTTON_HEIGHT: u32 = 72;
-const BUTTON_GAP: i32 = 38;
-const BUTTON_INFO_GAP: i32 = 32;
+const BUTTON_HEIGHT: u32 = 84;
+const BUTTON_GAP: i32 = 22;
+const BUTTON_INFO_GAP: i32 = 36;
 const INFO_ROW_HEIGHT: u32 = 40;
 const INFO_ROW_GAP: i32 = 4;
 const IDEAL_LABEL_WIDTH: u32 = 96;
@@ -97,6 +101,9 @@ impl State {
         }
     }
 
+    /// This screen repaints in full every frame, so there is no cache to drop.
+    pub(crate) fn invalidate(&mut self) {}
+
     pub(crate) fn on_tick(&mut self, uptime_ms: u64) -> bool {
         if !self.running {
             return false;
@@ -136,6 +143,14 @@ impl State {
             }
         }
     }
+}
+
+/// Focusable controls, in reading order.
+pub(crate) fn focus_targets(layout: &Layout) -> FocusTargets {
+    let mut targets = FocusTargets::new();
+    let _ = targets.push(layout.buttons.start);
+    let _ = targets.push(layout.buttons.stop);
+    targets
 }
 
 pub(crate) fn layout(bounds: Rectangle) -> Layout {

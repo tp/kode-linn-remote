@@ -1,6 +1,7 @@
 # Connected idle power follow-up
 
-Status: deferred until display, touch, buttons, and HIFI runtime are stable
+Status: blocked — no Kode Dot firmware exists yet (see `KODE_DOT_PORT_TICKET.md`).
+Then deferred until display, touch, buttons, and HIFI runtime are stable.
 
 Design and measure a low-power connected-idle mode for the handheld remote. The
 goal is to keep wake latency feeling instant while reducing average battery
@@ -21,11 +22,14 @@ The desired mode is therefore connected idle rather than deep sleep:
   long-lived TCP socket proves too expensive.
 - Turn the AMOLED off or put it in sleep mode.
 - Stop redraws and reduce app tick work while the display is off.
-- Wake the UI from touch interrupt and the clean app button.
+- Wake the UI from touch interrupt and the directional pad or control buttons.
 
 The important power model is average idle current, not feature count. A small
-ESP32-C6 board can still lose badly to a phone if it idles at tens of milliamps
-continuously. Phones get long standby life through a tightly integrated power
+board can still lose badly to a phone if it idles at tens of milliamps
+continuously. The Kode Dot splits this across two chips — an ESP32-P4
+application processor and an ESP32-C5 wireless co-processor — so idle current
+is a property of the pair, and the link between them is itself a cost worth
+measuring. Phones get long standby life through a tightly integrated power
 stack: display off, app CPUs mostly asleep, radio firmware handling low-power
 network state, batching/coalescing of network events, and aggressive peripheral
 power gating.
@@ -45,7 +49,7 @@ Start with a conservative two-level policy:
    - No routine rendering.
    - App tick frequency reduced to the minimum required for runtime health.
    - Wi-Fi remains associated with power-save behavior enabled where supported.
-   - Touch/button wake re-enters Active.
+   - Touch, pad or control-button wake re-enters Active.
    - HIFI runtime either keeps a quiet TCP session or reconnects lazily without a
      full Wi-Fi reconnect.
 
@@ -60,9 +64,11 @@ low battery, or very long idle timeout. It is allowed to have slow wake.
 - Stop rendering while idle and invalidate the render state on wake.
 - Move touch from constant polling to the interrupt-driven follow-up once GPIO
   ownership is clear.
-- Poll the clean app button initially; consider interrupt wake later.
-- Enable and test ESP Wi-Fi power-save settings compatible with the current
-  `esp-radio` stack.
+- Poll the pad and control buttons initially; consider interrupt wake later.
+- Enable and test Wi-Fi power-save settings on the ESP32-C5 co-processor. Note
+  that `esp-radio` does not apply here: the application processor has no on-die
+  radio, so power-save is negotiated across the host link rather than
+  configured locally.
 - Decide whether LPEC should keep TCP connected in idle or reconnect on wake.
 - Add logging for state transitions, reconnect time, and command latency after
   wake.
@@ -119,4 +125,7 @@ an actual phone replacement battery.
 - Which `esp-radio` Wi-Fi power-save knobs are available and stable for the
   current dependency versions?
 - Does the access point's DTIM interval materially affect latency or current?
-- How should the PWR button interact with explicit off mode versus app UI?
+- How should an explicit off mode be triggered, given the Kode Dot exposes a
+  directional pad and two control buttons rather than a dedicated power key?
+- What does the ESP32-C5 co-processor cost at idle, and can it hold association
+  while the ESP32-P4 sleeps?

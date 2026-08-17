@@ -35,6 +35,7 @@ dependencies = [
 name = "app-core"
 version = "0.1.0"
 dependencies = [
+ "board-kode-dot",
  "embedded-graphics",
  "embedded-graphics-framebuf",
  "heapless 0.9.1",
@@ -119,6 +120,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
 dependencies = [
  "objc2",
+]
+
+[[package]]
+name = "board-kode-dot"
+version = "0.1.0"
+dependencies = [
+ "embedded-graphics",
 ]
 
 [[package]]

@@ -91,6 +91,39 @@ where
     Ok(())
 }
 
+/// Outlines the control the D-pad is on.
+///
+/// Drawn as an overlay after the screen paints, so it needs no cooperation
+/// from each screen's dirty-region cache. `App` forces a full repaint when the
+/// ring moves, which is what clears the previous outline.
+pub(super) fn draw_focus_ring<D>(
+    display: &mut D,
+    rect: Rectangle,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let inset = FOCUS_RING_INSET;
+    let top_left = Point::new(rect.top_left.x - inset, rect.top_left.y - inset);
+    let size = Size::new(
+        rect.size.width.saturating_add((inset * 2) as u32),
+        rect.size.height.saturating_add((inset * 2) as u32),
+    );
+
+    RoundedRectangle::with_equal_corners(
+        Rectangle::new(top_left, size),
+        Size::new(FOCUS_RING_RADIUS, FOCUS_RING_RADIUS),
+    )
+    .into_styled(
+        PrimitiveStyleBuilder::new()
+            .stroke_color(FOCUS_RING)
+            .stroke_width(FOCUS_RING_STROKE)
+            .build(),
+    )
+    .draw(display)
+    .map_err(RenderError::Draw)
+}
+
 pub(super) fn clear_rect<D>(display: &mut D, rect: Rectangle) -> Result<(), RenderError<D::Error>>
 where
     D: DrawTarget<Color = Rgb565>,

@@ -6,6 +6,7 @@ members = [
     "crates/app-config",
     "crates/app-core",
     "crates/app-runtime",
+    "crates/board-kode-dot",
     "crates/board-waveshare-c6",
     "crates/linn-ci-gateway",
     "crates/linn-lpec",
@@ -15,6 +16,7 @@ default-members = [
     "crates/app-config",
     "crates/app-core",
     "crates/app-runtime",
+    "crates/board-kode-dot",
     "crates/board-waveshare-c6",
     "crates/linn-ci-gateway",
     "crates/linn-lpec",
@@ -29,6 +31,7 @@ rust-version = "1.88"
 app-config = { path = "crates/app-config", default-features = false }
 app-core = { path = "crates/app-core" }
 app-runtime = { path = "crates/app-runtime", default-features = false }
+board-kode-dot = { path = "crates/board-kode-dot" }
 board-waveshare-c6 = { path = "crates/board-waveshare-c6" }
 embassy-futures = { version = "0.1.2", default-features = false }
 embassy-executor = { version = "0.10.0", default-features = false }

@@ -116,7 +116,7 @@ It may still expose APIs that make host and firmware glue small.
 ## Non-Goals
 
 - Do not move platform socket ownership into `app-core`.
-- Do not put AppKit, Embassy, ESP32-C6, or host TCP details into shared runtime
+- Do not put AppKit, Embassy, ESP32-P4, or host TCP details into shared runtime
   logic.
 - Do not require firmware to use heap-backed simulator conveniences.
 - Do not introduce Tokio into firmware.

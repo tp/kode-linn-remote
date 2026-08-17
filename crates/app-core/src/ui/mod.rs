@@ -1,4 +1,5 @@
 mod components;
+pub(crate) mod focus;
 mod geometry;
 mod painter;
 mod render;

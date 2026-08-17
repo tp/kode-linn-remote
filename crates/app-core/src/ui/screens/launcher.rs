@@ -14,26 +14,32 @@ use super::super::{
         ButtonTone, clear_rect, draw_button, draw_network_blocked_icon, draw_spinner,
         draw_spinner_dots, draw_wifi_icon, ui_font,
     },
-    geometry::horizontal_pair,
+    focus::FocusTargets,
+    geometry::vertical_pair,
     painter::Painter,
     style::{OLED_BLACK, TEXT_PRIMARY, TEXT_SECONDARY},
     widget::Widget,
 };
 
-const CONTENT_INSET: i32 = 44;
-const TITLE_Y: i32 = 64;
-const BUTTON_Y: i32 = 154;
-const BUTTON_HEIGHT: u32 = 150;
-const BUTTON_GAP: i32 = 22;
-const NETWORK_STATUS_Y: i32 = 386;
-const NETWORK_STATUS_WIDTH: u32 = 180;
-const NETWORK_STATUS_HEIGHT: u32 = 96;
+// Tuned for the Kode Dot's 410 x 502 portrait rectangle. The panel has no
+// rounded mask eating its corners, so the inset is cosmetic rather than a
+// safe area, and the extra height lets the app buttons stack full-width
+// instead of splitting the narrow width between them.
+const CONTENT_INSET: i32 = 24;
+const TITLE_Y: i32 = 40;
+const BUTTON_Y: i32 = 108;
+const BUTTON_HEIGHT: u32 = 140;
+const BUTTON_GAP: i32 = 20;
+const NETWORK_STATUS_Y: i32 = 452;
+const NETWORK_STATUS_WIDTH: u32 = 178;
+const NETWORK_STATUS_HEIGHT: u32 = 72;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Layout {
     pub(super) title_origin: Point,
     pub(super) stopwatch_button: Rectangle,
     pub(super) hifi_button: Rectangle,
+    pub(super) network_status_center: Point,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +59,13 @@ impl State {
         Self {
             render_cache: RenderCache::new(),
         }
+    }
+
+    /// Drops every cached "already drawn" flag so the next render repaints
+    /// from scratch. Used when the focus ring moves and the old outline has to
+    /// disappear along with it.
+    pub(crate) fn invalidate(&mut self) {
+        self.render_cache = RenderCache::new();
     }
 
     pub(crate) fn on_tick(&self, context: AppContext) -> bool {
@@ -75,7 +88,7 @@ pub(crate) fn layout(bounds: Rectangle) -> Layout {
     let content_left = bounds.top_left.x + CONTENT_INSET;
     let content_width = bounds.size.width.saturating_sub((CONTENT_INSET * 2) as u32);
     let button_y = bounds.top_left.y + BUTTON_Y;
-    let (stopwatch_button, hifi_button) = horizontal_pair(
+    let (stopwatch_button, hifi_button) = vertical_pair(
         content_left,
         button_y,
         content_width,
@@ -87,7 +100,19 @@ pub(crate) fn layout(bounds: Rectangle) -> Layout {
         title_origin: Point::new(content_left, bounds.top_left.y + TITLE_Y),
         stopwatch_button,
         hifi_button,
+        network_status_center: Point::new(
+            bounds.top_left.x + (bounds.size.width / 2) as i32,
+            bounds.top_left.y + NETWORK_STATUS_Y,
+        ),
     }
+}
+
+/// Focusable controls, in reading order.
+pub(crate) fn focus_targets(layout: &Layout) -> FocusTargets {
+    let mut targets = FocusTargets::new();
+    let _ = targets.push(layout.stopwatch_button);
+    let _ = targets.push(layout.hifi_button);
+    targets
 }
 
 pub(crate) fn handle_touch(layout: &Layout, point: Point) -> Option<Screen> {
@@ -122,7 +147,7 @@ where
     painter.draw(&static_chrome).map_err(RenderError::Draw)?;
     state.render_cache.static_drawn = true;
 
-    let status_center = Point::new(ui_layout.title_origin.x + 189, NETWORK_STATUS_Y);
+    let status_center = ui_layout.network_status_center;
     let spinner_phase = spinner_phase(context.uptime_ms);
     let network_status = NetworkStatusWidget {
         center: status_center,

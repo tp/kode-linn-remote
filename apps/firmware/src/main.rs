@@ -420,7 +420,9 @@ async fn boot_button_task(pin: GPIO9<'static>) {
             continue;
         }
         last_press_ms = now_ms;
-        send_app_event(Event::ButtonPressed(Button::Boot)).await;
+        // This board has one software-readable key, so it maps to the "up one
+        // level" control rather than any of the Kode Dot's pad directions.
+        send_app_event(Event::ButtonPressed(Button::Back)).await;
     }
 }
 

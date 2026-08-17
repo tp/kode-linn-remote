@@ -3,7 +3,8 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
+pub use board_kode_dot::{ControlButton, Direction};
+use embedded_graphics::{pixelcolor::Rgb565, prelude::*, primitives::Rectangle};
 use heapless::String;
 
 mod ui;
@@ -13,7 +14,9 @@ pub use ui::screens::hifi::Command as HifiCommand;
 
 pub type ArtworkPixel = Rgb565;
 
-pub const DISPLAY_SIZE: Size = Size::new(466, 466);
+/// Panel geometry for the target board. Re-exported so screens and hosts all
+/// agree on one number; change it in `board-kode-dot` and every layout reflows.
+pub use board_kode_dot::DISPLAY_SIZE;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -33,10 +36,52 @@ pub struct TouchPoint {
     pub y: i32,
 }
 
+/// Physical inputs on the Kode Dot: a four-way pad plus two control buttons.
+///
+/// The pad moves a focus ring between the controls on the current screen and
+/// [`Button::Select`] activates whatever is focused, so every screen stays
+/// operable without touching the panel. [`Button::Back`] goes up one level.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Button {
-    Boot,
-    User,
+    Up,
+    Down,
+    Left,
+    Right,
+    Select,
+    Back,
+}
+
+impl Button {
+    /// The pad direction this button represents, if it is a pad direction.
+    pub const fn direction(self) -> Option<Direction> {
+        match self {
+            Self::Up => Some(Direction::Up),
+            Self::Down => Some(Direction::Down),
+            Self::Left => Some(Direction::Left),
+            Self::Right => Some(Direction::Right),
+            Self::Select | Self::Back => None,
+        }
+    }
+}
+
+impl From<Direction> for Button {
+    fn from(direction: Direction) -> Self {
+        match direction {
+            Direction::Up => Self::Up,
+            Direction::Down => Self::Down,
+            Direction::Left => Self::Left,
+            Direction::Right => Self::Right,
+        }
+    }
+}
+
+impl From<ControlButton> for Button {
+    fn from(control: ControlButton) -> Self {
+        match control {
+            ControlButton::Select => Self::Select,
+            ControlButton::Back => Self::Back,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -243,6 +288,10 @@ pub struct App {
     ui_layouts: ui::ScreenLayouts,
     active_screen: ActiveScreen,
     pub(crate) last_rendered_screen: Option<Screen>,
+    /// Index into the active screen's focus targets: the control the D-pad is
+    /// on. `None` until the pad is first used, so a touch-only session never
+    /// shows a ring it did not ask for.
+    focus: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -268,6 +317,14 @@ impl ActiveScreen {
             Self::HifiControl(_) => Screen::HifiControl,
         }
     }
+
+    fn invalidate(&mut self) {
+        match self {
+            Self::Launcher(state) => state.invalidate(),
+            Self::Stopwatch(state) => state.invalidate(),
+            Self::HifiControl(state) => state.invalidate(),
+        }
+    }
 }
 
 impl App {
@@ -283,6 +340,7 @@ impl App {
             ui_layouts: ui::ScreenLayouts::new(ui::SCREEN_BOUNDS),
             active_screen: ActiveScreen::new(screen, 0),
             last_rendered_screen: None,
+            focus: None,
         }
     }
 
@@ -305,19 +363,11 @@ impl App {
                 true
             }
             Event::TouchUp => false,
-            Event::ButtonPressed(_) => {
-                // Single hardware button on this device (BOOT/GPIO9). Both
-                // variants behave the same: cycle pages when in HIFI mode,
-                // navigate to Launcher otherwise. The simulator emits both
-                // variants from its menu; we keep them as one code path.
+            Event::ButtonPressed(button) => {
                 self.interaction_count = self.interaction_count.saturating_add(1);
-                match &mut self.active_screen {
-                    ActiveScreen::HifiControl(state) => state.cycle_page(),
-                    ActiveScreen::Launcher(_) | ActiveScreen::Stopwatch(_) => {
-                        self.navigate(Screen::Launcher);
-                    }
-                }
-                true
+                let (redraw, button_command) = self.handle_button(button);
+                command = button_command;
+                redraw
             }
             Event::NetworkStatus(status) => {
                 if self.network_status == status {
@@ -363,8 +413,119 @@ impl App {
         self.active_screen.screen()
     }
 
+    /// Focusable controls on the screen currently shown.
+    fn focus_targets(&self) -> ui::focus::FocusTargets {
+        match &self.active_screen {
+            ActiveScreen::Launcher(_) => {
+                ui::screens::launcher::focus_targets(self.ui_layouts.launcher())
+            }
+            ActiveScreen::Stopwatch(_) => {
+                ui::screens::stopwatch::focus_targets(self.ui_layouts.stopwatch())
+            }
+            ActiveScreen::HifiControl(state) => state.focus_targets(self.ui_layouts.hifi()),
+        }
+    }
+
+    /// Bounds of the focused control, for the render pass to outline.
+    pub(crate) fn focused_rect(&self) -> Option<Rectangle> {
+        let targets = self.focus_targets();
+        self.focus.and_then(|index| targets.get(index).copied())
+    }
+
+    /// Moves the ring, forcing a full repaint so the previous outline is not
+    /// left behind by the per-screen dirty-region caches.
+    fn set_focus(&mut self, focus: Option<usize>) -> bool {
+        if self.focus == focus {
+            return false;
+        }
+
+        self.focus = focus;
+        self.active_screen.invalidate();
+        self.last_rendered_screen = None;
+        true
+    }
+
+    fn handle_button(&mut self, button: Button) -> (bool, Option<Command>) {
+        match button {
+            Button::Select => self.activate_focused(),
+            Button::Back => (self.go_back(), None),
+            Button::Up | Button::Down | Button::Left | Button::Right => {
+                let direction = button
+                    .direction()
+                    .expect("pad variants always carry a direction");
+                (self.move_focus(direction), None)
+            }
+        }
+    }
+
+    /// Presses the focused control by replaying it as a tap at its centre, so
+    /// pad and touch share one dispatch path and cannot drift apart.
+    fn activate_focused(&mut self) -> (bool, Option<Command>) {
+        let Some(rect) = self.focused_rect() else {
+            // Nothing focused yet: the first press just reveals the ring
+            // rather than firing a control the user cannot see.
+            return (self.set_focus(Some(0)), None);
+        };
+
+        let center = TouchPoint {
+            x: rect.top_left.x + (rect.size.width / 2) as i32,
+            y: rect.top_left.y + (rect.size.height / 2) as i32,
+        };
+        (true, self.handle_touch(center))
+    }
+
+    /// Up one level: out of a HiFi subpage first, then out to the launcher.
+    fn go_back(&mut self) -> bool {
+        if let ActiveScreen::HifiControl(state) = &mut self.active_screen
+            && state.pop_page()
+        {
+            self.set_focus(None);
+            return true;
+        }
+
+        if self.active_screen.screen() == Screen::Launcher {
+            return false;
+        }
+
+        self.navigate(Screen::Launcher);
+        true
+    }
+
+    fn move_focus(&mut self, direction: Direction) -> bool {
+        let targets = self.focus_targets();
+        if let Some(next) = ui::focus::step(&targets, self.focus, direction) {
+            return self.set_focus(Some(next));
+        }
+
+        // Nothing further in that direction. On the HiFi screen the pages form
+        // a vertical stack, so running off the top or bottom edge moves
+        // between them instead of doing nothing.
+        match (&mut self.active_screen, direction) {
+            (ActiveScreen::HifiControl(state), Direction::Down) => {
+                state.cycle_page();
+                self.set_focus(None);
+                true
+            }
+            (ActiveScreen::HifiControl(state), Direction::Up) => {
+                state.cycle_page_back();
+                self.set_focus(None);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn handle_touch(&mut self, point: TouchPoint) -> Option<Command> {
         let point = Point::new(point.x, point.y);
+
+        // Keep the ring under the finger, but only once the pad has been used;
+        // a touch-only session should never sprout a focus ring on its own.
+        if self.focus.is_some() {
+            let targets = self.focus_targets();
+            if let Some(index) = ui::focus::hit(&targets, point) {
+                self.set_focus(Some(index));
+            }
+        }
 
         let (destination, command) = match &mut self.active_screen {
             ActiveScreen::Launcher(_) => (
@@ -392,6 +553,9 @@ impl App {
 
     fn navigate(&mut self, screen: Screen) {
         self.active_screen = ActiveScreen::new(screen, self.uptime_ms);
+        // Focus indices are per-screen; carrying one across would point at an
+        // unrelated control.
+        self.focus = None;
     }
 
     fn ui_context(&self) -> ui::AppContext {
@@ -606,7 +770,7 @@ mod tests {
                 .render_requested
         );
 
-        app.update(Event::ButtonPressed(Button::User));
+        app.update(Event::ButtonPressed(Button::Back));
         app.update(Event::TouchDown(launcher_stopwatch_touch()));
 
         assert_eq!(app.screen(), Screen::Stopwatch);
@@ -643,8 +807,7 @@ mod tests {
         pins.set(0, loaded_pin(4711, "Radio"));
         pins.set(1, loaded_pin(8128, "Spotify"));
         app.update(Event::HifiPins(pins));
-        // User-button cycles Status -> Pins.
-        app.update(Event::ButtonPressed(Button::User));
+        hifi_pad_to_pins(&mut app);
 
         let outcome = app.update(Event::TouchDown(hifi_pin_slot_touch(0)));
         assert!(outcome.render_requested);
@@ -663,23 +826,39 @@ mod tests {
     #[test]
     fn hifi_pin_slot_without_loaded_pin_emits_no_command() {
         let mut app = App::new_on_screen(Screen::HifiControl);
-        app.update(Event::ButtonPressed(Button::User)); // -> Pins page
+        hifi_pad_to_pins(&mut app);
 
         let outcome = app.update(Event::TouchDown(hifi_pin_slot_touch(0)));
         assert!(outcome.render_requested);
         assert_eq!(outcome.command, None);
     }
 
+    /// Walks the pad from a freshly opened HiFi screen to the Pins page.
+    ///
+    /// The first press only reveals the focus ring; the second runs off the
+    /// bottom of the single transport row, which is what advances the page.
+    fn hifi_pad_to_pins(app: &mut App) {
+        app.update(Event::ButtonPressed(Button::Down));
+        app.update(Event::ButtonPressed(Button::Down));
+    }
+
+    /// Continues from the Pins page to the Volume page. The pins form a 3x2
+    /// grid, so the ring steps into the second row before the page turns.
+    fn hifi_pad_to_volume(app: &mut App) {
+        hifi_pad_to_pins(app);
+        app.update(Event::ButtonPressed(Button::Down));
+        app.update(Event::ButtonPressed(Button::Down));
+        app.update(Event::ButtonPressed(Button::Down));
+    }
+
     #[test]
-    fn hifi_user_button_cycles_pages() {
+    fn hifi_pad_walks_through_the_pages() {
         let mut app = App::new_on_screen(Screen::HifiControl);
 
-        // Tap the increment button while on Volume page after two cycles.
         let mut status = hifi_status(PlaybackState::Paused);
         status.volume_percent = 30;
         app.update(Event::HifiStatus(status));
-        app.update(Event::ButtonPressed(Button::User)); // Status -> Pins
-        app.update(Event::ButtonPressed(Button::User)); // Pins -> Volume
+        hifi_pad_to_volume(&mut app);
 
         let outcome = app.update(Event::TouchDown(hifi_volume_increment_touch()));
         assert_eq!(
@@ -687,36 +866,101 @@ mod tests {
             Some(Command::Hifi(HifiCommand::SetVolume { volume: 31 }))
         );
 
-        // Cycle again returns to Status — touching the volume button now is
-        // a no-op (it's not on screen).
-        app.update(Event::ButtonPressed(Button::User)); // Volume -> Status
+        // Back pops out of the subpage to Status, where the volume buttons are
+        // no longer on screen.
+        app.update(Event::ButtonPressed(Button::Back));
+        assert_eq!(app.screen(), Screen::HifiControl);
         let outcome = app.update(Event::TouchDown(hifi_volume_decrement_touch()));
         assert_eq!(outcome.command, None);
     }
 
     #[test]
-    fn hifi_boot_button_cycles_pages_same_as_user_button() {
-        // With a single hardware button, Boot and User both cycle HIFI pages.
+    fn back_from_hifi_status_leaves_for_the_launcher() {
         let mut app = App::new_on_screen(Screen::HifiControl);
-        let mut status = hifi_status(PlaybackState::Paused);
-        status.volume_percent = 30;
-        app.update(Event::HifiStatus(status));
-        app.update(Event::ButtonPressed(Button::Boot)); // Status -> Pins
-        app.update(Event::ButtonPressed(Button::Boot)); // Pins -> Volume
+        app.update(Event::ButtonPressed(Button::Back));
+        assert_eq!(app.screen(), Screen::Launcher);
+    }
 
-        let outcome = app.update(Event::TouchDown(hifi_volume_increment_touch()));
-        assert_eq!(
-            outcome.command,
-            Some(Command::Hifi(HifiCommand::SetVolume { volume: 31 }))
+    #[test]
+    fn back_from_stopwatch_navigates_to_launcher() {
+        let mut app = App::new_on_screen(Screen::Stopwatch);
+        app.update(Event::ButtonPressed(Button::Back));
+        assert_eq!(app.screen(), Screen::Launcher);
+    }
+
+    #[test]
+    fn back_on_the_launcher_does_nothing() {
+        let mut app = App::new_on_screen(Screen::Launcher);
+        let outcome = app.update(Event::ButtonPressed(Button::Back));
+        assert_eq!(app.screen(), Screen::Launcher);
+        assert!(!outcome.render_requested);
+    }
+
+    #[test]
+    fn first_pad_press_reveals_the_ring_without_activating() {
+        let mut app = App::new_on_screen(Screen::Launcher);
+
+        // Select with nothing focused must not fire a control the user cannot
+        // yet see; it only brings the ring up.
+        let outcome = app.update(Event::ButtonPressed(Button::Select));
+        assert!(outcome.render_requested);
+        assert_eq!(app.screen(), Screen::Launcher);
+    }
+
+    #[test]
+    fn pad_selects_launcher_entries() {
+        let mut app = App::new_on_screen(Screen::Launcher);
+
+        // Ring onto the first card, then confirm.
+        app.update(Event::ButtonPressed(Button::Down));
+        app.update(Event::ButtonPressed(Button::Select));
+        assert_eq!(app.screen(), Screen::Stopwatch);
+
+        app.update(Event::ButtonPressed(Button::Back));
+        // Second card is below the first on the portrait layout.
+        app.update(Event::ButtonPressed(Button::Down));
+        app.update(Event::ButtonPressed(Button::Down));
+        app.update(Event::ButtonPressed(Button::Select));
+        assert_eq!(app.screen(), Screen::HifiControl);
+    }
+
+    #[test]
+    fn pad_select_runs_the_stopwatch() {
+        let mut app = App::new_on_screen(Screen::Stopwatch);
+
+        // Ring onto Start, confirm, and the clock should advance.
+        app.update(Event::ButtonPressed(Button::Right));
+        app.update(Event::ButtonPressed(Button::Select));
+        assert!(
+            app.update(Event::Tick { uptime_ms: 2_000 })
+                .render_requested
+        );
+
+        // Ring right onto Stop and confirm; ticks stop requesting frames.
+        app.update(Event::ButtonPressed(Button::Right));
+        app.update(Event::ButtonPressed(Button::Select));
+        app.update(Event::Tick { uptime_ms: 3_000 });
+        assert!(
+            !app.update(Event::Tick { uptime_ms: 4_000 })
+                .render_requested
         );
     }
 
     #[test]
-    fn boot_button_from_stopwatch_navigates_to_launcher() {
-        // Outside HIFI mode, the button still routes to Launcher.
-        let mut app = App::new_on_screen(Screen::Stopwatch);
-        app.update(Event::ButtonPressed(Button::Boot));
-        assert_eq!(app.screen(), Screen::Launcher);
+    fn pad_select_toggles_hifi_playback() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        app.update(Event::HifiStatus(hifi_status(PlaybackState::Paused)));
+
+        // Ring lands on the first transport control, then steps right onto
+        // play/pause in the middle.
+        app.update(Event::ButtonPressed(Button::Right));
+        app.update(Event::ButtonPressed(Button::Right));
+        let outcome = app.update(Event::ButtonPressed(Button::Select));
+
+        assert_eq!(
+            outcome.command,
+            Some(Command::Hifi(HifiCommand::TogglePlayback))
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
 
-use super::screens;
+use super::{components::draw_focus_ring, screens};
 use crate::{ActiveScreen, App, RenderError};
 
 impl App {
@@ -23,6 +23,7 @@ impl App {
         }
 
         let context = self.ui_context();
+        let focused = self.focused_rect();
 
         match &mut self.active_screen {
             ActiveScreen::Launcher(state) => screens::launcher::render(
@@ -42,6 +43,15 @@ impl App {
             ActiveScreen::HifiControl(state) => {
                 screens::hifi::render(state, display, scratch, self.ui_layouts.hifi())
             }
+        }?;
+
+        // Drawn last so it sits above the screen's own pixels. `App::set_focus`
+        // forces a full repaint when the ring moves, which is what erases the
+        // outline from its previous position.
+        if let Some(rect) = focused {
+            draw_focus_ring(display, rect)?;
         }
+
+        Ok(())
     }
 }

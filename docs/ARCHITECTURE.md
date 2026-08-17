@@ -9,9 +9,10 @@ The workspace separates app behavior from hardware access.
 - `app-runtime` owns app side effects behind small traits. It is `no_std` by default and turns `app-core` commands into service calls such as hi-fi pin invocation. Protocol implementations live here or in protocol crates; platform socket setup does not.
 - `linn-lpec` owns Linn's LPEC command formatting and message parsing. It is a protocol crate, not a platform networking crate.
 - `linn-ci-gateway` owns Linn CI Gateway request paths and WebSocket JSON message formatting. It is based on the DSM-hosted Swagger schema at `/api/swagger.yaml` and is also `no_std`.
-- `board-waveshare-c6` records hardware facts and will grow into the board support layer for display, touch, GPIO expansion, IMU, RTC, and storage.
+- `board-kode-dot` records Kode Dot hardware facts and owns the input model. It is the single source of truth for display geometry: `app-core` re-exports `DISPLAY_SIZE` from it rather than repeating the number. Facts inherited from the vendor's ESP32-S3 documentation are tagged `Confidence::Provisional` because the board this project targets is the ESP32-P4 revision.
+- `board-waveshare-c6` records hardware facts for the retired round board the project started on, used only by the legacy firmware.
 - `sim` adapts native macOS controls into app events, renders the app into an AppKit window, and provides host networking adapters to `app-runtime`.
-- `firmware` initializes ESP32-C6 hardware and will adapt physical peripherals and embedded networking into the same app events and runtime traits.
+- `firmware` initializes ESP32-C6 hardware for the retired Waveshare board. It is legacy: `esp-hal` has no ESP32-P4 support, so there is no Kode Dot firmware yet. See `docs/KODE_DOT_PORT_TICKET.md`.
 
 ## Event Flow
 
@@ -23,7 +24,30 @@ The simulator runs a short AppKit timer only as a refresh cadence. Each refresh 
 
 The tap highlight is a simulator-only overlay. The shared app core receives the tap coordinate for control hit-testing, but it does not render pointer feedback.
 
-The simulator can mask the rectangular framebuffer to the board's round visible display area. Circle mode is the default, and simulator taps outside the visible circle are ignored so desktop interaction matches the hardware shape.
+## Input Model
+
+The Kode Dot has a four-way pad and two control buttons alongside its
+touchscreen, so every screen must be operable without touching the panel.
+
+Rather than give each screen a hand-written navigation table, each screen
+publishes the rectangles of its focusable controls in reading order and
+`app-core::ui::focus` moves between them geometrically. One implementation
+therefore covers a stacked pair of launcher cards, a row of transport
+controls, and a 3x2 grid of pins, with nothing to keep in sync when a layout
+constant changes.
+
+`Select` activates the focused control by replaying it as a tap at the
+control's centre, so pad and touch share a single dispatch path and cannot
+drift apart. `Back` goes up one level: out of a HiFi subpage first, then out to
+the launcher. Running the pad off the edge of a HiFi page turns to the next
+page, which is how the three pages are reached without a dedicated key.
+
+The focus ring is drawn as an overlay after the screen paints, so it needs no
+cooperation from each screen's dirty-region cache. Moving the ring forces a
+full repaint, which is what erases the outline from its previous position.
+
+A touch moves the ring to whatever was pressed, but only once the pad has been
+used — a touch-only session never sprouts a ring it did not ask for.
 
 The Mac simulator shows render debug counters outside the device display. `core requests` count times `app-core` reported that visible app state changed, `core frames` count actual shared-core renders, and `sim redraws` count AppKit refreshes including simulator-only overlays.
 
@@ -33,18 +57,22 @@ The UI is OLED-first: the screen background is true black, with small near-black
 
 Touch hit-testing intentionally uses each control's rectangular bounds, even when the visual shape is rounded. This keeps touch handling simple, forgiving, and consistent between simulator and firmware; taps in the small rounded-off corner areas still activate the control. Only switch to shape-accurate hit-testing if a future layout has overlapping controls or visible affordances that make rectangular targets misleading.
 
-Simulator zoom changes the AppKit image view size only. The embedded framebuffer remains 466 x 466 pixels at both native scale and 2x zoom. The window layout always reserves the 2x display area so controls and window size stay stable.
+Simulator zoom changes the AppKit image view size only. The embedded framebuffer remains 410 x 502 pixels at both native scale and 2x zoom. The window layout always reserves the 2x display area so controls and window size stay stable.
+
+The simulator can also render every screen to PNG and exit (`--snapshot`), which is how layout work gets reviewed without a window or hardware.
+
+Because the panel is 410 px wide, its centre line falls on an odd x. Centred widgets therefore need even half-widths to stay on the display controller's 2-px write grid; `Painter` asserts this for scratch-blitted bounds, and `Framebuffer::fill_solid` reproduces the controller's window expansion so the simulator catches drift before hardware does.
 
 ## Hardware Direction
 
 The firmware is set up for the no_std Espressif stack:
 
-- `esp-hal` for ESP32-C6 peripheral access.
-- `esp-wifi` for Wi-Fi/BLE radio support when networking is enabled.
+- `esp-hal` for peripheral access. **Blocked for the Kode Dot**: `esp-hal` 1.1.2 has no `esp32p4` chip feature, so the ESP32-P4 cannot be targeted yet.
+- Wi-Fi on the Kode Dot comes from an ESP32-C5 co-processor rather than an on-die radio, so `esp-radio` does not apply; that path needs an `esp-hosted`-style link.
 - `embassy-net` for the no_std TCP/IP stack, with TCP sockets implementing embedded async I/O traits.
 - `reqwless` or an equivalent embedded HTTP/WebSocket-capable client for HTTP-facing integrations.
 
-The first real board task should be display and touch bring-up for the CO5300 AMOLED panel and FT6146 touch controller.
+The first real board task is confirming the panel resolution, display controller and interface for the ESP32-P4 revision, since the vendor documentation still describes the ESP32-S3 revision. See `docs/KODE_DOT_PORT_TICKET.md`.
 
 ## Network Direction
 

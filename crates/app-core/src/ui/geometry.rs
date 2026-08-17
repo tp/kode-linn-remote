@@ -29,14 +29,32 @@ impl Column {
     }
 }
 
-pub(super) fn centered_square(bounds: Rectangle, size: u32) -> Rectangle {
-    let center_x = bounds.top_left.x + (bounds.size.width / 2) as i32;
-    let center_y = bounds.top_left.y + (bounds.size.height / 2) as i32;
-    let half = (size / 2) as i32;
+/// Two full-width rows stacked with a gap. Portrait panels have height to
+/// spare and only ~410 px of width, so stacked cards beat a side-by-side pair.
+pub(super) fn vertical_pair(
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+    gap: i32,
+) -> (Rectangle, Rectangle) {
+    (
+        Rectangle::new(Point::new(left, top), Size::new(width, height)),
+        Rectangle::new(
+            Point::new(left, top + height as i32 + gap),
+            Size::new(width, height),
+        ),
+    )
+}
 
+/// Shrinks `bounds` by `inset` on every side.
+pub(super) fn inset_rect(bounds: Rectangle, inset: i32) -> Rectangle {
     Rectangle::new(
-        Point::new(center_x - half, center_y - half),
-        Size::new(size, size),
+        Point::new(bounds.top_left.x + inset, bounds.top_left.y + inset),
+        Size::new(
+            bounds.size.width.saturating_sub((inset * 2) as u32),
+            bounds.size.height.saturating_sub((inset * 2) as u32),
+        ),
     )
 }
 

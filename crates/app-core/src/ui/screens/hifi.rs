@@ -4,7 +4,7 @@ use embedded_graphics::{
     Pixel,
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{Arc, PrimitiveStyle, Rectangle, Triangle},
+    primitives::{PrimitiveStyle, Rectangle, Triangle},
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
 use heapless::String;
@@ -20,28 +20,34 @@ use super::super::{
         ButtonTone, DURATION_WIDTH, clear_rect, draw_button, draw_duration, draw_progress_bar,
         draw_spinner_dots, ui_font,
     },
-    geometry::centered_square,
+    focus::FocusTargets,
+    geometry::inset_rect,
     painter::Painter,
     style::*,
     widget::{Slot, Widget},
 };
 
-const ROUND_SAFE_SQUARE_SIZE: u32 = 330;
-const SONG_TOP: i32 = 22;
-const ARTIST_TOP: i32 = 56;
+// Page content is inset from the panel edge on all four sides. The round
+// board this started on needed a centred square to keep content clear of the
+// circular mask; the Kode Dot's panel is a plain rectangle, so pages use the
+// full framebuffer minus a cosmetic margin.
+const BODY_INSET: i32 = 24;
+const SONG_TOP: i32 = 8;
+const ARTIST_TOP: i32 = 50;
 const TEXT_BAND_HEIGHT: u32 = 40;
-const PLAY_SIZE: u32 = 104;
-const PLAY_CENTER_Y: i32 = 142;
-const TRACK_BUTTON_SIZE: u32 = 64;
-const TRACK_BUTTON_GAP: i32 = 24;
-const TIMER_TOP: i32 = 218;
-const PROGRESS_TOP: i32 = 274;
-const PROGRESS_WIDTH: u32 = 294;
+const PLAY_SIZE: u32 = 130;
+const PLAY_CENTER_Y: i32 = 210;
+const TRACK_BUTTON_SIZE: u32 = 72;
+const TRACK_BUTTON_GAP: i32 = 28;
+const TIMER_TOP: i32 = 318;
+const PROGRESS_TOP: i32 = 372;
+const PROGRESS_WIDTH: u32 = 318;
 const PROGRESS_HEIGHT: u32 = 18;
-const VOLUME_DIAMETER: u32 = 442;
-const VOLUME_START_DEGREES: f32 = 135.0;
-const VOLUME_SWEEP_DEGREES: f32 = 270.0;
-const VOLUME_STROKE_WIDTH: u32 = 8;
+// Ambient volume readout, shown on every page. On the round board this was a
+// 270-degree ring tracing the panel edge; a rectangle has no edge to trace, so
+// it becomes a slim bar pinned along the bottom.
+const VOLUME_BAR_HEIGHT: u32 = 10;
+const VOLUME_BAR_BOTTOM_GAP: i32 = 12;
 const LOADING_TIMEOUT_MS: u64 = 5_000;
 
 // Marquee bounce: hold at start, scroll to end, brief hold, scroll back.
@@ -57,18 +63,18 @@ const PLAY_SLOT_BUFFERING: u8 = 4;
 const PLAY_SLOT_ARTWORK: u8 = 5;
 
 // Pins page layout: 3 columns x 2 rows.
-const PINS_GRID_TOP: i32 = 110;
-const PINS_BUTTON_SIZE: Size = Size::new(96, 80);
-const PINS_GRID_GAP: i32 = 14;
+const PINS_GRID_TOP: i32 = 120;
+const PINS_BUTTON_SIZE: Size = Size::new(106, 88);
+const PINS_GRID_GAP: i32 = 16;
 
 // Volume page layout.
 const VOLUME_TITLE_SLOT_HEIGHT: u32 = 40;
-const VOLUME_TITLE_TOP: i32 = 96;
+const VOLUME_TITLE_TOP: i32 = 120;
 const VOLUME_VALUE_SLOT_HEIGHT: u32 = 56;
-const VOLUME_VALUE_TOP: i32 = 152;
-const VOLUME_BUTTON_SIZE: u32 = 88;
-const VOLUME_BUTTON_Y: i32 = 268;
-const VOLUME_BUTTON_GAP: i32 = 56;
+const VOLUME_VALUE_TOP: i32 = 190;
+const VOLUME_BUTTON_SIZE: u32 = 96;
+const VOLUME_BUTTON_Y: i32 = 330;
+const VOLUME_BUTTON_GAP: i32 = 66;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HifiPage {
@@ -84,6 +90,14 @@ impl HifiPage {
             Self::Status => Self::Pins,
             Self::Pins => Self::Volume,
             Self::Volume => Self::Status,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Status => Self::Volume,
+            Self::Pins => Self::Status,
+            Self::Volume => Self::Pins,
         }
     }
 }
@@ -109,7 +123,7 @@ impl Layout {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct VolumeLayout {
-    pub(super) center: Point,
+    pub(super) bar: Rectangle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -246,6 +260,55 @@ impl State {
 
     pub(crate) fn cycle_page(&mut self) {
         self.page = self.page.next();
+    }
+
+    pub(crate) fn cycle_page_back(&mut self) {
+        self.page = self.page.previous();
+    }
+
+    /// Steps back toward the status page. Returns `false` once already there,
+    /// which `App` reads as "nothing left to pop, leave the screen".
+    pub(crate) fn pop_page(&mut self) -> bool {
+        match self.page {
+            HifiPage::Status => false,
+            HifiPage::Pins | HifiPage::Volume => {
+                self.page = HifiPage::Status;
+                true
+            }
+        }
+    }
+
+    /// Focusable controls for the page currently shown, in reading order.
+    pub(crate) fn focus_targets(&self, layout: &Layout) -> FocusTargets {
+        let mut targets = FocusTargets::new();
+        match self.page {
+            HifiPage::Status => {
+                let _ = targets.push(layout.status.previous_button);
+                let _ = targets.push(layout.status.play_button);
+                let _ = targets.push(layout.status.next_button);
+            }
+            HifiPage::Pins => {
+                for button in layout.pins.buttons {
+                    let _ = targets.push(button);
+                }
+            }
+            HifiPage::Volume => {
+                let _ = targets.push(layout.volume_page.decrement_button);
+                let _ = targets.push(layout.volume_page.increment_button);
+            }
+        }
+        targets
+    }
+
+    /// Drops every cached "already drawn" flag so the next render repaints from
+    /// scratch. Used when the focus ring moves and the old outline has to
+    /// disappear along with it.
+    pub(crate) fn invalidate(&mut self) {
+        self.last_rendered_page = None;
+        self.status_cache = StatusCache::default();
+        self.pins_cache = PinsCache::default();
+        self.volume_cache = VolumeCache::default();
+        self.play_slot.previous_kind = None;
     }
 
     pub(crate) fn on_tick(&mut self, uptime_ms: u64) -> bool {
@@ -410,17 +473,24 @@ impl State {
 
 pub(crate) fn layout(bounds: Rectangle) -> Layout {
     let center_x = bounds.top_left.x + (bounds.size.width / 2) as i32;
-    let center_y = bounds.top_left.y + (bounds.size.height / 2) as i32;
-    let page_body = centered_square(bounds, ROUND_SAFE_SQUARE_SIZE);
+    let page_body = inset_rect(bounds, BODY_INSET);
 
     let status = status_layout(&page_body, center_x);
     let pins = pins_layout(&page_body, center_x);
     let volume_page = volume_page_layout(&page_body, center_x);
 
+    // Pinned below every page body so page-change clears never touch it.
+    let bar_top = bounds.top_left.y + bounds.size.height as i32
+        - VOLUME_BAR_BOTTOM_GAP
+        - VOLUME_BAR_HEIGHT as i32;
+
     Layout {
         page_body,
         volume: VolumeLayout {
-            center: Point::new(center_x, center_y),
+            bar: Rectangle::new(
+                Point::new(page_body.top_left.x, bar_top),
+                Size::new(page_body.size.width, VOLUME_BAR_HEIGHT),
+            ),
         },
         status,
         pins,
@@ -604,14 +674,10 @@ where
 
     let mut painter = Painter::new(display, scratch);
 
-    // Volume arc is rendered on every page; reflects volume_percent against
-    // the receiver max (0..=HIFI_VOLUME_MAX).
-    let volume = VolumeArc {
-        center: ui_layout.volume.center,
-        diameter: VOLUME_DIAMETER,
-        stroke_width: VOLUME_STROKE_WIDTH,
-        start_deg: VOLUME_START_DEGREES,
-        sweep_deg: VOLUME_SWEEP_DEGREES,
+    // Volume is rendered on every page; reflects volume_percent against the
+    // receiver max (0..=HIFI_VOLUME_MAX).
+    let volume = VolumeBar {
+        bar: ui_layout.volume.bar,
         track_color: VOLUME_TRACK,
         active_color: VOLUME_ACTIVE,
         percent: state.status.volume_percent,
@@ -1096,81 +1162,66 @@ fn spinner_phase(uptime_ms: u64) -> u8 {
 // Widgets
 // =====================================================================
 
-struct VolumeArc {
-    center: Point,
-    diameter: u32,
-    stroke_width: u32,
-    start_deg: f32,
-    sweep_deg: f32,
+/// Ambient volume readout along the bottom of the panel.
+///
+/// Replaces the 270-degree ring used on the round board. Like the ring, it
+/// repaints only the span between the old and new levels rather than the whole
+/// bar, which keeps volume nudges cheap on a slow QSPI panel.
+struct VolumeBar {
+    bar: Rectangle,
     track_color: Rgb565,
     active_color: Rgb565,
     percent: u8,
     previous_percent: Option<u8>,
 }
 
-impl Widget<Action> for VolumeArc {
+impl VolumeBar {
+    /// Horizontal span `[left, right)` of the bar, clamped to its bounds.
+    fn segment(&self, from_px: u32, to_px: u32) -> Rectangle {
+        let left = self.bar.top_left.x + from_px as i32;
+        Rectangle::new(
+            Point::new(left, self.bar.top_left.y),
+            Size::new(to_px.saturating_sub(from_px), self.bar.size.height),
+        )
+    }
+}
+
+impl Widget<Action> for VolumeBar {
     fn bounds(&self) -> Rectangle {
-        Rectangle::with_center(self.center, Size::new(self.diameter, self.diameter))
+        self.bar
+    }
+
+    fn should_draw(&self) -> bool {
+        self.previous_percent != Some(self.percent)
     }
 
     fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = Rgb565>,
     {
-        let new_active = arc_sweep_for_volume(self.percent, self.sweep_deg);
+        let width = self.bar.size.width;
+        let new_filled = filled_width_for_volume(self.percent, width);
 
         match self.previous_percent {
-            // First frame — paint the full track plus the active wedge.
+            // First frame — paint the full track, then the filled span.
             None => {
-                let track = PrimitiveStyle::with_stroke(self.track_color, self.stroke_width);
-                Arc::with_center(
-                    self.center,
-                    self.diameter,
-                    self.start_deg.deg(),
-                    self.sweep_deg.deg(),
-                )
-                .into_styled(track)
-                .draw(target)?;
-                if new_active > 0.0 {
-                    let active = PrimitiveStyle::with_stroke(self.active_color, self.stroke_width);
-                    Arc::with_center(
-                        self.center,
-                        self.diameter,
-                        self.start_deg.deg(),
-                        new_active.deg(),
-                    )
-                    .into_styled(active)
-                    .draw(target)?;
+                target.fill_solid(&self.bar, self.track_color)?;
+                if new_filled > 0 {
+                    target.fill_solid(&self.segment(0, new_filled), self.active_color)?;
                 }
             }
-            Some(prev) if prev == self.percent => {
+            Some(previous) if previous == self.percent => {
                 // Smart-skip.
             }
-            Some(prev) => {
-                let prev_active = arc_sweep_for_volume(prev, self.sweep_deg);
-                let (delta_start, delta_sweep, color) = if new_active > prev_active {
-                    (
-                        self.start_deg + prev_active,
-                        new_active - prev_active,
-                        self.active_color,
-                    )
+            Some(previous) => {
+                let previous_filled = filled_width_for_volume(previous, width);
+                let (from_px, to_px, color) = if new_filled > previous_filled {
+                    (previous_filled, new_filled, self.active_color)
                 } else {
-                    (
-                        self.start_deg + new_active,
-                        prev_active - new_active,
-                        self.track_color,
-                    )
+                    (new_filled, previous_filled, self.track_color)
                 };
-                if delta_sweep > f32::EPSILON {
-                    let style = PrimitiveStyle::with_stroke(color, self.stroke_width);
-                    Arc::with_center(
-                        self.center,
-                        self.diameter,
-                        delta_start.deg(),
-                        delta_sweep.deg(),
-                    )
-                    .into_styled(style)
-                    .draw(target)?;
+                if to_px > from_px {
+                    target.fill_solid(&self.segment(from_px, to_px), color)?;
                 }
             }
         }
@@ -1179,9 +1230,9 @@ impl Widget<Action> for VolumeArc {
     }
 }
 
-fn arc_sweep_for_volume(percent: u8, sweep_deg: f32) -> f32 {
-    let clamped = percent.min(HIFI_VOLUME_MAX);
-    sweep_deg * (clamped as f32) / (HIFI_VOLUME_MAX as f32)
+fn filled_width_for_volume(percent: u8, width: u32) -> u32 {
+    let clamped = percent.min(HIFI_VOLUME_MAX) as u32;
+    (width * clamped) / HIFI_VOLUME_MAX as u32
 }
 
 struct Spinner {
@@ -1774,22 +1825,58 @@ mod tests {
     #[test]
     fn primary_elements_are_centered() {
         let ui_layout = layout(SCREEN_BOUNDS);
+        let center_x = SCREEN_BOUNDS.top_left.x + (SCREEN_BOUNDS.size.width / 2) as i32;
 
-        assert_eq!(ui_layout.status.song_origin.x, ui_layout.volume.center.x);
-        assert_eq!(ui_layout.status.artist_origin.x, ui_layout.volume.center.x);
-        assert_eq!(
-            rect_visual_center(ui_layout.status.play_button).x,
-            ui_layout.volume.center.x
-        );
+        assert_eq!(ui_layout.status.song_origin.x, center_x);
+        assert_eq!(ui_layout.status.artist_origin.x, center_x);
+        assert_eq!(rect_visual_center(ui_layout.status.play_button).x, center_x);
         assert_eq!(
             ui_layout.status.timer_origin.x + DURATION_WIDTH / 2,
-            ui_layout.volume.center.x
+            center_x
         );
         assert_eq!(
             ui_layout.status.progress.top_left.x
                 + (ui_layout.status.progress.size.width / 2) as i32,
-            ui_layout.volume.center.x
+            center_x
         );
+    }
+
+    #[test]
+    fn page_content_stays_inside_the_panel() {
+        let ui_layout = layout(SCREEN_BOUNDS);
+        let panel_right = SCREEN_BOUNDS.top_left.x + SCREEN_BOUNDS.size.width as i32;
+        let panel_bottom = SCREEN_BOUNDS.top_left.y + SCREEN_BOUNDS.size.height as i32;
+
+        // Every control plus the focus ring drawn around it has to fit; the
+        // ring is the widest thing on screen once a pad user is driving.
+        let ring = FOCUS_RING_INSET + FOCUS_RING_STROKE as i32;
+        let mut controls = alloc::vec![
+            ui_layout.status.previous_button,
+            ui_layout.status.play_button,
+            ui_layout.status.next_button,
+            ui_layout.volume_page.decrement_button,
+            ui_layout.volume_page.increment_button,
+        ];
+        controls.extend_from_slice(&ui_layout.pins.buttons);
+
+        for control in controls {
+            assert!(
+                control.top_left.x - ring >= SCREEN_BOUNDS.top_left.x
+                    && control.top_left.y - ring >= SCREEN_BOUNDS.top_left.y
+                    && rect_right(control) + ring <= panel_right
+                    && rect_bottom(control) + ring <= panel_bottom,
+                "control {control:?} plus focus ring escapes the panel"
+            );
+        }
+
+        assert!(rect_bottom(ui_layout.volume.bar) <= panel_bottom);
+        // The ambient volume bar sits below every page body, so a page change
+        // clearing its body must not erase it.
+        assert!(ui_layout.volume.bar.top_left.y >= rect_bottom(ui_layout.page_body));
+    }
+
+    fn rect_right(rect: Rectangle) -> i32 {
+        rect.top_left.x + rect.size.width as i32
     }
 
     /// The scratch-blit fast-path requires 2-px aligned bounds — for direct
@@ -2160,12 +2247,8 @@ mod tests {
             }
         }
 
-        let arc = VolumeArc {
-            center: Point::new(232, 232),
-            diameter: VOLUME_DIAMETER,
-            stroke_width: VOLUME_STROKE_WIDTH,
-            start_deg: VOLUME_START_DEGREES,
-            sweep_deg: VOLUME_SWEEP_DEGREES,
+        let bar = VolumeBar {
+            bar: layout(SCREEN_BOUNDS).volume.bar,
             track_color: VOLUME_TRACK,
             active_color: VOLUME_ACTIVE,
             percent: 50,
@@ -2174,24 +2257,20 @@ mod tests {
         let mut t = Counting {
             calls: Cell::new(0),
         };
-        arc.draw(&mut t).unwrap();
-        assert_eq!(t.calls.get(), 0, "volume arc should smart-skip");
+        assert!(!bar.should_draw(), "volume bar should smart-skip");
+        bar.draw(&mut t).unwrap();
+        assert_eq!(t.calls.get(), 0, "volume bar should smart-skip");
     }
 
     #[test]
-    fn volume_arc_full_at_max_volume() {
-        // Volume at HIFI_VOLUME_MAX should fill the arc completely.
-        assert!(
-            (arc_sweep_for_volume(HIFI_VOLUME_MAX, VOLUME_SWEEP_DEGREES) - VOLUME_SWEEP_DEGREES)
-                .abs()
-                < 0.01
-        );
-        // And anything beyond max also caps at the full sweep.
-        assert!(
-            (arc_sweep_for_volume(HIFI_VOLUME_MAX + 10, VOLUME_SWEEP_DEGREES)
-                - VOLUME_SWEEP_DEGREES)
-                .abs()
-                < 0.01
-        );
+    fn volume_bar_full_at_max_volume() {
+        let width = layout(SCREEN_BOUNDS).volume.bar.size.width;
+
+        // Volume at HIFI_VOLUME_MAX fills the bar completely.
+        assert_eq!(filled_width_for_volume(HIFI_VOLUME_MAX, width), width);
+        // And anything beyond max also caps at full.
+        assert_eq!(filled_width_for_volume(HIFI_VOLUME_MAX + 10, width), width);
+        // Zero volume leaves it empty.
+        assert_eq!(filled_width_for_volume(0, width), 0);
     }
 }

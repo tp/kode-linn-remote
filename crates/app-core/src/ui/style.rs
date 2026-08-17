@@ -17,3 +17,10 @@ pub(super) const ACTION_INACTIVE: Rgb565 = Rgb565::new(3, 4, 6);
 pub(super) const ACTION_INACTIVE_BORDER: Rgb565 = Rgb565::new(7, 10, 13);
 pub(super) const VOLUME_TRACK: Rgb565 = Rgb565::new(9, 45, 31);
 pub(super) const VOLUME_ACTIVE: Rgb565 = Rgb565::new(0, 12, 27);
+
+/// Ring drawn around the control the D-pad is currently on.
+pub(super) const FOCUS_RING: Rgb565 = Rgb565::new(20, 50, 28);
+/// Padding between a focused control's bounds and its ring.
+pub(super) const FOCUS_RING_INSET: i32 = 6;
+pub(super) const FOCUS_RING_STROKE: u32 = 3;
+pub(super) const FOCUS_RING_RADIUS: u32 = 14;
