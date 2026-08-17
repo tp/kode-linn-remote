@@ -65,12 +65,17 @@ Because the panel is 410 px wide, its centre line falls on an odd x. Centred wid
 
 ## Hardware Direction
 
-The firmware is set up for the no_std Espressif stack:
+`apps/firmware` is built on the no_std Espressif stack (`esp-hal`, `esp-radio`, `embassy-net`, `reqwless`), which is why it still targets the retired Waveshare ESP32-C6 board.
 
-- `esp-hal` for peripheral access. **Blocked for the Kode Dot**: `esp-hal` 1.1.2 has no `esp32p4` chip feature, so the ESP32-P4 cannot be targeted yet.
-- Wi-Fi on the Kode Dot comes from an ESP32-C5 co-processor rather than an on-die radio, so `esp-radio` does not apply; that path needs an `esp-hosted`-style link.
-- `embassy-net` for the no_std TCP/IP stack, with TCP sockets implementing embedded async I/O traits.
-- `reqwless` or an equivalent embedded HTTP/WebSocket-capable client for HTTP-facing integrations.
+**That stack does not reach the Kode Dot.** As of 2026-08-17, released `esp-hal` (1.1.2) has no `esp32p4` chip feature — support exists on `main` but is unpublished — and bare-metal Rust additionally has no MIPI-DSI driver and no way to reach the ESP32-C5 co-processor's radio (`esp-radio` covers on-die radios only).
+
+The Kode Dot firmware is therefore planned against **std Rust on ESP-IDF**:
+
+- `esp-idf-hal` / `esp-idf-svc` for peripherals, which carry ESP32-P4 support and `esp_wifi_remote` co-processor Wi-Fi as of their 2026-03-10 releases.
+- `esp_lcd` through bindgen for the MIPI-DSI panel.
+- ESP-IDF's own TCP/IP stack and HTTP client in place of `embassy-net` and `reqwless`.
+
+This trades embassy and `no_std` on device for Espressif's drivers. `app-core` stays `no_std` and is unaffected — it needs only a framebuffer blit and an event source.
 
 The first real board task is confirming the panel resolution, display controller and interface for the ESP32-P4 revision, since the vendor documentation still describes the ESP32-S3 revision. See `docs/KODE_DOT_PORT_TICKET.md`.
 

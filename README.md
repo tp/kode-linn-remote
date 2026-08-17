@@ -40,7 +40,8 @@ The **ESP32-P4 revision** (November 2026 batch):
 - `apps/firmware`: **legacy** ESP32-C6 firmware for the retired Waveshare
   board, kept for its CO5300 QSPI display driver. See
   [docs/KODE_DOT_PORT_TICKET.md](docs/KODE_DOT_PORT_TICKET.md) before touching
-  it — Rust firmware for the ESP32-P4 is currently blocked upstream.
+  it — ESP32-P4 firmware is planned against std Rust on ESP-IDF
+  (`esp-idf-svc`), not the no_std stack this crate uses.
 - `crates/board-waveshare-c6`: board facts for that retired board.
 
 ## Run The Simulator
