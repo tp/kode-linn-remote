@@ -77,7 +77,10 @@ const TCA9554_ADDR: u8 = 0x20;
 /// leaving the audio-amp gate (bit 7) alone.
 const TCA9554_OUTPUT_REG: u8 = 0x01;
 const TCA9554_OUTPUT_BAT_RELEASED: u8 = 0x80;
-const LOCAL_CONFIG: &str = include_str!("../../../config/local.env");
+/// Contents of `config/local.env`, or of `config/local.env.example` when that
+/// gitignored file is absent. `build.rs` decides which and says so when it
+/// falls back.
+const LOCAL_CONFIG: &str = include_str!(env!("LOCAL_CONFIG_PATH"));
 
 static FIRMWARE_EVENTS: Channel<CriticalSectionRawMutex, FirmwareEvent, 1> = Channel::new();
 static HIFI_REQUESTS: Channel<CriticalSectionRawMutex, HifiRequest, 4> = Channel::new();
