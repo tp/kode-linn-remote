@@ -12,16 +12,23 @@ its directional pad.
 The **ESP32-P4 revision** (November 2026 batch):
 
 - ESP32-P4 application processor with an ESP32-C5 wireless co-processor
+- 32 MB PSRAM, 32 MB flash
 - Dual-band Wi-Fi 2.4 / 5 GHz, Bluetooth LE 5, Thread, Zigbee
-- 2.13" AMOLED touchscreen
+- 2.13" AMOLED touchscreen, 410 x 502, mounted portrait
 - Directional pad plus two control buttons
-- 9-axis IMU, NFC, RFID, IR, speaker, microphone, haptics, RGB LED, microSD
+- 9-axis IMU (LSM6DSV + LIS2MDL), NFC, RFID, IR, speaker, microphone,
+  haptics, RGB LED, microSD
 
+> Kode publishes the panel as "a crisp 502x410 touch panel" — that is its
+> native scan resolution, long side first. It is mounted portrait, screen above
+> the pad, so the framebuffer is 410 wide by 502 tall. Writing it the other way
+> round transposes every layout.
+>
 > The vendor documentation at <https://docs.kode.diy> still describes the
 > earlier **ESP32-S3** revision. Its pin maps and drivers do not transfer, so
 > board facts carried over from it are marked `Confidence::Provisional` in
 > `crates/board-kode-dot` — those are the ones to re-check against real
-> hardware. The panel resolution is among them.
+> hardware.
 
 ## What Is Here
 

@@ -8,10 +8,12 @@
 //! published specification is:
 //!
 //! - ESP32-P4 application processor with an **ESP32-C5 wireless co-processor**
+//! - 32 MB PSRAM, 32 MB flash
 //! - Dual-band Wi-Fi 2.4 / 5 GHz, Bluetooth LE 5, Thread, Zigbee
-//! - 2.13" AMOLED touchscreen
+//! - 2.13" AMOLED touchscreen, 410 x 502
 //! - Directional pad plus two control buttons
-//! - 9-axis IMU, NFC 13.56 MHz (read and emulate), RFID 125 kHz, IR TX/RX
+//! - 9-axis IMU (LSM6DSV + LIS2MDL), NFC 13.56 MHz (read and emulate),
+//!   RFID 125 kHz, IR TX/RX
 //! - Speaker, microphone, haptic motor, RGB LED, microSD
 //! - USB-C with OTG, 20-pin expansion header, rear magnetic connector
 //!
@@ -37,17 +39,21 @@ pub enum Confidence {
 
 pub const BOARD_NAME: &str = "Kode Dot (ESP32-P4 + ESP32-C5)";
 
-/// Panel resolution in pixels, portrait.
+/// Panel resolution in pixels: 410 wide by 502 tall.
 ///
-/// The 2.13" AMOLED on the ESP32-S3 revision is 410 x 502. The product page
-/// for the P4 revision lists the panel size but not its resolution, so this is
-/// [`Confidence::Provisional`]: same physical panel is the likely case, but it
-/// is not confirmed. This constant is the single source of truth for display
-/// geometry across the workspace — correcting it here reflows every screen.
+/// **Beware the axis order.** Kode publishes this as "a crisp 502x410 touch
+/// panel" — that is the panel's native scan resolution quoted long side first.
+/// The panel is mounted portrait in the case, with the screen above the
+/// directional pad, so in framebuffer terms the width is 410 and the height is
+/// 502. Writing it the other way round transposes every layout in the
+/// workspace.
+///
+/// This constant is the single source of truth for display geometry —
+/// correcting it here reflows every screen.
 pub const DISPLAY_SIZE: Size = Size::new(410, 502);
 
 /// Confidence in [`DISPLAY_SIZE`].
-pub const DISPLAY_SIZE_CONFIDENCE: Confidence = Confidence::Provisional;
+pub const DISPLAY_SIZE_CONFIDENCE: Confidence = Confidence::Published;
 
 /// The panel is a plain rectangle: unlike the round 466 x 466 board this
 /// project started on, there are no corners lost to a circular mask, so
@@ -64,6 +70,17 @@ pub mod peripherals {
     pub const SOC: &str = "ESP32-P4";
     /// Wireless co-processor. Published for this revision.
     pub const WIRELESS_COPROCESSOR: &str = "ESP32-C5";
+
+    /// Published for this revision. A full 410 x 502 RGB565 frame is about
+    /// 402 KiB, so double buffering is comfortably affordable here — unlike on
+    /// the internal-RAM-only board this project started on.
+    pub const PSRAM_BYTES: usize = 32 * 1024 * 1024;
+    pub const FLASH_BYTES: usize = 32 * 1024 * 1024;
+
+    /// 9-axis IMU, published for this revision as a 6-axis part plus a
+    /// separate magnetometer.
+    pub const IMU: &str = "LSM6DSV";
+    pub const MAGNETOMETER: &str = "LIS2MDL";
 
     /// Display controller on the ESP32-S3 revision.
     ///

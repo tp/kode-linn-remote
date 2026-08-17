@@ -43,18 +43,22 @@ simulator is the only place this project runs.
 
 ## Open Questions For First Bring-Up
 
-Everything marked `Confidence::Provisional` in `crates/board-kode-dot`, most
-importantly:
+Everything marked `Confidence::Provisional` in `crates/board-kode-dot`:
 
-1. **Panel resolution.** 410 x 502 is carried over from the 2.13" AMOLED on the
-   ESP32-S3 revision. The product page gives the panel size but not its pixel
-   count for the P4 revision. Confirm before trusting any layout.
-2. **Display controller and interface.** The S3 revision used a CO5300 over
+1. **Display controller and interface.** The S3 revision used a CO5300 over
    QuadSPI. The P4 has a MIPI-DSI host and may drive the panel differently,
    which would also invalidate the 2-px write-window alignment the simulator's
    `Framebuffer::fill_solid` currently mirrors.
-3. **Touch controller.** CST820 over I2C at 0x15 on the S3 revision.
-4. **Button wiring.** On the S3 revision the pad sat behind a TCA95xx I/O
+2. **Touch controller.** CST820 over I2C at 0x15 on the S3 revision.
+3. **Button wiring.** On the S3 revision the pad sat behind a TCA95xx I/O
    expander at 0x20 with one key wired straight to GPIO0. The P4 revision
    advertises "two control buttons", which `board-kode-dot` models as
    `Select` and `Back`; confirm which physical key is which.
+
+Settled, and no longer open:
+
+- **Panel geometry.** 410 x 502, portrait. Kode publishes it as "502x410" —
+  the native scan resolution, long side first — but the panel is mounted with
+  the screen above the pad, so the framebuffer is 410 wide. Do not transpose
+  it.
+- **Memory.** 32 MB PSRAM and 32 MB flash.

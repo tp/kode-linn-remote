@@ -6,12 +6,12 @@ Improve firmware display rendering performance once the Kode Dot display path ex
 
 ### Context
 
-The Kode Dot panel is a 2.13" AMOLED. Treating it as 410x502 RGB565, one full frame is about 402 KiB.
+The Kode Dot panel is a 2.13" AMOLED, 410x502 portrait. One full RGB565 frame is about 402 KiB.
 
 **This ticket cannot start yet.** `esp-hal` has no ESP32-P4 support, so there is no firmware display path to optimize — see `KODE_DOT_PORT_TICKET.md`. Several of its assumptions also need re-checking against the ESP32-P4 revision before any of the design below is valid:
 
 - **Transport.** The ESP32-S3 revision drove the panel through a CO5300 over QuadSPI. The ESP32-P4 has a MIPI-DSI host and may drive it differently, which would make the SPI/DMA work below moot.
-- **Memory budget.** Full double buffering was not realistic on the older internal-RAM budget. The Kode Dot ships PSRAM, so a full framebuffer may well be affordable here — measure before assuming the tile-based approach is still necessary.
+- **Memory budget.** Full double buffering was not realistic on the older internal-RAM budget. The Kode Dot has 32 MB of PSRAM, so two 402 KiB framebuffers are a rounding error against it. Much of the tile-based complexity below may simply be unnecessary — check that before porting any of it.
 - **Alignment.** The CO5300 required even-aligned write windows of at least two scanlines, and naive tile batching glitched text. `app-core`'s painter and the simulator's `Framebuffer::fill_solid` still enforce that rule. If the P4 revision uses a different controller, confirm whether the constraint still applies before relaxing it.
 
 ### Proposed Design
@@ -44,5 +44,5 @@ The Kode Dot panel is a 2.13" AMOLED. Treating it as 410x502 RGB565, one full fr
 
 - Do not begin this before a Kode Dot firmware exists at all, and then not before touch input, Wi-Fi/runtime integration, and remaining board peripherals are usable enough to exercise real UI updates.
 - Prefer blocking DMA first; async rendering can be considered later only if blocking DMA plus dirty regions are insufficient.
-- Do not add a full framebuffer unless PSRAM is confirmed, configured, and justified by measured performance.
+- PSRAM is confirmed at 32 MB, but still justify a full framebuffer by measured performance rather than assuming it — PSRAM bandwidth, not capacity, is the likely constraint.
 - Keep hardware-specific controller and DMA details in `apps/firmware` or board-support code; keep `app-core` deterministic and `no_std`.
