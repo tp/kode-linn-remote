@@ -319,12 +319,18 @@ pub mod worker {
         Hifi: HifiController,
     {
         while let Ok(command) = commands.recv() {
+            // Predict before sending, not after. `handle_command` is a network
+            // round trip, and waiting for it would put the whole point of the
+            // prediction — a screen that changes on the press — behind the
+            // latency it exists to hide. If the command then fails, the
+            // prediction's own expiry walks it back.
+            if matches!(command, HifiCommand::PreviousTrack | HifiCommand::NextTrack) {
+                let forward = matches!(command, HifiCommand::NextTrack);
+                let _ = background_requests.send(Request::TrackChanged { forward });
+            }
+
             match runtime.handle_command(Command::Hifi(command)) {
                 Ok(()) => {
-                    if matches!(command, HifiCommand::PreviousTrack | HifiCommand::NextTrack) {
-                        let forward = matches!(command, HifiCommand::NextTrack);
-                        let _ = background_requests.send(Request::TrackChanged { forward });
-                    }
                     let _ = background_requests.send(Request::RequestStatusPoll);
                 }
                 Err(error) => {
