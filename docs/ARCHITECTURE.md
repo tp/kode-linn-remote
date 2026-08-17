@@ -29,18 +29,34 @@ The tap highlight is a simulator-only overlay. The shared app core receives the 
 The Kode Dot has a four-way pad and two control buttons alongside its
 touchscreen, so every screen must be operable without touching the panel.
 
-Rather than give each screen a hand-written navigation table, each screen
-publishes the rectangles of its focusable controls in reading order and
-`app-core::ui::focus` moves between them geometrically. One implementation
-therefore covers a stacked pair of launcher cards, a row of transport
-controls, and a 3x2 grid of pins, with nothing to keep in sync when a layout
-constant changes.
+There are two ways a screen can use the pad, and which one it wants depends on
+whether the screen is *browsed* or *operated*.
 
-`Select` activates the focused control by replaying it as a tap at the
-control's centre, so pad and touch share a single dispatch path and cannot
-drift apart. `Back` goes up one level: out of a HiFi subpage first, then out to
-the launcher. Running the pad off the edge of a HiFi page turns to the next
-page, which is how the three pages are reached without a dedicated key.
+**Browsed screens publish focus targets.** Rather than a hand-written
+navigation table, the screen publishes the rectangles of its focusable
+controls in reading order and `app-core::ui::focus` moves between them
+geometrically. One implementation covers a stacked pair of launcher cards, a
+row of stopwatch buttons and a 2x2 grid of music choices, with nothing to keep
+in sync when a layout constant changes. `Select` activates the focused control
+by replaying it as a tap at the control's centre, so pad and touch share a
+single dispatch path and cannot drift apart.
+
+**Operated screens bind the pad directly.** A screen may instead implement
+`intercept_button`, which gets first refusal on every press and returns `None`
+for anything it does not want. HiFi Now Playing does this: up and down are
+volume, left and right are the track, `Select` is play/pause, and it publishes
+no focus targets at all. The reason is that a focus ring costs two presses for
+every action, and the most common thing anyone does with a remote is nudge the
+volume. Now Playing is also tap-inert, so it has no touch dispatch that the
+pad could drift away from.
+
+`Back` goes up one level, out to the launcher — except on the HiFi screen,
+which intercepts it to move between Now Playing and Choices and never leaves.
+Running the pad off the end of a *row* continues in reading order onto the
+adjacent line, which is how a grid is normally traversed and means a
+left/right-only user can still reach every tile. It stops at the ends of the
+list rather than wrapping round to the far corner. Vertical movement off an
+edge does nothing; that is the seam a scrolling picker would use.
 
 The focus ring is drawn as an overlay after the screen paints, so it needs no
 cooperation from each screen's dirty-region cache. Moving the ring forces a
@@ -63,7 +79,7 @@ The simulator can also render every screen to PNG and exit (`--snapshot`), which
 
 The display driver **must compose whole frames in PSRAM and blit them**, aligning the blit window without disturbing its contents. It must not satisfy the panel's even-aligned window requirement by widening individual fills, which is what the round board's framebuffer-less driver did. That is lossy: a fill starting on an odd row grows upward over the row above it, and since the font emits glyph-background fills on odd rows, it silently ate the bottom row of every glyph whose ink ended on an even row — bars and stems rendered about a pixel thin. With 32 MB of PSRAM a full framebuffer costs nothing and removes the whole class of bug.
 
-Because the panel is 410 px wide, its centre line falls on an odd x. Centred widgets therefore need even half-widths to stay on the display controller's 2-px write grid; `Painter` asserts this for scratch-blitted bounds, and `Framebuffer::fill_solid` reproduces the controller's window expansion so the simulator catches drift before hardware does.
+Because the panel is 410 px wide, its centre line falls on an odd x (205). A centred widget's left edge is `205 - width / 2`, so staying on the display controller's 2-px write grid requires an *odd* half-width — that is, `width % 4 == 2`. `Painter` asserts this for scratch-blitted bounds, and `Framebuffer::fill_solid` reproduces the controller's window expansion so the simulator catches drift before hardware does.
 
 ## Hardware Direction
 

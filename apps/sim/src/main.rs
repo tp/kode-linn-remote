@@ -10,8 +10,9 @@ use std::{
 
 use app_config::AppConfig;
 use app_core::{
-    App, Button, Command, DISPLAY_SIZE, Event, NetworkStatus, RECOMMENDED_SCRATCH_PIXELS,
-    RenderSession, Screen, TouchPoint,
+    App, Button, Command, DISPLAY_SIZE, Event, HIFI_ARTWORK_SIZE, HifiArtwork, HifiPin, HifiPins,
+    HifiStatus, NetworkStatus, PlaybackState, RECOMMENDED_SCRATCH_PIXELS, RenderSession, Screen,
+    TouchPoint,
 };
 use app_runtime::{
     hifi::{
@@ -1049,6 +1050,64 @@ fn tap_alpha(age_ms: u64) -> Option<u8> {
     }
 }
 
+/// Stand-in metadata so snapshots show a populated layout rather than the
+/// waiting-for-the-network empty state.
+const DEMO_ARTWORK_URI: &str = "demo://cover";
+
+fn demo_status() -> HifiStatus {
+    let mut status = HifiStatus::empty();
+    let _ = status.title.push_str("Yellow Submarine");
+    let _ = status.artist.push_str("The Beatles");
+    let _ = status.album.push_str("Revolver");
+    let _ = status.album_art_uri.push_str(DEMO_ARTWORK_URI);
+    status.playback = PlaybackState::Playing;
+    status.elapsed_seconds = 42;
+    status.duration_seconds = 160;
+    status.volume_percent = 38;
+    status
+}
+
+/// A stand-in cover, so snapshots exercise the artwork path.
+///
+/// Snapshot mode has no network, so nothing real can be fetched — but the
+/// artwork slot is the largest thing on Now Playing, and reviewing that screen
+/// without it means reviewing a black rectangle.
+fn demo_artwork() -> HifiArtwork {
+    let mut artwork = HifiArtwork::new(DEMO_ARTWORK_URI).expect("uri fits");
+    let size = HIFI_ARTWORK_SIZE as i32;
+    for y in 0..size {
+        for x in 0..size {
+            // Off-centre radial bands: enough structure to show cropping,
+            // scaling and the badges drawn over the top.
+            let dx = x - size / 3;
+            let dy = y - size / 2;
+            let radius = ((dx * dx + dy * dy) as f32).sqrt() as i32;
+            let band = (radius / 26) % 3;
+            let fade = (y * 255 / size) as u8;
+            let color = match band {
+                0 => Rgb565::new(28 - (fade >> 4), 20, 8),
+                1 => Rgb565::new(6, 24 - (fade >> 5), 22),
+                _ => Rgb565::new(10, 12, 6),
+            };
+            if !artwork.push_pixel(color) {
+                break;
+            }
+        }
+    }
+    artwork
+}
+
+fn demo_pins() -> HifiPins {
+    let mut pins = HifiPins::new();
+    for (slot, title) in ["Favourites", "Dance!", "Sleepy", "Stories"]
+        .into_iter()
+        .enumerate()
+    {
+        pins.set(slot, HifiPin::new(slot as u32 + 1, title));
+    }
+    pins
+}
+
 /// Renders every screen to a PNG and exits, without opening a window.
 ///
 /// Design iteration on hardware that has not shipped yet mostly means looking
@@ -1064,27 +1123,26 @@ fn write_snapshots(directory: &Path) -> std::io::Result<()> {
         ("launcher-focused", Screen::Launcher, &[Button::Down]),
         ("stopwatch", Screen::Stopwatch, &[]),
         ("stopwatch-focused", Screen::Stopwatch, &[Button::Right]),
-        ("hifi-status", Screen::HifiControl, &[]),
+        ("hifi-now-playing", Screen::HifiControl, &[]),
+        // Up raises the volume readout, which is the only thing on Now
+        // Playing that is not on screen the rest of the time.
         (
-            "hifi-status-focused",
+            "hifi-now-playing-volume",
             Screen::HifiControl,
-            &[Button::Right, Button::Right],
+            &[Button::Up],
         ),
+        // Select pauses, which badges the artwork rather than editing the
+        // artist line.
         (
-            "hifi-pins",
+            "hifi-now-playing-paused",
             Screen::HifiControl,
-            &[Button::Down, Button::Down],
+            &[Button::Select],
         ),
+        ("hifi-choices", Screen::HifiControl, &[Button::Back]),
         (
-            "hifi-volume",
+            "hifi-choices-focused",
             Screen::HifiControl,
-            &[
-                Button::Down,
-                Button::Down,
-                Button::Down,
-                Button::Down,
-                Button::Down,
-            ],
+            &[Button::Back, Button::Right],
         ),
     ];
 
@@ -1094,6 +1152,15 @@ fn write_snapshots(directory: &Path) -> std::io::Result<()> {
         let mut app = App::new_on_screen(*screen);
         let _ = app.update(Event::NetworkStatus(NetworkStatus::Online));
         let _ = app.update(Event::Tick { uptime_ms: 6_000 });
+        // Empty screens are a poor review artifact: half the layout only shows
+        // up once there is something to lay out. Artwork still cannot appear
+        // here, since fetching it needs a network the snapshot path does not
+        // have, so the hero falls back to its no-artwork glyph.
+        if *screen == Screen::HifiControl {
+            let _ = app.update(Event::HifiStatus(demo_status()));
+            let _ = app.update(Event::HifiArtwork(demo_artwork()));
+            let _ = app.update(Event::HifiPins(demo_pins()));
+        }
         for button in *presses {
             let _ = app.update(Event::ButtonPressed(*button));
         }

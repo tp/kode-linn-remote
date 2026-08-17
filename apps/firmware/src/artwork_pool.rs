@@ -1,10 +1,25 @@
 //! Three-slot pool for decoded album-artwork pixels.
 //!
-//! The decoded artwork (96×96 Rgb565 = 18 KiB) lives in statically allocated
-//! buffers and is handed to the renderer as a `&'static` view via
-//! `HifiArtwork::from_static_pixels`. We cannot allocate a fresh `Box` per
-//! load — the device has run out of heap doing exactly that — so the buffers
-//! must be statically reserved.
+//! The decoded artwork lives in statically allocated buffers and is handed to
+//! the renderer as a `&'static` view via `HifiArtwork::from_static_pixels`. We
+//! cannot allocate a fresh `Box` per load — the device has run out of heap
+//! doing exactly that — so the buffers must be statically reserved.
+//!
+//! ## This no longer fits the retired C6 board
+//!
+//! `HIFI_ARTWORK_SIZE` is now 330 px, because that is the size of the Now
+//! Playing artwork slot on the Kode Dot's 410x502 panel. One slot is therefore
+//! 330 x 330 x 2 = 213 KiB, and three of them are 638 KiB — more than the
+//! ESP32-C6's entire 512 KiB of SRAM. Together with the artwork decode and
+//! HTTP buffers this file's pool will not link for that target.
+//!
+//! That is a known consequence, not an oversight. `apps/firmware` is legacy: it
+//! targets the retired round Waveshare C6 board, whose 466x466 geometry already
+//! does not match what `app-core` renders, and there is no Kode Dot firmware
+//! yet. `cargo check` still passes because checking does not link. The real fix
+//! arrives with the ESP32-P4 port, which has 32 MB of PSRAM and wants a
+//! PSRAM-backed pool rather than `.bss` slots — and by then the pool needs a
+//! second, smaller size for the picker's tile artwork anyway.
 //!
 //! ## Soundness invariant
 //!

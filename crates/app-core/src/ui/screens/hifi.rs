@@ -1,4 +1,24 @@
-use core::time::Duration;
+//! The hi-fi remote: two screens, six buttons.
+//!
+//! # Why this screen does not use the focus ring
+//!
+//! Every other screen publishes focusable rectangles and lets
+//! [`super::super::focus`] move a ring between them, with `Select` replaying
+//! the focused control as a tap. That is the right model for a screen you
+//! *browse*.
+//!
+//! It is the wrong model for a screen you *operate*. The most common thing
+//! anyone does with a remote is nudge the volume, and a focus ring turns that
+//! into two presses: one to move the ring onto the volume control, one to
+//! press it. So [`HifiPage::NowPlaying`] binds the pad directly — up and down
+//! are volume, left and right are the track, `Select` is play/pause — and
+//! publishes no focus targets at all.
+//!
+//! [`HifiPage::Choices`] is a grid of things to play, which *is* a browse
+//! screen, so it keeps the ring and the geometric movement that comes with it.
+//!
+//! The invariant across both: **the pad manipulates what is on screen,
+//! `Select` acts, `Back` leaves.**
 
 use embedded_graphics::{
     Pixel,
@@ -11,44 +31,96 @@ use heapless::String;
 use mplusfonts::{mplus, style::BitmapFontStyleBuilder};
 
 use crate::{
-    HIFI_ARTWORK_PIXELS, HIFI_ARTWORK_SIZE, HIFI_PIN_COUNT, HIFI_TEXT_LEN, HIFI_URI_LEN,
-    HIFI_VOLUME_MAX, HifiArtwork, HifiPins, HifiStatus, PlaybackState, RenderError,
+    Button, HIFI_ARTWORK_SIZE, HIFI_TEXT_LEN, HIFI_URI_LEN, HIFI_VOLUME_MAX, HifiArtwork, HifiPins,
+    HifiStatus, PlaybackState, RenderError,
 };
 
 use super::super::{
     aa,
-    components::{
-        ButtonTone, DURATION_WIDTH, clear_rect, draw_button, draw_duration, draw_progress_bar,
-        draw_spinner_dots, ui_font,
-    },
+    components::{clear_rect, draw_panel, draw_spinner_dots, ui_font},
     focus::FocusTargets,
-    geometry::inset_rect,
     painter::Painter,
     style::*,
     widget::{Slot, Widget},
 };
 
-// Page content is inset from the panel edge on all four sides. The round
-// board this started on needed a centred square to keep content clear of the
-// circular mask; the Kode Dot's panel is a plain rectangle, so pages use the
-// full framebuffer minus a cosmetic margin.
-const BODY_INSET: i32 = 24;
-const SONG_TOP: i32 = 8;
-const ARTIST_TOP: i32 = 50;
-const TEXT_BAND_HEIGHT: u32 = 40;
-const PLAY_SIZE: u32 = 130;
-const PLAY_CENTER_Y: i32 = 210;
-const TRACK_BUTTON_SIZE: u32 = 72;
-const TRACK_BUTTON_GAP: i32 = 28;
-const TIMER_TOP: i32 = 318;
-const PROGRESS_TOP: i32 = 372;
-const PROGRESS_WIDTH: u32 = 318;
-const PROGRESS_HEIGHT: u32 = 18;
-// Ambient volume readout, shown on every page. On the round board this was a
-// 270-degree ring tracing the panel edge; a rectangle has no edge to trace, so
-// it becomes a slim bar pinned along the bottom.
-const VOLUME_BAR_HEIGHT: u32 = 10;
-const VOLUME_BAR_BOTTOM_GAP: i32 = 12;
+// ---------------------------------------------------------------------------
+// Now Playing layout
+//
+// Absolute framebuffer coordinates on the 410 x 502 panel rather than offsets
+// into an inset body: the artwork is the hero and wants more width than a
+// cosmetic margin would leave it.
+//
+// Vertical rhythm, top to bottom:
+//   28 margin / 330 artwork / 14 / 40 title / 2 / 40 artist / 16 / 6 progress
+//   / 26 margin  =  502 exactly.
+//
+// Every origin and extent here is even, and the centred widgets have *odd*
+// half-widths, which is what `Painter::is_two_aligned` actually requires: the
+// panel is 410 wide so its centre is x=205, and an odd centre minus an even
+// half-width lands on an odd edge. In short, centred widths must satisfy
+// `width % 4 == 2`. Both 330 and 190 below do.
+// ---------------------------------------------------------------------------
+
+/// Horizontal margin for the text bands. The artwork is wider than this.
+const TEXT_INSET: i32 = 24;
+const TEXT_WIDTH: u32 = 362;
+
+const ARTWORK_TOP: i32 = 28;
+/// The artwork slot is exactly the decoded artwork, so one constant governs
+/// both the buffer and the destination rectangle and they cannot drift.
+const ARTWORK_SIZE: u32 = HIFI_ARTWORK_SIZE;
+
+const TITLE_TOP: i32 = 372;
+const TITLE_HEIGHT: u32 = 40;
+const ARTIST_TOP: i32 = 414;
+/// One full line of the UI font, which is `line_height(40)`. Anything less
+/// clips the text rather than shrinking it — there is only one font size in
+/// this UI, so bands are sized to it rather than the other way round.
+const ARTIST_HEIGHT: u32 = 40;
+
+const PROGRESS_TOP: i32 = 470;
+const PROGRESS_WIDTH: u32 = 330;
+const PROGRESS_HEIGHT: u32 = 6;
+
+// Volume readout. There is no permanent volume bar: on Now Playing one would
+// sit directly under the progress bar and read as a second progress bar, and
+// on Choices the pad moves the ring so volume cannot be changed there at all.
+// It appears while it is being changed, then goes away.
+const OVERLAY_LEFT: i32 = 84;
+const OVERLAY_TOP: i32 = 140;
+const OVERLAY_WIDTH: u32 = 242;
+const OVERLAY_HEIGHT: u32 = 106;
+const OVERLAY_RADIUS: u32 = 22;
+const OVERLAY_VALUE_TOP: i32 = 158;
+const OVERLAY_VALUE_HEIGHT: u32 = 40;
+const OVERLAY_TRACK_LEFT: i32 = 110;
+const OVERLAY_TRACK_TOP: i32 = 214;
+const OVERLAY_TRACK_WIDTH: u32 = 190;
+const OVERLAY_TRACK_HEIGHT: u32 = 10;
+
+// Paused badge. Drawn over the artwork rather than spelled out in the artist
+// line: the state belongs to the picture, and a word beside the artist reads
+// as part of the artist's name. It is centred on the same line as the volume
+// readout, which therefore covers it completely while volume is being changed.
+const PAUSE_BADGE_SIZE: u32 = 106;
+const PAUSE_BADGE_RADIUS: u32 = 22;
+
+/// How long the volume readout stays up after the last press.
+const VOLUME_OVERLAY_MS: u64 = 1_000;
+/// Volume change per press. Hold-to-ramp comes from platform-side auto-repeat
+/// of the same event, so this stays a single step.
+const VOLUME_STEP: i16 = 2;
+
+/// Past this point into a track, `Left` restarts it instead of going back.
+///
+/// This is deliberately *one* comparison rather than a double-press timer:
+/// restarting sets elapsed to zero, so a second press immediately afterwards
+/// falls through to the previous track on its own. The familiar
+/// press-twice-to-go-back behaviour is an emergent consequence, needing no
+/// extra state and no timing window.
+const RESTART_THRESHOLD_SECONDS: u32 = 3;
+
 const LOADING_TIMEOUT_MS: u64 = 5_000;
 
 // Marquee bounce: hold at start, scroll to end, brief hold, scroll back.
@@ -56,108 +128,121 @@ const MARQUEE_HOLD_START_MS: u64 = 1_000;
 const MARQUEE_HOLD_END_MS: u64 = 500;
 const MARQUEE_SCROLL_PX_PER_SEC: u64 = 30;
 
-// Slot kinds for the play / spinner / artwork center area.
-const PLAY_SLOT_SPINNER: u8 = 1;
-const PLAY_SLOT_PLAY_ICON: u8 = 2;
-const PLAY_SLOT_PAUSE_BARS: u8 = 3;
-const PLAY_SLOT_BUFFERING: u8 = 4;
-const PLAY_SLOT_ARTWORK: u8 = 5;
+// Slot kinds for the artwork area, which is shared by the spinner, the
+// artwork itself, and the play/pause glyph shown when there is no artwork.
+const ART_SLOT_SPINNER: u8 = 1;
+const ART_SLOT_PLAY_ICON: u8 = 2;
+const ART_SLOT_PAUSE_BARS: u8 = 3;
+const ART_SLOT_BUFFERING: u8 = 4;
+const ART_SLOT_ARTWORK: u8 = 5;
 
-// Pins page layout: 3 columns x 2 rows.
-const PINS_GRID_TOP: i32 = 120;
-const PINS_BUTTON_SIZE: Size = Size::new(106, 88);
-const PINS_GRID_GAP: i32 = 16;
+// ---------------------------------------------------------------------------
+// Choices layout
+//
+// 2 x 2, because that is what the panel affords. At ~304 PPI a 3 x 2 grid
+// gives 9.5 mm covers and 2 x 3 gives 12.5 mm; three rows wide enough to fill
+// two columns do not fit in 502 px at all. 170 px is ~14.2 mm, about the
+// smallest a picture can be and still be recognised at a glance.
+//
+// Four *visible* is not four *total*. When the list outgrows the viewport this
+// should scroll rather than page, so that a tile's position relative to its
+// neighbours never changes. Two things here exist to keep that cheap: the row
+// pitch is even (210 + 12 = 222), so a row-snapped scroll offset keeps every
+// tile on the 2-px write grid; and `focus_targets` publishes only the tiles
+// currently on screen, so `focus::step` stays bounded however long the list
+// gets.
+// ---------------------------------------------------------------------------
 
-// Volume page layout.
-const VOLUME_TITLE_SLOT_HEIGHT: u32 = 40;
-const VOLUME_TITLE_TOP: i32 = 120;
-const VOLUME_VALUE_SLOT_HEIGHT: u32 = 56;
-const VOLUME_VALUE_TOP: i32 = 190;
-const VOLUME_BUTTON_SIZE: u32 = 96;
-const VOLUME_BUTTON_Y: i32 = 330;
-const VOLUME_BUTTON_GAP: i32 = 66;
+const CHOICES_HEADER_TOP: i32 = 8;
+const CHOICES_HEADER_HEIGHT: u32 = 40;
+const CHOICES_GRID_TOP: i32 = 56;
+const CHOICES_GRID_LEFT: i32 = 20;
+const TILE_WIDTH: u32 = 170;
+/// Square, because cover art is square and cropping it to fit loses the top
+/// and bottom of every picture.
+const TILE_ART_HEIGHT: u32 = TILE_WIDTH;
+/// One line of the UI font, which is `line_height(40)`. There is only one font
+/// size in this UI, so the band is sized to it rather than the other way
+/// round — a shorter band clips the text instead of shrinking it.
+///
+/// The caption sits below the art rather than over it, which is what costs the
+/// tiles 16 px of width: 186 px art plus a 40 px caption makes a 226 px tile,
+/// and two rows of those do not fit in 502 px. Labelling over the artwork
+/// would have kept the extra width, but the label's backing strip squares off
+/// the card's rounded lower corners, and 14.2 mm of cover reads about as well
+/// as 15.5 mm.
+const TILE_CAPTION_HEIGHT: u32 = 40;
+const TILE_HEIGHT: u32 = TILE_ART_HEIGHT + TILE_CAPTION_HEIGHT;
+const TILE_COL_GAP: i32 = 30;
+const TILE_ROW_GAP: i32 = 12;
+const TILE_RADIUS: u32 = 18;
+const CHOICES_COLS: usize = 2;
+
+/// Tiles on screen at once. The pin list may be longer; this is the viewport.
+pub(crate) const CHOICES_VISIBLE: usize = 4;
+
+/// Placeholder tints, used until pins carry artwork of their own.
+///
+/// Linn's `Ds/Pins` service gives this app an id and a title and nothing else,
+/// so there is no cover art to draw yet. A flat tinted card per slot at least
+/// gives each choice a stable colour as well as a stable position, which is
+/// what makes it findable without reading. The colours are the Dot's own.
+const TILE_TINTS: [(Rgb565, Rgb565); CHOICES_VISIBLE] = [
+    (dot::BLUE_DEEP, dot::BLUE),
+    (dot::RED_DEEP, dot::RED),
+    (dot::SLATE_DEEP, dot::SLATE),
+    (dot::SLATE_DIM, dot::SHELL),
+];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HifiPage {
     #[default]
-    Status,
-    Pins,
-    Volume,
+    NowPlaying,
+    Choices,
 }
 
-impl HifiPage {
-    fn next(self) -> Self {
-        match self {
-            Self::Status => Self::Pins,
-            Self::Pins => Self::Volume,
-            Self::Volume => Self::Status,
-        }
-    }
-
-    fn previous(self) -> Self {
-        match self {
-            Self::Status => Self::Volume,
-            Self::Pins => Self::Status,
-            Self::Volume => Self::Pins,
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Layout
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Layout {
-    pub(super) page_body: Rectangle,
-    pub(super) volume: VolumeLayout,
-    pub(super) status: StatusLayout,
-    pub(super) pins: PinsLayout,
-    pub(super) volume_page: VolumePageLayout,
-}
-
-impl Layout {
-    const fn body_for_page(&self, page: HifiPage) -> Rectangle {
-        match page {
-            HifiPage::Status => self.status.body,
-            HifiPage::Pins => self.pins.body,
-            HifiPage::Volume => self.volume_page.body,
-        }
-    }
+    /// The whole panel. A page change clears this rather than the outgoing
+    /// page's body, so the two pages are free to occupy different areas
+    /// without leaving each other's pixels behind.
+    pub(super) panel: Rectangle,
+    pub(super) now_playing: NowPlayingLayout,
+    pub(super) choices: ChoicesLayout,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct VolumeLayout {
-    pub(super) bar: Rectangle,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct StatusLayout {
-    pub(super) body: Rectangle,
-    pub(super) song_band: Rectangle,
-    pub(super) song_origin: Point,
+pub(super) struct NowPlayingLayout {
+    pub(super) artwork: Rectangle,
+    pub(super) title_band: Rectangle,
+    pub(super) title_origin: Point,
     pub(super) artist_band: Rectangle,
     pub(super) artist_origin: Point,
-    pub(super) previous_button: Rectangle,
-    pub(super) play_button: Rectangle,
-    pub(super) next_button: Rectangle,
-    pub(super) timer_origin: Point,
-    pub(super) timer_bounds: Rectangle,
     pub(super) progress: Rectangle,
+    pub(super) overlay_panel: Rectangle,
+    pub(super) overlay_value: Rectangle,
+    pub(super) overlay_track: Rectangle,
+    pub(super) pause_badge: Rectangle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct PinsLayout {
-    pub(super) body: Rectangle,
-    pub(super) buttons: [Rectangle; HIFI_PIN_COUNT],
+pub(super) struct ChoicesLayout {
+    pub(super) header_band: Rectangle,
+    pub(super) header_origin: Point,
+    /// Full tile bounds — art plus caption. These are the focus targets and
+    /// the touch targets.
+    pub(super) tiles: [Rectangle; CHOICES_VISIBLE],
+    pub(super) tile_art: [Rectangle; CHOICES_VISIBLE],
+    pub(super) tile_caption: [Rectangle; CHOICES_VISIBLE],
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct VolumePageLayout {
-    pub(super) body: Rectangle,
-    pub(super) title_slot: Rectangle,
-    pub(super) value_slot: Rectangle,
-    pub(super) controls_slot: Rectangle,
-    pub(super) digit_origin: Point,
-    pub(super) decrement_button: Rectangle,
-    pub(super) increment_button: Rectangle,
-}
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct State {
@@ -171,34 +256,40 @@ pub(crate) struct State {
     current_ms: u64,
     current_second: u64,
     marquee: MarqueeState,
-    /// Set when the pin set changes, cleared once the Pins page repaints.
-    /// Content changes reach the display cache through a flag, because state
-    /// no longer has access to it.
+    /// Set when the pin set changes, cleared once Choices repaints.
     pins_dirty: bool,
+    /// Uptime at which the volume readout stops being shown. `None` means it
+    /// is not up. Cleared by `on_tick` when it lapses, so the frame that hides
+    /// it gets requested rather than waiting for unrelated activity.
+    volume_overlay_until_ms: Option<u64>,
+}
+
+/// What a screen did with a raw pad press.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ButtonOutcome {
+    pub(crate) redraw: bool,
+    pub(crate) command: Option<Command>,
+    /// The page changed, so any focus index the app is holding now points at
+    /// an unrelated control and must be dropped.
+    pub(crate) page_changed: bool,
 }
 
 /// Everything this screen knows about what is currently on one render target.
-///
-/// Owned by [`crate::RenderSession`] rather than by [`State`]: it describes
-/// the relationship between the app and one display, so two targets need two
-/// of them, and a failed frame must be able to throw one away.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RenderCache {
     last_rendered_page: Option<HifiPage>,
-    status_cache: StatusCache,
-    pins_cache: PinsCache,
-    volume_cache: VolumeCache,
-    play_slot: Slot,
+    now_playing: NowPlayingCache,
+    choices: ChoicesCache,
+    art_slot: Slot,
 }
 
 impl RenderCache {
     pub(crate) fn new(layout: &Layout) -> Self {
         Self {
             last_rendered_page: None,
-            status_cache: StatusCache::default(),
-            pins_cache: PinsCache::default(),
-            volume_cache: VolumeCache::default(),
-            play_slot: Slot::new(layout.status.play_button),
+            now_playing: NowPlayingCache::default(),
+            choices: ChoicesCache::default(),
+            art_slot: Slot::new(layout.now_playing.artwork),
         }
     }
 
@@ -208,20 +299,25 @@ impl RenderCache {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
-struct StatusCache {
+struct NowPlayingCache {
     has_rendered: bool,
-    volume_percent: Option<u8>,
     spinner_phase: Option<u8>,
-    elapsed_seconds: Option<u32>,
-    duration_seconds: Option<u32>,
     progress_filled_px: Option<u32>,
+    duration_seconds: Option<u32>,
     title: String<HIFI_TEXT_LEN>,
     artist: String<HIFI_TEXT_LEN>,
     artwork_uri: String<HIFI_URI_LEN>,
     loading_visible: bool,
     title_marquee_offset_px: Option<i32>,
     artist_marquee_offset_px: Option<i32>,
-    transport_controls_drawn: bool,
+    /// Whether the volume readout is currently on the panel. Drives the
+    /// repaint of the artwork underneath when it goes away.
+    overlay_visible: bool,
+    overlay_value: Option<u8>,
+    overlay_percent: Option<u8>,
+    /// Whether the paused badge is on the panel. Like the volume readout, it
+    /// covers artwork, so taking it away means putting those pixels back.
+    pause_badge_visible: bool,
 }
 
 /// Marquee bookkeeping for the two scrolling text bands.
@@ -239,22 +335,18 @@ pub(crate) struct MarqueeState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
-struct PinsCache {
-    drawn_titles: [String<HIFI_TEXT_LEN>; HIFI_PIN_COUNT],
-    drawn_active: [bool; HIFI_PIN_COUNT],
+struct ChoicesCache {
+    header_drawn: bool,
+    drawn_titles: [String<HIFI_TEXT_LEN>; CHOICES_VISIBLE],
+    drawn_active: [bool; CHOICES_VISIBLE],
     has_rendered: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Default)]
-struct VolumeCache {
-    static_drawn: bool,
-    volume_percent: Option<u8>,
-    digit_value: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action {
-    PreviousTrack,
+    /// Restart this track, or step back to the previous one — see
+    /// [`RESTART_THRESHOLD_SECONDS`].
+    PreviousOrRestart,
     TogglePlayback,
     NextTrack,
     InvokePinSlot(usize),
@@ -263,11 +355,17 @@ enum Action {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
-    InvokePinId { id: u32 },
+    InvokePinId {
+        id: u32,
+    },
     PreviousTrack,
+    /// Seek to the start of the current track without changing it.
+    Restart,
     TogglePlayback,
     NextTrack,
-    SetVolume { volume: u8 },
+    SetVolume {
+        volume: u8,
+    },
 }
 
 impl State {
@@ -275,7 +373,7 @@ impl State {
         let current_second = uptime_ms / 1000;
 
         Self {
-            page: HifiPage::Status,
+            page: HifiPage::NowPlaying,
             status: HifiStatus::waiting(),
             artwork: None,
             pins: HifiPins::new(),
@@ -286,57 +384,97 @@ impl State {
             current_second,
             marquee: MarqueeState::default(),
             pins_dirty: false,
+            volume_overlay_until_ms: None,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn page(&self) -> HifiPage {
+    pub(crate) const fn page(&self) -> HifiPage {
         self.page
     }
 
-    pub(crate) fn cycle_page(&mut self) {
-        self.page = self.page.next();
-    }
-
-    pub(crate) fn cycle_page_back(&mut self) {
-        self.page = self.page.previous();
-    }
-
-    /// Steps back toward the status page. Returns `false` once already there,
-    /// which `App` reads as "nothing left to pop, leave the screen".
-    pub(crate) fn pop_page(&mut self) -> bool {
+    /// Raw pad handling, ahead of the app's focus-ring path.
+    ///
+    /// Returns `None` when the press is not this screen's to consume, which
+    /// the app reads as "fall through to geometric focus movement". Now
+    /// Playing consumes everything; Choices consumes only `Back`, leaving the
+    /// directions to move the ring and `Select` to be replayed as a tap on the
+    /// focused tile.
+    pub(crate) fn intercept_button(
+        &mut self,
+        button: Button,
+        uptime_ms: u64,
+    ) -> Option<ButtonOutcome> {
         match self.page {
-            HifiPage::Status => false,
-            HifiPage::Pins | HifiPage::Volume => {
-                self.page = HifiPage::Status;
-                true
+            HifiPage::NowPlaying => {
+                let action = match button {
+                    Button::Up => Action::VolumeDelta(VOLUME_STEP),
+                    Button::Down => Action::VolumeDelta(-VOLUME_STEP),
+                    Button::Left => Action::PreviousOrRestart,
+                    Button::Right => Action::NextTrack,
+                    Button::Select => Action::TogglePlayback,
+                    Button::Back => {
+                        self.page = HifiPage::Choices;
+                        return Some(ButtonOutcome {
+                            redraw: true,
+                            command: None,
+                            page_changed: true,
+                        });
+                    }
+                };
+                let before = self.page;
+                let command = self.handle(action, uptime_ms);
+                Some(ButtonOutcome {
+                    redraw: true,
+                    command,
+                    page_changed: self.page != before,
+                })
             }
+            HifiPage::Choices => match button {
+                Button::Back => {
+                    self.page = HifiPage::NowPlaying;
+                    Some(ButtonOutcome {
+                        redraw: true,
+                        command: None,
+                        page_changed: true,
+                    })
+                }
+                _ => None,
+            },
         }
     }
 
     /// Focusable controls for the page currently shown, in reading order.
+    ///
+    /// Now Playing has none by design: it binds the pad to actions rather than
+    /// to movement, so a ring there would have nothing to move between.
     pub(crate) fn focus_targets(&self, layout: &Layout) -> FocusTargets {
         let mut targets = FocusTargets::new();
-        match self.page {
-            HifiPage::Status => {
-                let _ = targets.push(layout.status.previous_button);
-                let _ = targets.push(layout.status.play_button);
-                let _ = targets.push(layout.status.next_button);
-            }
-            HifiPage::Pins => {
-                for button in layout.pins.buttons {
-                    let _ = targets.push(button);
-                }
-            }
-            HifiPage::Volume => {
-                let _ = targets.push(layout.volume_page.decrement_button);
-                let _ = targets.push(layout.volume_page.increment_button);
+        if matches!(self.page, HifiPage::Choices) {
+            for tile in layout.choices.tiles {
+                let _ = targets.push(tile);
             }
         }
         targets
     }
 
     pub(crate) fn on_tick(&mut self, uptime_ms: u64) -> bool {
+        // Lapse the volume readout first, and unconditionally: the playback
+        // tick below has several early returns and the readout has to come
+        // down regardless of which one wins.
+        let overlay_lapsed = match self.volume_overlay_until_ms {
+            Some(until) if uptime_ms >= until => {
+                self.volume_overlay_until_ms = None;
+                true
+            }
+            _ => false,
+        };
+
+        let playback_changed = self.tick_playback(uptime_ms);
+        playback_changed || overlay_lapsed
+    }
+
+    fn tick_playback(&mut self, uptime_ms: u64) -> bool {
         self.current_ms = uptime_ms;
         if self.loading {
             let timed_out = uptime_ms.saturating_sub(self.created_at_ms) >= LOADING_TIMEOUT_MS;
@@ -348,7 +486,7 @@ impl State {
             return true;
         }
 
-        let marquee_active = matches!(self.page, HifiPage::Status)
+        let marquee_active = matches!(self.page, HifiPage::NowPlaying)
             && (self.marquee.title_overflow_px > 0 || self.marquee.artist_overflow_px > 0);
 
         if self.status.playback == PlaybackState::Buffering {
@@ -408,12 +546,20 @@ impl State {
     pub(crate) fn apply_artwork(&mut self, artwork: HifiArtwork) -> bool {
         if artwork.source_uri.is_empty()
             || artwork.source_uri != self.status.album_art_uri
-            || artwork.pixels().len() != HIFI_ARTWORK_PIXELS
+            || !artwork.is_complete()
         {
             return false;
         }
 
-        if self.artwork.as_ref() == Some(&artwork) {
+        // Compare by URI rather than by pixels. The old full-buffer equality
+        // check was 9,216 comparisons; at this artwork size it would be
+        // 108,900 of them per artwork event, on a core with no FPU and better
+        // things to do.
+        if self
+            .artwork
+            .as_ref()
+            .is_some_and(|current| current.source_uri == artwork.source_uri)
+        {
             return false;
         }
 
@@ -426,7 +572,6 @@ impl State {
             return false;
         }
         self.pins = pins;
-        // Force a Pins-page redraw next time we are on it.
         self.pins_dirty = true;
         true
     }
@@ -438,22 +583,35 @@ impl State {
         uptime_ms: u64,
     ) -> Option<Command> {
         let action = match self.page {
-            HifiPage::Status => hit_test_status(&layout.status, point),
-            HifiPage::Pins => hit_test_pins(&layout.pins, point),
-            HifiPage::Volume => hit_test_volume(&layout.volume_page, point),
+            // Now Playing is deliberately tap-inert. The remote can be picked
+            // up, carried and held against a chest without changing what is
+            // playing — and the touch controller has nothing to report on the
+            // screen the device spends nearly all its time on.
+            HifiPage::NowPlaying => None,
+            HifiPage::Choices => hit_test_choices(&layout.choices, point),
         }?;
         self.handle(action, uptime_ms)
     }
 
     fn handle(&mut self, action: Action, uptime_ms: u64) -> Option<Command> {
         match action {
-            Action::PreviousTrack => {
-                self.clear_current_track();
-                Some(Command::PreviousTrack)
+            Action::PreviousOrRestart => {
+                if self.status.elapsed_seconds >= RESTART_THRESHOLD_SECONDS {
+                    // Same track, rewound: keep the metadata and the artwork,
+                    // move only the clock.
+                    self.status.elapsed_seconds = 0;
+                    let current_second = uptime_ms / 1000;
+                    self.current_second = current_second;
+                    self.last_second = current_second;
+                    Some(Command::Restart)
+                } else {
+                    self.clear_current_track();
+                    Some(Command::PreviousTrack)
+                }
             }
             Action::TogglePlayback => {
                 if playback_can_pause(self.status.playback) {
-                    self.on_tick(uptime_ms);
+                    self.tick_playback(uptime_ms);
                     self.status.playback = PlaybackState::Paused;
                 } else {
                     let current_second = uptime_ms / 1000;
@@ -468,10 +626,19 @@ impl State {
                 Some(Command::NextTrack)
             }
             Action::InvokePinSlot(slot) => {
-                let pin = self.pins.get(slot)?;
-                Some(Command::InvokePinId { id: pin.id })
+                let id = self.pins.get(slot)?.id;
+                // Playing something is the point of this screen, so go
+                // straight back to it rather than leaving the user on a grid
+                // wondering whether the press landed.
+                self.page = HifiPage::NowPlaying;
+                self.clear_current_track();
+                Some(Command::InvokePinId { id })
             }
             Action::VolumeDelta(delta) => {
+                // Raise the readout even when the level is already at the
+                // rail: the press was real, and showing nothing would read as
+                // a dead button.
+                self.volume_overlay_until_ms = Some(uptime_ms.saturating_add(VOLUME_OVERLAY_MS));
                 let current = self.status.volume_percent as i16;
                 let next = (current + delta).clamp(0, HIFI_VOLUME_MAX as i16) as u8;
                 if next == self.status.volume_percent {
@@ -495,188 +662,111 @@ impl State {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Layout construction
+// ---------------------------------------------------------------------------
+
 pub(crate) fn layout(bounds: Rectangle) -> Layout {
     let center_x = bounds.top_left.x + (bounds.size.width / 2) as i32;
-    let page_body = inset_rect(bounds, BODY_INSET);
-
-    let status = status_layout(&page_body, center_x);
-    let pins = pins_layout(&page_body, center_x);
-    let volume_page = volume_page_layout(&page_body, center_x);
-
-    // Pinned below every page body so page-change clears never touch it.
-    let bar_top = bounds.top_left.y + bounds.size.height as i32
-        - VOLUME_BAR_BOTTOM_GAP
-        - VOLUME_BAR_HEIGHT as i32;
+    let top = bounds.top_left.y;
+    let left = bounds.top_left.x;
 
     Layout {
-        page_body,
-        volume: VolumeLayout {
-            bar: Rectangle::new(
-                Point::new(page_body.top_left.x, bar_top),
-                Size::new(page_body.size.width, VOLUME_BAR_HEIGHT),
-            ),
-        },
-        status,
-        pins,
-        volume_page,
+        panel: bounds,
+        now_playing: now_playing_layout(left, top, center_x),
+        choices: choices_layout(left, top, center_x),
     }
 }
 
-fn status_layout(body: &Rectangle, center_x: i32) -> StatusLayout {
-    let play_center = Point::new(center_x, body.top_left.y + PLAY_CENTER_Y);
-    let play_button = Rectangle::new(
-        play_center - Point::new((PLAY_SIZE / 2) as i32, (PLAY_SIZE / 2) as i32),
-        Size::new(PLAY_SIZE, PLAY_SIZE),
+fn now_playing_layout(left: i32, top: i32, center_x: i32) -> NowPlayingLayout {
+    let artwork = Rectangle::new(
+        Point::new(center_x - (ARTWORK_SIZE / 2) as i32, top + ARTWORK_TOP),
+        Size::new(ARTWORK_SIZE, ARTWORK_SIZE),
     );
-    let track_button_top = play_center.y - (TRACK_BUTTON_SIZE / 2) as i32;
-    let previous_button = Rectangle::new(
-        Point::new(
-            play_button.top_left.x - TRACK_BUTTON_GAP - TRACK_BUTTON_SIZE as i32,
-            track_button_top,
-        ),
-        Size::new(TRACK_BUTTON_SIZE, TRACK_BUTTON_SIZE),
-    );
-    let next_button = Rectangle::new(
-        Point::new(
-            play_button.top_left.x + play_button.size.width as i32 + TRACK_BUTTON_GAP,
-            track_button_top,
-        ),
-        Size::new(TRACK_BUTTON_SIZE, TRACK_BUTTON_SIZE),
-    );
-    let song_band = Rectangle::new(
-        Point::new(body.top_left.x, body.top_left.y + SONG_TOP),
-        Size::new(body.size.width, TEXT_BAND_HEIGHT),
+    let title_band = Rectangle::new(
+        Point::new(left + TEXT_INSET, top + TITLE_TOP),
+        Size::new(TEXT_WIDTH, TITLE_HEIGHT),
     );
     let artist_band = Rectangle::new(
-        Point::new(body.top_left.x, body.top_left.y + ARTIST_TOP),
-        Size::new(body.size.width, TEXT_BAND_HEIGHT),
-    );
-    let timer_origin = Point::new(center_x - DURATION_WIDTH / 2, body.top_left.y + TIMER_TOP);
-    let timer_bounds = Rectangle::new(
-        timer_origin,
-        Size::new(DURATION_WIDTH as u32, TEXT_BAND_HEIGHT),
+        Point::new(left + TEXT_INSET, top + ARTIST_TOP),
+        Size::new(TEXT_WIDTH, ARTIST_HEIGHT),
     );
     let progress = Rectangle::new(
-        Point::new(
-            center_x - (PROGRESS_WIDTH / 2) as i32,
-            body.top_left.y + PROGRESS_TOP,
-        ),
+        Point::new(center_x - (PROGRESS_WIDTH / 2) as i32, top + PROGRESS_TOP),
         Size::new(PROGRESS_WIDTH, PROGRESS_HEIGHT),
     );
-    let status_body = vertical_page_body(body, song_band.top_left.y, rect_bottom(progress));
 
-    StatusLayout {
-        body: status_body,
-        song_band,
-        song_origin: Point::new(center_x, body.top_left.y + SONG_TOP),
+    NowPlayingLayout {
+        artwork,
+        title_band,
+        title_origin: Point::new(center_x, title_band.top_left.y),
         artist_band,
-        artist_origin: Point::new(center_x, body.top_left.y + ARTIST_TOP),
-        previous_button,
-        play_button,
-        next_button,
-        timer_origin,
-        timer_bounds,
+        artist_origin: Point::new(center_x, artist_band.top_left.y),
         progress,
+        overlay_panel: Rectangle::new(
+            Point::new(left + OVERLAY_LEFT, top + OVERLAY_TOP),
+            Size::new(OVERLAY_WIDTH, OVERLAY_HEIGHT),
+        ),
+        overlay_value: Rectangle::new(
+            Point::new(left + OVERLAY_LEFT, top + OVERLAY_VALUE_TOP),
+            Size::new(OVERLAY_WIDTH, OVERLAY_VALUE_HEIGHT),
+        ),
+        overlay_track: Rectangle::new(
+            Point::new(left + OVERLAY_TRACK_LEFT, top + OVERLAY_TRACK_TOP),
+            Size::new(OVERLAY_TRACK_WIDTH, OVERLAY_TRACK_HEIGHT),
+        ),
+        pause_badge: Rectangle::new(
+            Point::new(
+                center_x - (PAUSE_BADGE_SIZE / 2) as i32,
+                artwork.top_left.y + (ARTWORK_SIZE / 2) as i32 - (PAUSE_BADGE_SIZE / 2) as i32,
+            ),
+            Size::new(PAUSE_BADGE_SIZE, PAUSE_BADGE_SIZE),
+        ),
     }
 }
 
-fn pins_layout(body: &Rectangle, center_x: i32) -> PinsLayout {
-    let cols = 3_i32;
-    let rows = HIFI_PIN_COUNT.div_ceil(cols as usize) as i32;
-    let total_width = cols * PINS_BUTTON_SIZE.width as i32 + (cols - 1) * PINS_GRID_GAP;
-    let total_height = rows * PINS_BUTTON_SIZE.height as i32 + (rows - 1) * PINS_GRID_GAP;
-    let start_x = center_x - total_width / 2;
-    let start_y = body.top_left.y + PINS_GRID_TOP;
-    let mut buttons = [Rectangle::new(Point::zero(), PINS_BUTTON_SIZE); HIFI_PIN_COUNT];
-    for (slot, button) in buttons.iter_mut().enumerate() {
-        let row = (slot / cols as usize) as i32;
-        let col = (slot % cols as usize) as i32;
-        let x = start_x + col * (PINS_BUTTON_SIZE.width as i32 + PINS_GRID_GAP);
-        let y = start_y + row * (PINS_BUTTON_SIZE.height as i32 + PINS_GRID_GAP);
-        *button = Rectangle::new(Point::new(x, y), PINS_BUTTON_SIZE);
-    }
-    PinsLayout {
-        body: vertical_page_body(body, start_y, start_y + total_height),
-        buttons,
-    }
-}
+fn choices_layout(left: i32, top: i32, center_x: i32) -> ChoicesLayout {
+    let header_band = Rectangle::new(
+        Point::new(left + TEXT_INSET, top + CHOICES_HEADER_TOP),
+        Size::new(TEXT_WIDTH, CHOICES_HEADER_HEIGHT),
+    );
 
-fn volume_page_layout(body: &Rectangle, center_x: i32) -> VolumePageLayout {
-    let title_slot = Rectangle::new(
-        Point::new(body.top_left.x, body.top_left.y + VOLUME_TITLE_TOP),
-        Size::new(body.size.width, VOLUME_TITLE_SLOT_HEIGHT),
-    );
-    let value_slot = Rectangle::new(
-        Point::new(body.top_left.x, body.top_left.y + VOLUME_VALUE_TOP),
-        Size::new(body.size.width, VOLUME_VALUE_SLOT_HEIGHT),
-    );
-    let digit_origin = Point::new(center_x, body.top_left.y + VOLUME_VALUE_TOP);
-    let half_size = (VOLUME_BUTTON_SIZE / 2) as i32;
-    let half_gap = VOLUME_BUTTON_GAP / 2;
-    let button_top = body.top_left.y + VOLUME_BUTTON_Y - half_size;
-    let decrement_button = Rectangle::new(
-        Point::new(center_x - half_gap - VOLUME_BUTTON_SIZE as i32, button_top),
-        Size::new(VOLUME_BUTTON_SIZE, VOLUME_BUTTON_SIZE),
-    );
-    let increment_button = Rectangle::new(
-        Point::new(center_x + half_gap, button_top),
-        Size::new(VOLUME_BUTTON_SIZE, VOLUME_BUTTON_SIZE),
-    );
-    let controls_slot = Rectangle::new(
-        Point::new(body.top_left.x, button_top),
-        Size::new(body.size.width, VOLUME_BUTTON_SIZE),
-    );
-    VolumePageLayout {
-        body: vertical_page_body(body, title_slot.top_left.y, rect_bottom(controls_slot)),
-        title_slot,
-        value_slot,
-        controls_slot,
-        digit_origin,
-        decrement_button,
-        increment_button,
+    let mut tiles = [Rectangle::new(Point::zero(), Size::zero()); CHOICES_VISIBLE];
+    let mut tile_art = tiles;
+    let mut tile_caption = tiles;
+    for slot in 0..CHOICES_VISIBLE {
+        let col = (slot % CHOICES_COLS) as i32;
+        let row = (slot / CHOICES_COLS) as i32;
+        let x = left + CHOICES_GRID_LEFT + col * (TILE_WIDTH as i32 + TILE_COL_GAP);
+        let y = top + CHOICES_GRID_TOP + row * (TILE_HEIGHT as i32 + TILE_ROW_GAP);
+        tiles[slot] = Rectangle::new(Point::new(x, y), Size::new(TILE_WIDTH, TILE_HEIGHT));
+        tile_art[slot] = Rectangle::new(Point::new(x, y), Size::new(TILE_WIDTH, TILE_ART_HEIGHT));
+        tile_caption[slot] = Rectangle::new(
+            Point::new(x, y + TILE_ART_HEIGHT as i32),
+            Size::new(TILE_WIDTH, TILE_CAPTION_HEIGHT),
+        );
+    }
+
+    ChoicesLayout {
+        header_band,
+        header_origin: Point::new(center_x, header_band.top_left.y),
+        tiles,
+        tile_art,
+        tile_caption,
     }
 }
 
-fn vertical_page_body(inner: &Rectangle, top: i32, bottom: i32) -> Rectangle {
-    Rectangle::new(
-        Point::new(inner.top_left.x, top),
-        Size::new(inner.size.width, bottom.saturating_sub(top) as u32),
-    )
-}
-
-fn rect_bottom(rect: Rectangle) -> i32 {
-    rect.top_left.y + rect.size.height as i32
-}
-
-fn hit_test_status(layout: &StatusLayout, point: Point) -> Option<Action> {
-    if layout.previous_button.contains(point) {
-        Some(Action::PreviousTrack)
-    } else if layout.play_button.contains(point) {
-        Some(Action::TogglePlayback)
-    } else if layout.next_button.contains(point) {
-        Some(Action::NextTrack)
-    } else {
-        None
-    }
-}
-
-fn hit_test_pins(layout: &PinsLayout, point: Point) -> Option<Action> {
+fn hit_test_choices(layout: &ChoicesLayout, point: Point) -> Option<Action> {
     layout
-        .buttons
+        .tiles
         .iter()
         .position(|rect| rect.contains(point))
         .map(Action::InvokePinSlot)
 }
 
-fn hit_test_volume(layout: &VolumePageLayout, point: Point) -> Option<Action> {
-    if layout.decrement_button.contains(point) {
-        Some(Action::VolumeDelta(-1))
-    } else if layout.increment_button.contains(point) {
-        Some(Action::VolumeDelta(1))
-    } else {
-        None
-    }
-}
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
 
 pub(crate) fn render<D>(
     state: &mut State,
@@ -688,488 +778,502 @@ pub(crate) fn render<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    cache.play_slot.bounds = ui_layout.status.play_button;
+    cache.art_slot.bounds = ui_layout.now_playing.artwork;
 
     if state.pins_dirty {
-        cache.pins_cache = PinsCache::default();
+        cache.choices = ChoicesCache::default();
         state.pins_dirty = false;
     }
 
     if cache.last_rendered_page != Some(state.page) {
-        let page_to_clear = cache.last_rendered_page.unwrap_or(state.page);
-        clear_rect(display, ui_layout.body_for_page(page_to_clear))?;
-        invalidate_caches_on_page_change(cache);
+        // Clear the whole panel rather than the outgoing page's body: the two
+        // pages use different insets, so a body-sized clear would leave the
+        // other page's edges behind.
+        clear_rect(display, ui_layout.panel)?;
+        cache.now_playing = NowPlayingCache::default();
+        cache.choices = ChoicesCache::default();
+        cache.art_slot.previous_kind = None;
         cache.last_rendered_page = Some(state.page);
     }
 
-    let mut painter = Painter::new(display, scratch);
-
-    // Volume is rendered on every page; reflects volume_percent against the
-    // receiver max (0..=HIFI_VOLUME_MAX).
-    let volume = VolumeBar {
-        bar: ui_layout.volume.bar,
-        track_color: VOLUME_TRACK,
-        active_color: VOLUME_ACTIVE,
-        percent: state.status.volume_percent,
-        previous_percent: cache.status_cache.volume_percent,
-    };
-    painter.draw(&volume).map_err(RenderError::Draw)?;
-    cache.status_cache.volume_percent = Some(state.status.volume_percent);
-
     match state.page {
-        HifiPage::Status => render_status(state, cache, display, scratch, &ui_layout.status),
-        HifiPage::Pins => render_pins(state, cache, display, scratch, &ui_layout.pins),
-        HifiPage::Volume => {
-            render_volume_page(state, cache, display, scratch, &ui_layout.volume_page)
+        HifiPage::NowPlaying => {
+            render_now_playing(state, cache, display, scratch, &ui_layout.now_playing)
         }
+        HifiPage::Choices => render_choices(state, cache, display, scratch, &ui_layout.choices),
     }
 }
 
-/// Slot transitions and page-local cache resets stay here rather than moving
-/// to the session: only this module knows what a page change invalidates.
-fn invalidate_caches_on_page_change(cache: &mut RenderCache) {
-    cache.status_cache = StatusCache::default();
-    cache.pins_cache = PinsCache::default();
-    cache.volume_cache = VolumeCache::default();
-    cache.play_slot.previous_kind = None;
-}
-
-fn render_status<D>(
+fn render_now_playing<D>(
     state: &mut State,
     cache: &mut RenderCache,
     display: &mut D,
     scratch: &mut [Rgb565],
-    ui_layout: &StatusLayout,
+    ui_layout: &NowPlayingLayout,
 ) -> Result<(), RenderError<D::Error>>
 where
     D: DrawTarget<Color = Rgb565>,
 {
     let mut painter = Painter::new(display, scratch);
 
-    // The play-button area is a slot: spinner / play icon / pause bars / buffering / artwork
-    // are mutually exclusive and the slot clears on kind transitions.
-    let play_kind = compute_play_kind(state);
+    let art_kind = compute_art_kind(state);
     cache
-        .play_slot
-        .clear_if_kind_changed(painter.display(), play_kind)
+        .art_slot
+        .clear_if_kind_changed(painter.display(), art_kind)
         .map_err(RenderError::Draw)?;
 
+    // The readout goes away on a tick, not on a press, so its disappearance
+    // has to be noticed here. Handled *before* the artwork so that the artwork
+    // pass repaints what the panel covered rather than leaving a hole.
+    let overlay_visible = state.volume_overlay_until_ms.is_some();
+    let overlay_just_hidden = !overlay_visible && cache.now_playing.overlay_visible;
+    if overlay_just_hidden {
+        cache.now_playing.overlay_visible = false;
+        cache.now_playing.overlay_value = None;
+        cache.now_playing.overlay_percent = None;
+    }
+
     if state.loading {
-        // Center on the play-button slot so the slot's clear (used when
-        // loading ends and the play icon takes over) fully covers the
-        // spinner's footprint.
+        if overlay_just_hidden {
+            clear_rect(painter.display(), ui_layout.overlay_panel)?;
+        }
         let spinner = Spinner {
-            center: rect_visual_center(ui_layout.play_button),
+            center: rect_visual_center(ui_layout.artwork),
             phase: spinner_phase(state.current_ms),
-            previous_phase: if cache.play_slot.previous_kind == Some(PLAY_SLOT_SPINNER) {
-                cache.status_cache.spinner_phase
+            previous_phase: if cache.art_slot.previous_kind == Some(ART_SLOT_SPINNER)
+                && !overlay_just_hidden
+            {
+                cache.now_playing.spinner_phase
             } else {
                 None
             },
         };
         painter.draw(&spinner).map_err(RenderError::Draw)?;
-        cache.status_cache.spinner_phase = Some(spinner.phase);
-        cache.play_slot.previous_kind = Some(play_kind);
-        cache.status_cache.loading_visible = true;
-        cache.status_cache.has_rendered = true;
+        cache.now_playing.spinner_phase = Some(spinner.phase);
+        cache.art_slot.previous_kind = Some(art_kind);
+        cache.now_playing.loading_visible = true;
+        cache.now_playing.has_rendered = true;
         return Ok(());
     }
 
-    if cache.status_cache.loading_visible {
-        // Transitioning out of loading: invalidate caches so all widgets we
-        // skipped during the spinner-only phase get a fresh first frame.
-        cache.status_cache.title.clear();
-        cache.status_cache.artist.clear();
-        cache.status_cache.title_marquee_offset_px = None;
-        cache.status_cache.artist_marquee_offset_px = None;
-        cache.status_cache.elapsed_seconds = None;
-        cache.status_cache.duration_seconds = None;
-        cache.status_cache.progress_filled_px = None;
-        cache.status_cache.loading_visible = false;
+    if cache.now_playing.loading_visible {
+        // Leaving the spinner-only phase: everything skipped while it was up
+        // needs a fresh first frame.
+        cache.now_playing.title.clear();
+        cache.now_playing.artist.clear();
+        cache.now_playing.title_marquee_offset_px = None;
+        cache.now_playing.artist_marquee_offset_px = None;
+        cache.now_playing.progress_filled_px = None;
+        cache.now_playing.duration_seconds = None;
+        cache.now_playing.loading_visible = false;
     }
 
-    if !cache.status_cache.transport_controls_drawn {
-        draw_transport_button(
-            painter.display(),
-            ui_layout.previous_button,
-            "<<",
-            ButtonTone::Stop,
-        )?;
-        draw_transport_button(
-            painter.display(),
-            ui_layout.next_button,
-            ">>",
-            ButtonTone::Start,
-        )?;
-        cache.status_cache.transport_controls_drawn = true;
+    // Anything but artwork is a glyph on black, so the panel's footprint has
+    // to be cleared before it is redrawn. Artwork restores itself from its own
+    // buffer and needs no clear.
+    if overlay_just_hidden && art_kind != ART_SLOT_ARTWORK {
+        clear_rect(painter.display(), ui_layout.overlay_panel)?;
     }
 
-    match play_kind {
-        PLAY_SLOT_BUFFERING => {
+    match art_kind {
+        ART_SLOT_BUFFERING => {
             let spinner = Spinner {
-                center: rect_visual_center(ui_layout.play_button),
+                center: rect_visual_center(ui_layout.artwork),
                 phase: spinner_phase(state.current_ms),
-                previous_phase: if cache.play_slot.previous_kind == Some(PLAY_SLOT_BUFFERING) {
-                    cache.status_cache.spinner_phase
+                previous_phase: if cache.art_slot.previous_kind == Some(ART_SLOT_BUFFERING)
+                    && !overlay_just_hidden
+                {
+                    cache.now_playing.spinner_phase
                 } else {
                     None
                 },
             };
             painter.draw(&spinner).map_err(RenderError::Draw)?;
-            cache.status_cache.spinner_phase = Some(spinner.phase);
+            cache.now_playing.spinner_phase = Some(spinner.phase);
         }
-        PLAY_SLOT_ARTWORK => {
+        ART_SLOT_ARTWORK => {
             let artwork = state.artwork.as_ref().expect("artwork present");
-            let already_drawn = cache.status_cache.artwork_uri.as_str()
-                == artwork.source_uri.as_str()
-                && cache.play_slot.previous_kind == Some(PLAY_SLOT_ARTWORK);
+            let painted = cache.now_playing.artwork_uri.as_str() == artwork.source_uri.as_str()
+                && cache.art_slot.previous_kind == Some(ART_SLOT_ARTWORK);
+            // Already on the panel and only the readout's footprint is stale:
+            // re-blit that rectangle instead of all 330 x 330 of it.
+            let region = if painted && overlay_just_hidden {
+                Some(ui_layout.overlay_panel)
+            } else {
+                None
+            };
             let widget = ArtworkWidget {
-                rect: ui_layout.play_button,
+                rect: ui_layout.artwork,
                 artwork,
-                already_drawn,
+                region,
+                skip: painted && !overlay_just_hidden,
             };
             painter.draw(&widget).map_err(RenderError::Draw)?;
-            cache.status_cache.artwork_uri.clear();
+            cache.now_playing.artwork_uri.clear();
             let _ = cache
-                .status_cache
+                .now_playing
                 .artwork_uri
                 .push_str(artwork.source_uri.as_str());
         }
-        PLAY_SLOT_PAUSE_BARS => {
+        ART_SLOT_PAUSE_BARS => {
             let widget = PauseBars {
-                rect: ui_layout.play_button,
-                already_drawn: cache.play_slot.previous_kind == Some(PLAY_SLOT_PAUSE_BARS),
+                rect: ui_layout.artwork,
+                already_drawn: cache.art_slot.previous_kind == Some(ART_SLOT_PAUSE_BARS)
+                    && !overlay_just_hidden,
             };
             painter.draw(&widget).map_err(RenderError::Draw)?;
         }
-        PLAY_SLOT_PLAY_ICON => {
+        ART_SLOT_PLAY_ICON => {
             let widget = PlayTriangle {
-                rect: ui_layout.play_button,
-                already_drawn: cache.play_slot.previous_kind == Some(PLAY_SLOT_PLAY_ICON),
+                rect: ui_layout.artwork,
+                already_drawn: cache.art_slot.previous_kind == Some(ART_SLOT_PLAY_ICON)
+                    && !overlay_just_hidden,
             };
             painter.draw(&widget).map_err(RenderError::Draw)?;
         }
         _ => {}
     }
-    cache.play_slot.previous_kind = Some(play_kind);
+    cache.art_slot.previous_kind = Some(art_kind);
 
-    let timer = TimerDisplay {
-        origin: ui_layout.timer_origin,
-        bounds: ui_layout.timer_bounds,
-        elapsed: state.status.elapsed_seconds,
-        previous_elapsed: cache.status_cache.elapsed_seconds,
-    };
-    painter.draw(&timer).map_err(RenderError::Draw)?;
-    cache.status_cache.elapsed_seconds = Some(state.status.elapsed_seconds);
+    // Paused, and there is a picture to mark. Without artwork the slot above
+    // already shows pause bars as its state glyph, so badging that too would
+    // draw the same thing twice.
+    let paused = matches!(
+        state.status.playback,
+        PlaybackState::Paused | PlaybackState::Stopped
+    );
+    let badge_wanted = paused && art_kind == ART_SLOT_ARTWORK;
+    if badge_wanted {
+        // Redrawn after the volume readout lapses, because that panel is
+        // larger than the badge and covered it completely.
+        if !cache.now_playing.pause_badge_visible || overlay_just_hidden {
+            draw_panel(
+                painter.display(),
+                ui_layout.pause_badge,
+                PAUSE_BADGE_RADIUS,
+                OLED_BLACK,
+                SURFACE_BORDER,
+            )?;
+            let bars = PauseBars {
+                rect: ui_layout.pause_badge,
+                already_drawn: false,
+            };
+            painter.draw(&bars).map_err(RenderError::Draw)?;
+            cache.now_playing.pause_badge_visible = true;
+        }
+    } else if cache.now_playing.pause_badge_visible {
+        // Playing again: put back the artwork the badge was sitting on. The
+        // pixels are already in `State::artwork`, so this is a blit from a
+        // buffer we hold rather than a refetch.
+        cache.now_playing.pause_badge_visible = false;
+        if art_kind == ART_SLOT_ARTWORK {
+            let artwork = state.artwork.as_ref().expect("artwork present");
+            let widget = ArtworkWidget {
+                rect: ui_layout.artwork,
+                artwork,
+                region: Some(ui_layout.pause_badge),
+                skip: false,
+            };
+            painter.draw(&widget).map_err(RenderError::Draw)?;
+        } else {
+            clear_rect(painter.display(), ui_layout.pause_badge)?;
+        }
+    }
 
-    let new_filled_px =
-        progress_filled_px(state.status.elapsed_seconds, state.status.duration_seconds);
-    let progress = ProgressBarWidget {
-        rect: ui_layout.progress,
+    let duration_changed =
+        cache.now_playing.duration_seconds != Some(state.status.duration_seconds);
+    let new_filled_px = progress_filled_px(
+        state.status.elapsed_seconds,
+        state.status.duration_seconds,
+        ui_layout.progress.size.width,
+    );
+    let progress = LevelBar {
+        bar: ui_layout.progress,
+        track_color: PROGRESS_TRACK,
+        active_color: PROGRESS_FILL,
         filled_px: new_filled_px,
-        previous_filled_px: cache.status_cache.progress_filled_px,
-        previous_duration: cache.status_cache.duration_seconds,
-        duration: state.status.duration_seconds,
+        previous_filled_px: if duration_changed {
+            None
+        } else {
+            cache.now_playing.progress_filled_px
+        },
     };
     painter.draw(&progress).map_err(RenderError::Draw)?;
-    cache.status_cache.progress_filled_px = Some(new_filled_px);
-    cache.status_cache.duration_seconds = Some(state.status.duration_seconds);
+    cache.now_playing.progress_filled_px = Some(new_filled_px);
+    cache.now_playing.duration_seconds = Some(state.status.duration_seconds);
 
-    let song_text = non_empty_or(&state.status.title, "No track");
-    let song_text_changed = cache.status_cache.title.as_str() != song_text;
-    if song_text_changed {
-        state.marquee.title_anim_base_ms = state.current_ms;
-        cache.status_cache.title_marquee_offset_px = None;
-    }
-    let song_text_width = measure_band_text_width(song_text);
-    let song_overflow_px = song_text_width.saturating_sub(ui_layout.song_band.size.width);
-    let song_offset_px = compute_marquee_offset(
-        state
-            .current_ms
-            .saturating_sub(state.marquee.title_anim_base_ms),
-        song_overflow_px,
-    );
-    let song_unchanged = cache.status_cache.has_rendered
-        && !song_text_changed
-        && cache.status_cache.title_marquee_offset_px == Some(song_offset_px);
-    let song = MarqueeBand {
-        band: ui_layout.song_band,
-        centered_origin: ui_layout.song_origin,
-        text: song_text,
-        unchanged: song_unchanged,
-        primary: true,
-        overflow_px: song_overflow_px,
-        offset_px: song_offset_px,
-    };
-    painter.draw(&song).map_err(RenderError::Draw)?;
-    cache.status_cache.title.clear();
-    let _ = cache.status_cache.title.push_str(song_text);
-    state.marquee.title_overflow_px = song_overflow_px;
-    cache.status_cache.title_marquee_offset_px = Some(song_offset_px);
+    let has_rendered = cache.now_playing.has_rendered;
+    let title_text = non_empty_or(&state.status.title, "No track");
+    draw_marquee_band(
+        &mut painter,
+        MarqueeInput {
+            band: ui_layout.title_band,
+            origin: ui_layout.title_origin,
+            text: title_text,
+            primary: true,
+        },
+        &mut state.marquee.title_overflow_px,
+        &mut state.marquee.title_anim_base_ms,
+        &mut cache.now_playing.title,
+        &mut cache.now_playing.title_marquee_offset_px,
+        state.current_ms,
+        has_rendered,
+    )?;
 
     let artist_text = non_empty_or(&state.status.artist, "Not playing");
-    let artist_text_changed = cache.status_cache.artist.as_str() != artist_text;
-    if artist_text_changed {
-        state.marquee.artist_anim_base_ms = state.current_ms;
-        cache.status_cache.artist_marquee_offset_px = None;
-    }
-    let artist_text_width = measure_band_text_width(artist_text);
-    let artist_overflow_px = artist_text_width.saturating_sub(ui_layout.artist_band.size.width);
-    let artist_offset_px = compute_marquee_offset(
-        state
-            .current_ms
-            .saturating_sub(state.marquee.artist_anim_base_ms),
-        artist_overflow_px,
-    );
-    let artist_unchanged = cache.status_cache.has_rendered
-        && !artist_text_changed
-        && cache.status_cache.artist_marquee_offset_px == Some(artist_offset_px);
-    let artist = MarqueeBand {
-        band: ui_layout.artist_band,
-        centered_origin: ui_layout.artist_origin,
-        text: artist_text,
-        unchanged: artist_unchanged,
-        primary: false,
-        overflow_px: artist_overflow_px,
-        offset_px: artist_offset_px,
-    };
-    painter.draw(&artist).map_err(RenderError::Draw)?;
-    cache.status_cache.artist.clear();
-    let _ = cache.status_cache.artist.push_str(artist_text);
-    state.marquee.artist_overflow_px = artist_overflow_px;
-    cache.status_cache.artist_marquee_offset_px = Some(artist_offset_px);
+    draw_marquee_band(
+        &mut painter,
+        MarqueeInput {
+            band: ui_layout.artist_band,
+            origin: ui_layout.artist_origin,
+            text: artist_text,
+            primary: false,
+        },
+        &mut state.marquee.artist_overflow_px,
+        &mut state.marquee.artist_anim_base_ms,
+        &mut cache.now_playing.artist,
+        &mut cache.now_playing.artist_marquee_offset_px,
+        state.current_ms,
+        has_rendered,
+    )?;
 
-    cache.status_cache.has_rendered = true;
+    // Last, so it sits over the artwork rather than under it.
+    if overlay_visible {
+        if !cache.now_playing.overlay_visible {
+            draw_panel(
+                painter.display(),
+                ui_layout.overlay_panel,
+                OVERLAY_RADIUS,
+                OLED_BLACK,
+                SURFACE_BORDER,
+            )?;
+            cache.now_playing.overlay_value = None;
+            cache.now_playing.overlay_percent = None;
+        }
+
+        let value = state.status.volume_percent.min(HIFI_VOLUME_MAX);
+        let readout = VolumeValue {
+            band: ui_layout.overlay_value,
+            value,
+            unchanged: cache.now_playing.overlay_value == Some(value),
+        };
+        painter.draw(&readout).map_err(RenderError::Draw)?;
+        cache.now_playing.overlay_value = Some(value);
+
+        let width = ui_layout.overlay_track.size.width;
+        let track = LevelBar {
+            bar: ui_layout.overlay_track,
+            track_color: VOLUME_TRACK,
+            active_color: VOLUME_ACTIVE,
+            filled_px: filled_width_for_volume(value, width),
+            previous_filled_px: cache
+                .now_playing
+                .overlay_percent
+                .map(|percent| filled_width_for_volume(percent, width)),
+        };
+        painter.draw(&track).map_err(RenderError::Draw)?;
+        cache.now_playing.overlay_percent = Some(value);
+        cache.now_playing.overlay_visible = true;
+    }
+
+    cache.now_playing.has_rendered = true;
     Ok(())
 }
 
-fn draw_transport_button<D>(
-    display: &mut D,
-    rect: Rectangle,
-    label: &str,
-    tone: ButtonTone,
-) -> Result<(), RenderError<D::Error>>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    match draw_button(display, rect, label, true, tone) {
-        Ok(()) => Ok(()),
-        Err(RenderError::Draw(error)) => Err(RenderError::Draw(error)),
-        Err(RenderError::TextFormat) => Ok(()),
-    }
-}
-
-fn render_pins<D>(
+fn render_choices<D>(
     state: &mut State,
     cache: &mut RenderCache,
     display: &mut D,
-    _scratch: &mut [Rgb565],
-    ui_layout: &PinsLayout,
+    scratch: &mut [Rgb565],
+    ui_layout: &ChoicesLayout,
 ) -> Result<(), RenderError<D::Error>>
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    for slot in 0..HIFI_PIN_COUNT {
+    let mut painter = Painter::new(display, scratch);
+
+    if !cache.choices.header_drawn {
+        let header = CenteredBand {
+            band: ui_layout.header_band,
+            origin: ui_layout.header_origin,
+            text: "PICK SOME MUSIC",
+        };
+        painter.draw(&header).map_err(RenderError::Draw)?;
+        cache.choices.header_drawn = true;
+    }
+
+    for (slot, tint) in TILE_TINTS.iter().enumerate() {
         let pin = state.pins.get(slot);
         let active = pin.is_some();
-        let label = pin_button_label(slot, pin);
+        let label = tile_label(slot, pin);
 
-        let label_changed = cache.pins_cache.drawn_titles[slot].as_str() != label.as_str();
-        let active_changed = cache.pins_cache.drawn_active[slot] != active;
-        if cache.pins_cache.has_rendered && !label_changed && !active_changed {
+        let label_changed = cache.choices.drawn_titles[slot].as_str() != label.as_str();
+        let active_changed = cache.choices.drawn_active[slot] != active;
+        if cache.choices.has_rendered && !label_changed && !active_changed {
             continue;
         }
 
-        let rect = ui_layout.buttons[slot];
-        let tone = if active {
-            ButtonTone::Start
+        let (fill, stroke) = if active {
+            *tint
         } else {
-            ButtonTone::Stop
+            (ACTION_INACTIVE, ACTION_INACTIVE_BORDER)
         };
-        if let Err(error) = draw_button(display, rect, label.as_str(), active, tone) {
-            return match error {
-                RenderError::Draw(error) => Err(RenderError::Draw(error)),
-                RenderError::TextFormat => Ok(()),
-            };
-        }
-        cache.pins_cache.drawn_titles[slot].clear();
-        let _ = cache.pins_cache.drawn_titles[slot].push_str(label.as_str());
-        cache.pins_cache.drawn_active[slot] = active;
+        draw_panel(
+            painter.display(),
+            ui_layout.tile_art[slot],
+            TILE_RADIUS,
+            fill,
+            stroke,
+        )?;
+
+        let caption_band = ui_layout.tile_caption[slot];
+        let caption = CenteredBand {
+            band: caption_band,
+            origin: Point::new(caption_band.center().x, caption_band.top_left.y),
+            text: label.as_str(),
+        };
+        painter.draw(&caption).map_err(RenderError::Draw)?;
+
+        cache.choices.drawn_titles[slot].clear();
+        let _ = cache.choices.drawn_titles[slot].push_str(label.as_str());
+        cache.choices.drawn_active[slot] = active;
     }
-    cache.pins_cache.has_rendered = true;
+    cache.choices.has_rendered = true;
     Ok(())
 }
 
-fn pin_button_label(slot: usize, pin: Option<&crate::HifiPin>) -> String<HIFI_TEXT_LEN> {
+/// What to write under a tile.
+///
+/// Three cases, and conflating them hides a real fault. A pin that exists but
+/// has no title is *not* an empty slot: the device answered `GetIdArray` and
+/// then failed or declined to answer `ReadList` for that id. Labelling that
+/// "Empty" makes a broken title fetch look like an unconfigured pin, so an
+/// untitled pin shows its id instead — which also says, on the panel itself,
+/// exactly which pin the device would not describe.
+fn tile_label(slot: usize, pin: Option<&crate::HifiPin>) -> String<HIFI_TEXT_LEN> {
     let mut label = String::<HIFI_TEXT_LEN>::new();
-    if let Some(pin) = pin
-        && !pin.title.is_empty()
-        && label.push_str(pin.title.as_str()).is_ok()
-    {
+    let Some(pin) = pin else {
+        let _ = label.push_str("Empty ");
+        let digit = (slot as u8 + 1).min(9);
+        let _ = label.push((b'0' + digit) as char);
+        return label;
+    };
+
+    if !pin.title.is_empty() && label.push_str(pin.title.as_str()).is_ok() {
         return label;
     }
+
     label.clear();
-    let _ = label.push_str("Pin ");
-    let digit = (slot as u8 + 1).min(9);
-    let _ = label.push((b'0' + digit) as char);
+    if core::fmt::write(&mut label, format_args!("Pin {}", pin.id)).is_err() {
+        label.clear();
+        let _ = label.push_str("Pin");
+    }
     label
 }
 
-fn render_volume_page<D>(
-    state: &mut State,
-    cache: &mut RenderCache,
-    display: &mut D,
-    _scratch: &mut [Rgb565],
-    ui_layout: &VolumePageLayout,
+struct MarqueeInput<'a> {
+    band: Rectangle,
+    origin: Point,
+    text: &'a str,
+    primary: bool,
+}
+
+/// Draws one scrolling text band and updates every piece of bookkeeping that
+/// goes with it. Both bands do exactly the same thing, so they share this
+/// rather than repeating thirty lines each.
+#[allow(clippy::too_many_arguments)]
+fn draw_marquee_band<D>(
+    painter: &mut Painter<'_, D>,
+    input: MarqueeInput<'_>,
+    overflow_px: &mut u32,
+    anim_base_ms: &mut u64,
+    drawn_text: &mut String<HIFI_TEXT_LEN>,
+    drawn_offset_px: &mut Option<i32>,
+    current_ms: u64,
+    has_rendered: bool,
 ) -> Result<(), RenderError<D::Error>>
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    if !cache.volume_cache.static_drawn {
-        let title_font = ui_font!(BOLD);
-        let title_style = BitmapFontStyleBuilder::new()
-            .text_color(TEXT_PRIMARY)
-            .background_color(OLED_BLACK)
-            .font(&title_font)
-            .build();
-        let centered = TextStyleBuilder::new()
-            .alignment(Alignment::Center)
-            .baseline(Baseline::Top)
-            .build();
-        let title_origin = Point::new(
-            ui_layout.title_slot.center().x,
-            ui_layout.title_slot.top_left.y,
-        );
-        Text::with_text_style("VOLUME", title_origin, title_style, centered)
-            .draw(display)
-            .map_err(RenderError::Draw)?;
-        if let Err(error) = draw_button(
-            display,
-            ui_layout.decrement_button,
-            "-",
-            true,
-            ButtonTone::Stop,
-        ) {
-            return match error {
-                RenderError::Draw(error) => Err(RenderError::Draw(error)),
-                RenderError::TextFormat => Ok(()),
-            };
-        }
-        if let Err(error) = draw_button(
-            display,
-            ui_layout.increment_button,
-            "+",
-            true,
-            ButtonTone::Start,
-        ) {
-            return match error {
-                RenderError::Draw(error) => Err(RenderError::Draw(error)),
-                RenderError::TextFormat => Ok(()),
-            };
-        }
-        cache.volume_cache.static_drawn = true;
+    let text_changed = drawn_text.as_str() != input.text;
+    if text_changed {
+        *anim_base_ms = current_ms;
+        *drawn_offset_px = None;
     }
+    let text_width = measure_band_text_width(input.text);
+    let overflow = text_width.saturating_sub(input.band.size.width);
+    let offset = compute_marquee_offset(current_ms.saturating_sub(*anim_base_ms), overflow);
+    let unchanged = has_rendered && !text_changed && *drawn_offset_px == Some(offset);
 
-    let value = state.status.volume_percent.min(HIFI_VOLUME_MAX);
-    if cache.volume_cache.digit_value == Some(value) {
-        return Ok(());
-    }
-    clear_rect(display, ui_layout.value_slot)?;
+    let band = MarqueeBand {
+        band: input.band,
+        centered_origin: input.origin,
+        text: input.text,
+        unchanged,
+        primary: input.primary,
+        overflow_px: overflow,
+        offset_px: offset,
+    };
+    painter.draw(&band).map_err(RenderError::Draw)?;
 
-    let digit_font = ui_font!(BOLD);
-    let digit_style = BitmapFontStyleBuilder::new()
-        .text_color(TEXT_PRIMARY)
-        .background_color(OLED_BLACK)
-        .font(&digit_font)
-        .build();
-    let centered = TextStyleBuilder::new()
-        .alignment(Alignment::Center)
-        .baseline(Baseline::Top)
-        .build();
-
-    let mut buffer = String::<4>::new();
-    if value >= 100 {
-        let _ = buffer.push((b'0' + (value / 100)) as char);
-    }
-    if value >= 10 {
-        let _ = buffer.push((b'0' + ((value / 10) % 10)) as char);
-    }
-    let _ = buffer.push((b'0' + (value % 10)) as char);
-
-    Text::with_text_style(
-        buffer.as_str(),
-        ui_layout.digit_origin,
-        digit_style,
-        centered,
-    )
-    .draw(display)
-    .map_err(RenderError::Draw)?;
-    cache.volume_cache.digit_value = Some(value);
+    drawn_text.clear();
+    let _ = drawn_text.push_str(input.text);
+    *overflow_px = overflow;
+    *drawn_offset_px = Some(offset);
     Ok(())
 }
 
-fn compute_play_kind(state: &State) -> u8 {
+fn compute_art_kind(state: &State) -> u8 {
     if state.loading {
-        return PLAY_SLOT_SPINNER;
+        return ART_SLOT_SPINNER;
     }
     match state.status.playback {
-        PlaybackState::Buffering => PLAY_SLOT_BUFFERING,
-        PlaybackState::Playing => {
+        PlaybackState::Buffering => ART_SLOT_BUFFERING,
+        playback => {
             if state
                 .artwork
                 .as_ref()
                 .is_some_and(|artwork| artwork.source_uri == state.status.album_art_uri)
             {
-                PLAY_SLOT_ARTWORK
+                // Artwork is the hero whether or not it is playing; the
+                // transport state reads off the artist line instead.
+                ART_SLOT_ARTWORK
+            } else if playback == PlaybackState::Playing {
+                // Reports the state, rather than the action a press would
+                // take. This slot used to *be* the play/pause button, where
+                // pause bars while playing meant "press to pause"; it is a
+                // status area now, and keeping that inversion would have it
+                // showing bars — universally read as "paused" — during
+                // playback.
+                ART_SLOT_PLAY_ICON
             } else {
-                PLAY_SLOT_PAUSE_BARS
+                ART_SLOT_PAUSE_BARS
             }
-        }
-        PlaybackState::Paused | PlaybackState::Stopped | PlaybackState::Unknown => {
-            PLAY_SLOT_PLAY_ICON
         }
     }
 }
 
-fn progress_filled_px(elapsed: u32, duration: u32) -> u32 {
+fn progress_filled_px(elapsed: u32, duration: u32, width: u32) -> u32 {
     if duration == 0 {
         0
     } else {
-        ((PROGRESS_WIDTH as u64 * elapsed.min(duration) as u64) / duration as u64) as u32
+        ((width as u64 * elapsed.min(duration) as u64) / duration as u64) as u32
     }
 }
 
-#[cfg(test)]
-pub(crate) fn play_button_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
-    layout(bounds).status.play_button.center()
+fn filled_width_for_volume(percent: u8, width: u32) -> u32 {
+    let clamped = percent.min(HIFI_VOLUME_MAX) as u32;
+    (width * clamped) / HIFI_VOLUME_MAX as u32
 }
 
 #[cfg(test)]
-pub(crate) fn previous_button_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
-    layout(bounds).status.previous_button.center()
+pub(crate) fn artwork_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
+    layout(bounds).now_playing.artwork.center()
 }
 
 #[cfg(test)]
-pub(crate) fn next_button_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
-    layout(bounds).status.next_button.center()
-}
-
-#[cfg(test)]
-pub(crate) fn pin_slot_button_center(
-    bounds: Rectangle,
-    slot: usize,
-) -> embedded_graphics::geometry::Point {
-    layout(bounds).pins.buttons[slot].center()
-}
-
-#[cfg(test)]
-pub(crate) fn volume_decrement_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
-    layout(bounds).volume_page.decrement_button.center()
-}
-
-#[cfg(test)]
-pub(crate) fn volume_increment_center(bounds: Rectangle) -> embedded_graphics::geometry::Point {
-    layout(bounds).volume_page.increment_button.center()
+pub(crate) fn tile_center(bounds: Rectangle, slot: usize) -> embedded_graphics::geometry::Point {
+    layout(bounds).choices.tiles[slot].center()
 }
 
 fn non_empty_or<'a>(value: &'a str, fallback: &'static str) -> &'a str {
@@ -1197,77 +1301,156 @@ fn spinner_phase(uptime_ms: u64) -> u8 {
 // Widgets
 // =====================================================================
 
-/// Ambient volume readout along the bottom of the panel.
+/// A horizontal fill gauge that repaints only the span between the old and new
+/// levels rather than the whole bar.
 ///
-/// Replaces the 270-degree ring used on the round board. Like the ring, it
-/// repaints only the span between the old and new levels rather than the whole
-/// bar, which keeps volume nudges cheap on a slow QSPI panel.
-struct VolumeBar {
+/// Used for both the progress bar and the volume readout's track — they are
+/// the same shape, and keeping one implementation means a change to the
+/// partial-repaint logic cannot fix one and miss the other.
+struct LevelBar {
     bar: Rectangle,
     track_color: Rgb565,
     active_color: Rgb565,
-    percent: u8,
-    previous_percent: Option<u8>,
+    filled_px: u32,
+    previous_filled_px: Option<u32>,
 }
 
-impl VolumeBar {
-    /// Horizontal span `[left, right)` of the bar, clamped to its bounds.
+impl LevelBar {
+    /// Horizontal span `[from, to)` of the bar.
     fn segment(&self, from_px: u32, to_px: u32) -> Rectangle {
-        let left = self.bar.top_left.x + from_px as i32;
         Rectangle::new(
-            Point::new(left, self.bar.top_left.y),
+            Point::new(self.bar.top_left.x + from_px as i32, self.bar.top_left.y),
             Size::new(to_px.saturating_sub(from_px), self.bar.size.height),
         )
     }
 }
 
-impl Widget<Action> for VolumeBar {
+impl Widget<Action> for LevelBar {
     fn bounds(&self) -> Rectangle {
         self.bar
     }
 
     fn should_draw(&self) -> bool {
-        self.previous_percent != Some(self.percent)
+        self.previous_filled_px != Some(self.filled_px)
     }
 
     fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = Rgb565>,
     {
-        let width = self.bar.size.width;
-        let new_filled = filled_width_for_volume(self.percent, width);
-
-        match self.previous_percent {
+        match self.previous_filled_px {
             // First frame — paint the full track, then the filled span.
             None => {
                 target.fill_solid(&self.bar, self.track_color)?;
-                if new_filled > 0 {
-                    target.fill_solid(&self.segment(0, new_filled), self.active_color)?;
+                if self.filled_px > 0 {
+                    target.fill_solid(&self.segment(0, self.filled_px), self.active_color)?;
                 }
             }
-            Some(previous) if previous == self.percent => {
-                // Smart-skip.
-            }
+            Some(previous) if previous == self.filled_px => {}
             Some(previous) => {
-                let previous_filled = filled_width_for_volume(previous, width);
-                let (from_px, to_px, color) = if new_filled > previous_filled {
-                    (previous_filled, new_filled, self.active_color)
+                let (from_px, to_px, color) = if self.filled_px > previous {
+                    (previous, self.filled_px, self.active_color)
                 } else {
-                    (new_filled, previous_filled, self.track_color)
+                    (self.filled_px, previous, self.track_color)
                 };
                 if to_px > from_px {
                     target.fill_solid(&self.segment(from_px, to_px), color)?;
                 }
             }
         }
-
         Ok(())
     }
 }
 
-fn filled_width_for_volume(percent: u8, width: u32) -> u32 {
-    let clamped = percent.min(HIFI_VOLUME_MAX) as u32;
-    (width * clamped) / HIFI_VOLUME_MAX as u32
+/// The volume number inside the readout panel.
+struct VolumeValue {
+    band: Rectangle,
+    value: u8,
+    unchanged: bool,
+}
+
+impl Widget<Action> for VolumeValue {
+    fn bounds(&self) -> Rectangle {
+        self.band
+    }
+
+    fn use_scratch(&self) -> bool {
+        true
+    }
+
+    fn should_draw(&self) -> bool {
+        !self.unchanged
+    }
+
+    fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
+    where
+        D: DrawTarget<Color = Rgb565>,
+    {
+        let font = ui_font!(BOLD);
+        let style = BitmapFontStyleBuilder::new()
+            .text_color(TEXT_PRIMARY)
+            .background_color(OLED_BLACK)
+            .font(&font)
+            .build();
+        let text_style = TextStyleBuilder::new()
+            .alignment(Alignment::Center)
+            .baseline(Baseline::Top)
+            .build();
+
+        let mut buffer = String::<4>::new();
+        let value = self.value;
+        if value >= 100 {
+            let _ = buffer.push((b'0' + (value / 100)) as char);
+        }
+        if value >= 10 {
+            let _ = buffer.push((b'0' + ((value / 10) % 10)) as char);
+        }
+        let _ = buffer.push((b'0' + (value % 10)) as char);
+
+        Text::with_text_style(
+            buffer.as_str(),
+            Point::new(self.band.center().x, self.band.top_left.y),
+            style,
+            text_style,
+        )
+        .draw(target)?;
+        Ok(())
+    }
+}
+
+/// Static centred text — the Choices header and each tile's caption.
+struct CenteredBand<'a> {
+    band: Rectangle,
+    origin: Point,
+    text: &'a str,
+}
+
+impl Widget<Action> for CenteredBand<'_> {
+    fn bounds(&self) -> Rectangle {
+        self.band
+    }
+
+    fn use_scratch(&self) -> bool {
+        true
+    }
+
+    fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
+    where
+        D: DrawTarget<Color = Rgb565>,
+    {
+        let font = ui_font!(500);
+        let style = BitmapFontStyleBuilder::new()
+            .text_color(TEXT_PRIMARY)
+            .background_color(OLED_BLACK)
+            .font(&font)
+            .build();
+        let text_style = TextStyleBuilder::new()
+            .alignment(Alignment::Center)
+            .baseline(Baseline::Top)
+            .build();
+        Text::with_text_style(self.text, self.origin, style, text_style).draw(target)?;
+        Ok(())
+    }
 }
 
 struct Spinner {
@@ -1311,12 +1494,15 @@ impl Widget<Action> for PlayTriangle {
         if self.already_drawn {
             return Ok(());
         }
+        // Sized to sit *inside* the volume readout's panel. The readout is
+        // drawn over this slot, and a glyph taller than the panel leaves its
+        // tips poking out around the edges, which reads as a rendering bug.
         let center = rect_visual_center(self.rect);
         aa::triangle(
             target,
-            center + Point::new(-16, -30),
-            center + Point::new(-16, 30),
-            center + Point::new(34, 0),
+            center + Point::new(-22, -40),
+            center + Point::new(-22, 40),
+            center + Point::new(46, 0),
             TEXT_PRIMARY,
             OLED_BLACK,
         )
@@ -1340,9 +1526,11 @@ impl Widget<Action> for PauseBars {
         if self.already_drawn {
             return Ok(());
         }
+        // Same constraint as the play triangle: shorter than the volume
+        // readout that covers it.
         let center = rect_visual_center(self.rect);
-        for x_offset in [-21, 5] {
-            let bar = Rectangle::new(center + Point::new(x_offset, -32), Size::new(16, 64));
+        for x_offset in [-30, 8] {
+            let bar = Rectangle::new(center + Point::new(x_offset, -40), Size::new(22, 80));
             bar.into_styled(PrimitiveStyle::with_fill(TEXT_PRIMARY))
                 .draw(target)?;
         }
@@ -1350,123 +1538,56 @@ impl Widget<Action> for PauseBars {
     }
 }
 
+/// The album artwork, painted 1:1 into its own rectangle.
+///
+/// `region` restricts painting to a sub-rectangle, which is how the volume
+/// readout's footprint is restored when it disappears: the pixels are already
+/// in `State::artwork`, so putting them back is a blit from a buffer we hold
+/// rather than a refetch or a full-square repaint.
 struct ArtworkWidget<'a> {
     rect: Rectangle,
     artwork: &'a HifiArtwork,
-    already_drawn: bool,
+    region: Option<Rectangle>,
+    skip: bool,
 }
 
 impl Widget<Action> for ArtworkWidget<'_> {
     fn bounds(&self) -> Rectangle {
-        self.rect
+        self.region.unwrap_or(self.rect)
+    }
+
+    fn should_draw(&self) -> bool {
+        !self.skip
     }
 
     fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = Rgb565>,
     {
-        if self.already_drawn {
+        if self.skip {
             return Ok(());
         }
-        let center = rect_visual_center(self.rect);
-        let top_left = center
-            - Point::new(
-                (HIFI_ARTWORK_SIZE / 2) as i32,
-                (HIFI_ARTWORK_SIZE / 2) as i32,
-            );
-        let size = HIFI_ARTWORK_SIZE as i32;
-        target.draw_iter((0..size).flat_map(|y| {
-            (0..size).filter_map(move |x| {
-                let index = (y as usize * HIFI_ARTWORK_SIZE as usize) + x as usize;
-                self.artwork
-                    .pixels()
+        let stride = HIFI_ARTWORK_SIZE as i32;
+        let top_left = self.rect.top_left;
+        let region = self.region.unwrap_or(self.rect);
+
+        // Clamp the requested region into the artwork's own pixel space, so a
+        // region straddling the edge paints what exists and nothing else.
+        let x0 = (region.top_left.x - top_left.x).clamp(0, stride);
+        let y0 = (region.top_left.y - top_left.y).clamp(0, stride);
+        let x1 = (x0 + region.size.width as i32).clamp(0, stride);
+        let y1 = (y0 + region.size.height as i32).clamp(0, stride);
+
+        let pixels = self.artwork.pixels();
+        target.draw_iter((y0..y1).flat_map(move |y| {
+            (x0..x1).filter_map(move |x| {
+                let index = (y as usize * stride as usize) + x as usize;
+                pixels
                     .get(index)
                     .copied()
                     .map(|color| Pixel(top_left + Point::new(x, y), color))
             })
         }))
-    }
-}
-
-struct TimerDisplay {
-    origin: Point,
-    bounds: Rectangle,
-    elapsed: u32,
-    previous_elapsed: Option<u32>,
-}
-
-impl Widget<Action> for TimerDisplay {
-    fn bounds(&self) -> Rectangle {
-        self.bounds
-    }
-
-    fn use_scratch(&self) -> bool {
-        true
-    }
-
-    fn should_draw(&self) -> bool {
-        self.previous_elapsed != Some(self.elapsed)
-    }
-
-    fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
-    where
-        D: DrawTarget<Color = Rgb565>,
-    {
-        let body_font = ui_font!(500);
-        let body_style = BitmapFontStyleBuilder::new()
-            .text_color(TEXT_SECONDARY)
-            .background_color(OLED_BLACK)
-            .font(&body_font)
-            .build();
-        match draw_duration(
-            target,
-            self.origin,
-            Duration::from_secs(self.elapsed as u64),
-            body_style,
-        ) {
-            Ok(()) => Ok(()),
-            Err(RenderError::Draw(e)) => Err(e),
-            Err(RenderError::TextFormat) => Ok(()),
-        }
-    }
-}
-
-struct ProgressBarWidget {
-    rect: Rectangle,
-    filled_px: u32,
-    previous_filled_px: Option<u32>,
-    previous_duration: Option<u32>,
-    duration: u32,
-}
-
-impl Widget<Action> for ProgressBarWidget {
-    fn bounds(&self) -> Rectangle {
-        self.rect
-    }
-
-    fn use_scratch(&self) -> bool {
-        true
-    }
-
-    fn should_draw(&self) -> bool {
-        self.previous_duration != Some(self.duration)
-            || self.previous_filled_px != Some(self.filled_px)
-    }
-
-    fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
-    where
-        D: DrawTarget<Color = Rgb565>,
-    {
-        match draw_progress_bar(
-            target,
-            self.rect,
-            self.filled_px as u64,
-            self.rect.size.width as u64,
-        ) {
-            Ok(()) => Ok(()),
-            Err(RenderError::Draw(e)) => Err(e),
-            Err(RenderError::TextFormat) => Ok(()),
-        }
     }
 }
 
@@ -1583,735 +1704,394 @@ fn rect_visual_center(rect: Rectangle) -> Point {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::HifiPin;
-    use crate::ui::SCREEN_BOUNDS;
-    use crate::ui::painter::is_two_aligned;
+    use crate::{HifiPin, ui::SCREEN_BOUNDS, ui::painter::is_two_aligned};
+    use alloc::vec::Vec;
 
-    fn assert_contains_rect(outer: Rectangle, inner: Rectangle) {
-        assert!(
-            outer.contains(inner.top_left)
-                && outer.contains(Point::new(
-                    inner.top_left.x + inner.size.width as i32 - 1,
-                    inner.top_left.y + inner.size.height as i32 - 1,
-                )),
-            "{outer:?} should contain {inner:?}"
-        );
-    }
-
-    fn assert_no_overlap(a: Rectangle, b: Rectangle) {
-        assert!(!rects_overlap(a, b), "{a:?} should not overlap {b:?}");
-    }
-
-    fn rects_overlap(a: Rectangle, b: Rectangle) -> bool {
-        let a_right = a.top_left.x + a.size.width as i32;
-        let a_bottom = a.top_left.y + a.size.height as i32;
-        let b_right = b.top_left.x + b.size.width as i32;
-        let b_bottom = b.top_left.y + b.size.height as i32;
-
-        a.top_left.x < b_right
-            && b.top_left.x < a_right
-            && a.top_left.y < b_bottom
-            && b.top_left.y < a_bottom
-    }
-
-    #[test]
-    fn hit_tests_play_button() {
-        let ui_layout = layout(SCREEN_BOUNDS);
-
-        assert_eq!(
-            hit_test_status(&ui_layout.status, ui_layout.status.previous_button.center()),
-            Some(Action::PreviousTrack)
-        );
-        assert_eq!(
-            hit_test_status(&ui_layout.status, ui_layout.status.play_button.center()),
-            Some(Action::TogglePlayback)
-        );
-        assert_eq!(
-            hit_test_status(&ui_layout.status, ui_layout.status.next_button.center()),
-            Some(Action::NextTrack)
-        );
-    }
-
-    #[test]
-    fn status_page_track_buttons_emit_commands() {
-        let ui_layout = layout(SCREEN_BOUNDS);
-        let mut state = State::new(0);
-
-        assert_eq!(
-            state.handle_touch(&ui_layout, ui_layout.status.previous_button.center(), 100),
-            Some(Command::PreviousTrack)
-        );
-        assert_eq!(
-            state.handle_touch(&ui_layout, ui_layout.status.next_button.center(), 100),
-            Some(Command::NextTrack)
-        );
-    }
-
-    #[test]
-    fn track_buttons_clear_local_current_track() {
-        let ui_layout = layout(SCREEN_BOUNDS);
+    fn state_with_track(elapsed: u32) -> State {
         let mut state = State::new(0);
         let mut status = HifiStatus::empty();
-        status.title.push_str("Old title").unwrap();
-        status.artist.push_str("Old artist").unwrap();
-        status.album.push_str("Old album").unwrap();
-        status.album_art_uri.push_str("http://art/old.jpg").unwrap();
-        status.elapsed_seconds = 42;
-        status.duration_seconds = 180;
-        status.volume_percent = 37;
+        let _ = status.title.push_str("Yellow Submarine");
+        let _ = status.artist.push_str("The Beatles");
         status.playback = PlaybackState::Playing;
+        status.duration_seconds = 160;
+        status.elapsed_seconds = elapsed;
+        status.volume_percent = 30;
         state.apply_status(status, 0);
-        let mut artwork = HifiArtwork::new("http://art/old.jpg").unwrap();
-        while artwork.push_pixel(Rgb565::WHITE) {}
-        assert!(state.apply_artwork(artwork));
-
-        assert_eq!(
-            state.handle_touch(&ui_layout, ui_layout.status.next_button.center(), 100),
-            Some(Command::NextTrack)
-        );
-
-        assert!(state.status.title.is_empty());
-        assert!(state.status.artist.is_empty());
-        assert!(state.status.album.is_empty());
-        assert!(state.status.album_art_uri.is_empty());
-        assert_eq!(state.status.elapsed_seconds, 0);
-        assert_eq!(state.status.duration_seconds, 0);
-        assert_eq!(state.status.volume_percent, 37);
-        assert_eq!(state.status.playback, PlaybackState::Buffering);
-        assert!(state.artwork.is_none());
+        state
     }
 
-    #[test]
-    fn hit_tests_pin_slots() {
-        let ui_layout = layout(SCREEN_BOUNDS);
-
-        for slot in 0..HIFI_PIN_COUNT {
-            assert_eq!(
-                hit_test_pins(&ui_layout.pins, ui_layout.pins.buttons[slot].center()),
-                Some(Action::InvokePinSlot(slot))
-            );
-        }
-    }
-
-    #[test]
-    fn hit_tests_volume_buttons() {
-        let ui_layout = layout(SCREEN_BOUNDS);
-
-        assert_eq!(
-            hit_test_volume(
-                &ui_layout.volume_page,
-                ui_layout.volume_page.decrement_button.center()
-            ),
-            Some(Action::VolumeDelta(-1))
-        );
-        assert_eq!(
-            hit_test_volume(
-                &ui_layout.volume_page,
-                ui_layout.volume_page.increment_button.center()
-            ),
-            Some(Action::VolumeDelta(1))
-        );
-    }
-
-    #[test]
-    fn cycles_through_pages() {
-        let mut state = State::new(0);
-        assert_eq!(state.page(), HifiPage::Status);
-        state.cycle_page();
-        assert_eq!(state.page(), HifiPage::Pins);
-        state.cycle_page();
-        assert_eq!(state.page(), HifiPage::Volume);
-        state.cycle_page();
-        assert_eq!(state.page(), HifiPage::Status);
-    }
-
-    #[test]
-    fn pins_page_taps_emit_invoke_pin_id() {
-        let ui_layout = layout(SCREEN_BOUNDS);
-        let mut state = State::new(0);
+    fn filled_pins() -> HifiPins {
         let mut pins = HifiPins::new();
-        let mut title = String::<{ crate::HIFI_PIN_TITLE_LEN }>::new();
-        title.push_str("Radio").unwrap();
-        pins.set(0, HifiPin { id: 4711, title });
-        state.apply_pins(pins);
-        state.cycle_page(); // -> Pins
-
-        let command = state
-            .handle_touch(&ui_layout, ui_layout.pins.buttons[0].center(), 100)
-            .unwrap();
-        assert_eq!(command, Command::InvokePinId { id: 4711 });
-    }
-
-    #[test]
-    fn pins_page_inactive_slot_emits_no_command() {
-        let ui_layout = layout(SCREEN_BOUNDS);
-        let mut state = State::new(0);
-        state.cycle_page(); // -> Pins (no pins loaded)
-        assert!(
-            state
-                .handle_touch(&ui_layout, ui_layout.pins.buttons[0].center(), 100)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn volume_buttons_emit_clamped_set_volume() {
-        let ui_layout = layout(SCREEN_BOUNDS);
-        let mut state = State::new(0);
-        let mut status = HifiStatus::empty();
-        status.volume_percent = 50;
-        state.apply_status(status, 0);
-        state.cycle_page();
-        state.cycle_page(); // -> Volume
-
-        let increment = ui_layout.volume_page.increment_button.center();
-        let decrement = ui_layout.volume_page.decrement_button.center();
-
-        assert_eq!(
-            state.handle_touch(&ui_layout, increment, 100),
-            Some(Command::SetVolume { volume: 51 })
-        );
-        assert_eq!(
-            state.handle_touch(&ui_layout, decrement, 100),
-            Some(Command::SetVolume { volume: 50 })
-        );
-    }
-
-    #[test]
-    fn volume_clamped_at_max() {
-        let ui_layout = layout(SCREEN_BOUNDS);
-        let mut state = State::new(0);
-        let mut status = HifiStatus::empty();
-        status.volume_percent = HIFI_VOLUME_MAX;
-        state.apply_status(status, 0);
-        state.cycle_page();
-        state.cycle_page(); // -> Volume
-
-        // At max — increment is a no-op.
-        let increment = ui_layout.volume_page.increment_button.center();
-        assert_eq!(state.handle_touch(&ui_layout, increment, 100), None);
-    }
-
-    #[test]
-    fn page_controls_stay_inside_their_page_bodies() {
-        let ui_layout = layout(SCREEN_BOUNDS);
-
-        assert_contains_rect(ui_layout.status.body, ui_layout.status.song_band);
-        assert_contains_rect(ui_layout.status.body, ui_layout.status.artist_band);
-        assert_contains_rect(ui_layout.status.body, ui_layout.status.previous_button);
-        assert_contains_rect(ui_layout.status.body, ui_layout.status.play_button);
-        assert_contains_rect(ui_layout.status.body, ui_layout.status.next_button);
-        assert_contains_rect(ui_layout.status.body, ui_layout.status.timer_bounds);
-        assert_contains_rect(ui_layout.status.body, ui_layout.status.progress);
-        assert_no_overlap(
-            ui_layout.status.previous_button,
-            ui_layout.status.play_button,
-        );
-        assert_no_overlap(ui_layout.status.play_button, ui_layout.status.next_button);
-
-        for button in &ui_layout.pins.buttons {
-            assert_contains_rect(ui_layout.pins.body, *button);
-        }
-
-        assert_contains_rect(ui_layout.volume_page.body, ui_layout.volume_page.title_slot);
-        assert_contains_rect(ui_layout.volume_page.body, ui_layout.volume_page.value_slot);
-        assert_contains_rect(
-            ui_layout.volume_page.body,
-            ui_layout.volume_page.controls_slot,
-        );
-        assert_contains_rect(
-            ui_layout.volume_page.controls_slot,
-            ui_layout.volume_page.decrement_button,
-        );
-        assert_contains_rect(
-            ui_layout.volume_page.controls_slot,
-            ui_layout.volume_page.increment_button,
-        );
-    }
-
-    #[test]
-    fn page_bodies_stay_inside_the_hifi_inner_screen() {
-        let ui_layout = layout(SCREEN_BOUNDS);
-
-        assert_contains_rect(ui_layout.page_body, ui_layout.status.body);
-        assert_contains_rect(ui_layout.page_body, ui_layout.pins.body);
-        assert_contains_rect(ui_layout.page_body, ui_layout.volume_page.body);
-    }
-
-    #[test]
-    fn pins_and_volume_do_not_own_status_text_bands() {
-        let ui_layout = layout(SCREEN_BOUNDS);
-
-        for body in [ui_layout.pins.body, ui_layout.volume_page.body] {
-            assert_no_overlap(body, ui_layout.status.song_band);
-            assert_no_overlap(body, ui_layout.status.artist_band);
-        }
-    }
-
-    #[test]
-    fn volume_page_slots_do_not_overlap() {
-        let ui_layout = layout(SCREEN_BOUNDS);
-        let volume = ui_layout.volume_page;
-
-        assert_no_overlap(volume.title_slot, volume.value_slot);
-        assert_no_overlap(volume.value_slot, volume.controls_slot);
-        assert_no_overlap(volume.title_slot, volume.controls_slot);
-    }
-
-    #[test]
-    fn primary_elements_are_centered() {
-        let ui_layout = layout(SCREEN_BOUNDS);
-        let center_x = SCREEN_BOUNDS.top_left.x + (SCREEN_BOUNDS.size.width / 2) as i32;
-
-        assert_eq!(ui_layout.status.song_origin.x, center_x);
-        assert_eq!(ui_layout.status.artist_origin.x, center_x);
-        assert_eq!(rect_visual_center(ui_layout.status.play_button).x, center_x);
-        assert_eq!(
-            ui_layout.status.timer_origin.x + DURATION_WIDTH / 2,
-            center_x
-        );
-        assert_eq!(
-            ui_layout.status.progress.top_left.x
-                + (ui_layout.status.progress.size.width / 2) as i32,
-            center_x
-        );
-    }
-
-    #[test]
-    fn page_content_stays_inside_the_panel() {
-        let ui_layout = layout(SCREEN_BOUNDS);
-        let panel_right = SCREEN_BOUNDS.top_left.x + SCREEN_BOUNDS.size.width as i32;
-        let panel_bottom = SCREEN_BOUNDS.top_left.y + SCREEN_BOUNDS.size.height as i32;
-
-        // Every control plus the focus ring drawn around it has to fit; the
-        // ring is the widest thing on screen once a pad user is driving.
-        let ring = FOCUS_RING_INSET + FOCUS_RING_STROKE as i32;
-        let mut controls = alloc::vec![
-            ui_layout.status.previous_button,
-            ui_layout.status.play_button,
-            ui_layout.status.next_button,
-            ui_layout.volume_page.decrement_button,
-            ui_layout.volume_page.increment_button,
-        ];
-        controls.extend_from_slice(&ui_layout.pins.buttons);
-
-        for control in controls {
-            assert!(
-                control.top_left.x - ring >= SCREEN_BOUNDS.top_left.x
-                    && control.top_left.y - ring >= SCREEN_BOUNDS.top_left.y
-                    && rect_right(control) + ring <= panel_right
-                    && rect_bottom(control) + ring <= panel_bottom,
-                "control {control:?} plus focus ring escapes the panel"
+        for slot in 0..CHOICES_VISIBLE {
+            let mut title = String::new();
+            let _ = title.push_str("Choice");
+            pins.set(
+                slot,
+                HifiPin {
+                    id: slot as u32 + 1,
+                    title,
+                },
             );
         }
-
-        assert!(rect_bottom(ui_layout.volume.bar) <= panel_bottom);
-        // The ambient volume bar sits below every page body, so a page change
-        // clearing its body must not erase it.
-        assert!(ui_layout.volume.bar.top_left.y >= rect_bottom(ui_layout.page_body));
+        pins
     }
 
-    fn rect_right(rect: Rectangle) -> i32 {
-        rect.top_left.x + rect.size.width as i32
+    fn on_choices() -> State {
+        let mut state = State::new(0);
+        state.intercept_button(Button::Back, 0);
+        state
     }
 
-    /// The scratch-blit fast-path requires 2-px aligned bounds — for direct
-    /// (non-scratch) widgets the display driver handles alignment per-primitive,
-    /// so they are exempt. Today only the text bands are scratched.
+    // ---- layout ----
+
     #[test]
-    fn scratched_widget_bounds_are_two_aligned() {
+    fn every_layout_rect_is_two_aligned() {
         let ui_layout = layout(SCREEN_BOUNDS);
-        for bounds in [ui_layout.status.song_band, ui_layout.status.artist_band] {
+        let np = ui_layout.now_playing;
+        for rect in [
+            np.artwork,
+            np.title_band,
+            np.artist_band,
+            np.progress,
+            np.overlay_panel,
+            np.overlay_value,
+            np.overlay_track,
+            ui_layout.choices.header_band,
+        ] {
+            assert!(is_two_aligned(rect), "not 2-px aligned: {rect:?}");
+        }
+        for slot in 0..CHOICES_VISIBLE {
+            for rect in [
+                ui_layout.choices.tiles[slot],
+                ui_layout.choices.tile_art[slot],
+                ui_layout.choices.tile_caption[slot],
+            ] {
+                assert!(is_two_aligned(rect), "not 2-px aligned: {rect:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_layout_rect_fits_the_panel() {
+        let ui_layout = layout(SCREEN_BOUNDS);
+        let np = ui_layout.now_playing;
+        let mut rects: Vec<Rectangle> = Vec::new();
+        rects.extend_from_slice(&[
+            np.artwork,
+            np.title_band,
+            np.artist_band,
+            np.progress,
+            np.overlay_panel,
+            np.overlay_track,
+            ui_layout.choices.header_band,
+        ]);
+        rects.extend_from_slice(&ui_layout.choices.tiles);
+        for rect in rects {
+            let right = rect.top_left.x + rect.size.width as i32;
+            let bottom = rect.top_left.y + rect.size.height as i32;
             assert!(
-                is_two_aligned(bounds),
-                "scratched bounds {bounds:?} are not 2-px aligned"
+                rect.top_left.x >= 0
+                    && rect.top_left.y >= 0
+                    && right <= SCREEN_BOUNDS.size.width as i32
+                    && bottom <= SCREEN_BOUNDS.size.height as i32,
+                "escapes the panel: {rect:?}"
             );
         }
     }
 
     #[test]
-    fn state_advances_live_elapsed_time_while_playing() {
-        let mut state = State::new(0);
-        let mut status = HifiStatus::waiting();
-        status.playback = PlaybackState::Playing;
-        status.duration_seconds = 120;
-        status.elapsed_seconds = 10;
-        state.apply_status(status, 0);
-
-        assert!(state.on_tick(1_000));
-        assert_eq!(state.status.elapsed_seconds, 11);
-    }
-
-    #[test]
-    fn paused_state_does_not_advance_elapsed_time() {
-        let mut state = State::new(0);
-        let mut status = HifiStatus::waiting();
-        status.playback = PlaybackState::Paused;
-        status.duration_seconds = 120;
-        status.elapsed_seconds = 10;
-        state.apply_status(status, 0);
-
-        assert!(!state.on_tick(5_000));
-        assert_eq!(state.status.elapsed_seconds, 10);
-    }
-
-    #[test]
-    fn buffering_state_animates_without_advancing_elapsed_time() {
-        let mut state = State::new(0);
-        let mut status = HifiStatus::waiting();
-        status.playback = PlaybackState::Buffering;
-        status.duration_seconds = 120;
-        status.elapsed_seconds = 10;
-        state.apply_status(status, 0);
-
-        assert!(state.on_tick(120));
-        assert_eq!(state.status.elapsed_seconds, 10);
-    }
-
-    #[test]
-    fn loading_spinner_requests_frames_until_status_arrives() {
-        let mut state = State::new(0);
-
-        assert!(state.on_tick(100));
-        assert!(state.loading);
-
-        let mut status = HifiStatus::empty();
-        status.title.push_str("Caroline").unwrap();
-        assert!(state.apply_status(status, 200));
-        assert!(!state.loading);
-    }
-
-    #[test]
-    fn volume_only_status_finishes_loading() {
-        let mut state = State::new(0);
-        let mut status = HifiStatus::empty();
-        status.volume_percent = 42;
-
-        assert!(state.apply_status(status, 200));
-        assert!(!state.loading);
-    }
-
-    #[test]
-    fn loading_spinner_times_out() {
-        let mut state = State::new(0);
-
-        assert!(state.on_tick(LOADING_TIMEOUT_MS));
-        assert!(!state.loading);
-    }
-
-    #[test]
-    fn spinner_smart_skips_when_phase_unchanged() {
-        use core::cell::Cell;
-
-        struct Counting {
-            calls: Cell<u32>,
-        }
-
-        impl OriginDimensions for Counting {
-            fn size(&self) -> Size {
-                Size::new(466, 466)
+    fn tiles_do_not_overlap() {
+        let tiles = layout(SCREEN_BOUNDS).choices.tiles;
+        for a in 0..CHOICES_VISIBLE {
+            for b in (a + 1)..CHOICES_VISIBLE {
+                let (first, second) = (tiles[a], tiles[b]);
+                let overlaps = first.top_left.x < second.top_left.x + second.size.width as i32
+                    && second.top_left.x < first.top_left.x + first.size.width as i32
+                    && first.top_left.y < second.top_left.y + second.size.height as i32
+                    && second.top_left.y < first.top_left.y + first.size.height as i32;
+                assert!(!overlaps, "tiles {a} and {b} overlap");
             }
         }
-
-        impl DrawTarget for Counting {
-            type Color = Rgb565;
-            type Error = core::convert::Infallible;
-
-            fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
-            where
-                I: IntoIterator<Item = Pixel<Self::Color>>,
-            {
-                self.calls
-                    .set(self.calls.get() + pixels.into_iter().count() as u32);
-                Ok(())
-            }
-        }
-
-        let spinner = Spinner {
-            center: Point::new(100, 100),
-            phase: 3,
-            previous_phase: Some(3),
-        };
-        let mut t = Counting {
-            calls: Cell::new(0),
-        };
-        spinner.draw(&mut t).unwrap();
-        assert_eq!(t.calls.get(), 0, "spinner should smart-skip on equal phase");
     }
 
     #[test]
-    fn song_text_lands_non_black_pixels_in_band() {
-        let layout = layout(SCREEN_BOUNDS);
-        let mut cache = RenderCache::new(&layout);
-        let mut state = State::new(0);
-        let mut status = HifiStatus::empty();
-        status.title.push_str("Caroline").unwrap();
-        status.playback = PlaybackState::Playing;
-        state.apply_status(status.clone(), 100);
-
-        let mut display = TestDisplay::new(466, 466);
-        let mut scratch = std::vec![Rgb565::BLACK; crate::ui::RECOMMENDED_SCRATCH_PIXELS];
-
-        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
-
-        let band = layout.status.song_band;
-        let mut non_black = 0_u32;
-        for y in band.top_left.y..band.top_left.y + band.size.height as i32 {
-            for x in band.top_left.x..band.top_left.x + band.size.width as i32 {
-                let idx = (y as usize * 466) + x as usize;
-                if display.pixels[idx] != Rgb565::BLACK {
-                    non_black += 1;
-                }
-            }
-        }
-        assert!(
-            non_black > 0,
-            "song band should contain text pixels (got 0 non-black)"
-        );
+    fn the_tile_row_pitch_stays_on_the_write_grid() {
+        // Scrolling will offset the grid by whole rows. An odd pitch would put
+        // every other row on an odd y and trip the painter's alignment rule.
+        let tiles = layout(SCREEN_BOUNDS).choices.tiles;
+        let pitch = tiles[CHOICES_COLS].top_left.y - tiles[0].top_left.y;
+        assert_eq!(pitch, 222);
+        assert_eq!(pitch % 2, 0);
     }
 
     #[test]
-    fn song_text_persists_across_unchanged_renders() {
-        let layout = layout(SCREEN_BOUNDS);
-        let mut cache = RenderCache::new(&layout);
-        let mut state = State::new(0);
-        let mut status = HifiStatus::empty();
-        status.title.push_str("Caroline").unwrap();
-        status.playback = PlaybackState::Playing;
-        state.apply_status(status, 100);
+    fn artwork_slot_matches_the_decoded_artwork_size() {
+        // The widget blits 1:1 from the artwork buffer, so a mismatch would
+        // silently crop the image or leave a border.
+        let artwork = layout(SCREEN_BOUNDS).now_playing.artwork;
+        assert_eq!(artwork.size.width, HIFI_ARTWORK_SIZE);
+        assert_eq!(artwork.size.height, HIFI_ARTWORK_SIZE);
+    }
 
-        let mut display = TestDisplay::new(466, 466);
-        let mut scratch = std::vec![Rgb565::BLACK; crate::ui::RECOMMENDED_SCRATCH_PIXELS];
+    #[test]
+    fn the_volume_readout_sits_inside_the_artwork() {
+        let np = layout(SCREEN_BOUNDS).now_playing;
+        for rect in [np.overlay_panel, np.overlay_value, np.overlay_track] {
+            assert!(
+                rect.top_left.x >= np.artwork.top_left.x
+                    && rect.top_left.y >= np.artwork.top_left.y
+                    && rect.top_left.x + rect.size.width as i32
+                        <= np.artwork.top_left.x + np.artwork.size.width as i32
+                    && rect.top_left.y + rect.size.height as i32
+                        <= np.artwork.top_left.y + np.artwork.size.height as i32,
+                "readout escapes the artwork it restores from: {rect:?}"
+            );
+        }
+    }
 
-        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
-        let after_first = count_non_black(&display, layout.status.song_band);
-        assert!(after_first > 0, "first render should draw the title");
+    // ---- pad binding ----
 
-        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
-        let after_second = count_non_black(&display, layout.status.song_band);
+    #[test]
+    fn now_playing_publishes_no_focus_targets() {
+        let state = State::new(0);
+        assert_eq!(state.page(), HifiPage::NowPlaying);
+        assert!(state.focus_targets(&layout(SCREEN_BOUNDS)).is_empty());
+    }
+
+    #[test]
+    fn choices_publishes_only_the_visible_tiles() {
+        let state = on_choices();
         assert_eq!(
-            after_first, after_second,
-            "second render with unchanged title must preserve text pixels"
+            state.focus_targets(&layout(SCREEN_BOUNDS)).len(),
+            CHOICES_VISIBLE
         );
     }
 
     #[test]
-    fn loading_spinner_pixels_are_cleared_on_transition_out_of_loading() {
-        let layout = layout(SCREEN_BOUNDS);
-        let mut cache = RenderCache::new(&layout);
-        let mut state = State::new(0);
-        let mut display = TestDisplay::new(466, 466);
-        let mut scratch = std::vec![Rgb565::BLACK; crate::ui::RECOMMENDED_SCRATCH_PIXELS];
-
-        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
-        assert!(state.loading);
-
-        let mut status = HifiStatus::empty();
-        status.title.push_str("Caroline").unwrap();
-        status.artist.push_str("Jacob Banks").unwrap();
-        status.playback = PlaybackState::Paused;
-        state.apply_status(status, 200);
-        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
-        assert!(!state.loading);
-
-        let slot_bottom =
-            layout.status.play_button.top_left.y + layout.status.play_button.size.height as i32;
-        let progress_top = layout.status.progress.top_left.y;
-        let x_lo = layout.status.play_button.top_left.x;
-        let x_hi =
-            layout.status.play_button.top_left.x + layout.status.play_button.size.width as i32;
-        for y in slot_bottom..progress_top.min(slot_bottom + 24) {
-            for x in x_lo..x_hi {
-                if layout.status.timer_bounds.contains(Point::new(x, y)) {
-                    continue;
-                }
-                let idx = (y as usize * 466) + x as usize;
-                assert_eq!(
-                    display.pixels[idx],
-                    Rgb565::BLACK,
-                    "ghost spinner pixel at ({x}, {y}) below play-button slot"
-                );
-            }
-        }
+    fn up_and_down_change_volume_in_one_press() {
+        let mut state = state_with_track(0);
+        let outcome = state.intercept_button(Button::Up, 0).expect("consumed");
+        assert_eq!(outcome.command, Some(Command::SetVolume { volume: 32 }));
+        let outcome = state.intercept_button(Button::Down, 0).expect("consumed");
+        assert_eq!(outcome.command, Some(Command::SetVolume { volume: 30 }));
     }
 
     #[test]
-    fn volume_value_redraw_preserves_button_controls() {
-        let layout = layout(SCREEN_BOUNDS);
-        let mut cache = RenderCache::new(&layout);
+    fn volume_clamps_at_the_receiver_maximum() {
+        let mut state = state_with_track(0);
+        for _ in 0..80 {
+            state.intercept_button(Button::Up, 0);
+        }
+        assert_eq!(state.status.volume_percent, HIFI_VOLUME_MAX);
+        for _ in 0..80 {
+            state.intercept_button(Button::Down, 0);
+        }
+        assert_eq!(state.status.volume_percent, 0);
+    }
+
+    #[test]
+    fn right_is_always_the_next_track() {
+        let mut state = state_with_track(90);
+        let outcome = state.intercept_button(Button::Right, 0).expect("consumed");
+        assert_eq!(outcome.command, Some(Command::NextTrack));
+    }
+
+    #[test]
+    fn left_restarts_once_past_the_threshold_then_goes_back() {
+        let mut state = state_with_track(RESTART_THRESHOLD_SECONDS);
+
+        // Far enough in: rewind rather than skip.
+        let outcome = state.intercept_button(Button::Left, 0).expect("consumed");
+        assert_eq!(outcome.command, Some(Command::Restart));
+        assert_eq!(state.status.elapsed_seconds, 0);
+        // The track did not change, so its metadata survives.
+        assert_eq!(state.status.title.as_str(), "Yellow Submarine");
+
+        // Restarting zeroed the clock, so the very next press falls through to
+        // the previous track — no timer, no second mechanism.
+        let outcome = state.intercept_button(Button::Left, 0).expect("consumed");
+        assert_eq!(outcome.command, Some(Command::PreviousTrack));
+    }
+
+    #[test]
+    fn left_goes_back_immediately_near_the_start_of_a_track() {
+        let mut state = state_with_track(RESTART_THRESHOLD_SECONDS - 1);
+        let outcome = state.intercept_button(Button::Left, 0).expect("consumed");
+        assert_eq!(outcome.command, Some(Command::PreviousTrack));
+    }
+
+    #[test]
+    fn select_toggles_playback() {
+        let mut state = state_with_track(10);
+        let outcome = state.intercept_button(Button::Select, 0).expect("consumed");
+        assert_eq!(outcome.command, Some(Command::TogglePlayback));
+        assert_eq!(state.status.playback, PlaybackState::Paused);
+
+        let outcome = state.intercept_button(Button::Select, 0).expect("consumed");
+        assert_eq!(outcome.command, Some(Command::TogglePlayback));
+        assert_eq!(state.status.playback, PlaybackState::Playing);
+    }
+
+    #[test]
+    fn back_toggles_between_the_two_screens_and_never_leaves() {
         let mut state = State::new(0);
-        let mut status = HifiStatus::empty();
-        status.volume_percent = 23;
-        state.apply_status(status.clone(), 100);
-        state.cycle_page();
-        state.cycle_page(); // -> Volume
+        let outcome = state.intercept_button(Button::Back, 0).expect("consumed");
+        assert!(outcome.page_changed);
+        assert_eq!(state.page(), HifiPage::Choices);
 
-        let mut display = TestDisplay::new(466, 466);
-        let mut scratch = std::vec![Rgb565::BLACK; crate::ui::RECOMMENDED_SCRATCH_PIXELS];
-        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
+        let outcome = state.intercept_button(Button::Back, 0).expect("consumed");
+        assert!(outcome.page_changed);
+        assert_eq!(state.page(), HifiPage::NowPlaying);
+    }
 
-        let button_probe = Point::new(
-            layout.volume_page.decrement_button.center().x,
-            layout.volume_page.decrement_button.top_left.y + 2,
+    #[test]
+    fn choices_leaves_the_directions_and_select_to_the_focus_ring() {
+        let mut state = on_choices();
+        for button in [
+            Button::Up,
+            Button::Down,
+            Button::Left,
+            Button::Right,
+            // Select is replayed as a tap on the focused tile, so it also
+            // falls through rather than being intercepted.
+            Button::Select,
+        ] {
+            assert!(
+                state.intercept_button(button, 0).is_none(),
+                "{button:?} should fall through to the focus path"
+            );
+        }
+    }
+
+    // ---- volume readout ----
+
+    #[test]
+    fn volume_readout_appears_on_change_and_lapses_on_its_own() {
+        let mut state = state_with_track(0);
+        state.intercept_button(Button::Up, 1_000);
+        assert!(state.volume_overlay_until_ms.is_some());
+
+        // Still up just before the timeout.
+        state.on_tick(1_000 + VOLUME_OVERLAY_MS - 1);
+        assert!(state.volume_overlay_until_ms.is_some());
+
+        // The tick that lapses it must request a frame, or the readout would
+        // stay on the panel until something unrelated forced a repaint.
+        let redraw = state.on_tick(1_000 + VOLUME_OVERLAY_MS);
+        assert!(redraw);
+        assert!(state.volume_overlay_until_ms.is_none());
+    }
+
+    #[test]
+    fn volume_readout_appears_even_when_the_level_cannot_move() {
+        let mut state = state_with_track(0);
+        state.status.volume_percent = HIFI_VOLUME_MAX;
+        let outcome = state.intercept_button(Button::Up, 0).expect("consumed");
+        // Nothing to send — but the press was real, so it still shows.
+        assert_eq!(outcome.command, None);
+        assert!(state.volume_overlay_until_ms.is_some());
+    }
+
+    // ---- choices ----
+
+    #[test]
+    fn tapping_a_tile_plays_it_and_returns_to_now_playing() {
+        let mut state = on_choices();
+        state.apply_pins(filled_pins());
+
+        let ui_layout = layout(SCREEN_BOUNDS);
+        let command = state.handle_touch(&ui_layout, ui_layout.choices.tiles[2].center(), 0);
+        assert_eq!(command, Some(Command::InvokePinId { id: 3 }));
+        assert_eq!(state.page(), HifiPage::NowPlaying);
+    }
+
+    #[test]
+    fn an_untitled_pin_is_labelled_by_id_not_called_empty() {
+        // The device answered GetIdArray but not ReadList. That is a fault to
+        // surface, not an unconfigured slot to hide.
+        let mut pins = HifiPins::new();
+        pins.set(
+            0,
+            HifiPin {
+                id: 4711,
+                title: String::new(),
+            },
         );
-        assert_ne!(display.pixel_at(button_probe), Rgb565::BLACK);
-
-        status.volume_percent = 24;
-        state.apply_status(status, 200);
-        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
-
-        assert_ne!(display.pixel_at(button_probe), Rgb565::BLACK);
-    }
-
-    fn count_non_black(display: &TestDisplay, band: Rectangle) -> u32 {
-        let mut count = 0;
-        for y in band.top_left.y..band.top_left.y + band.size.height as i32 {
-            for x in band.top_left.x..band.top_left.x + band.size.width as i32 {
-                let idx = (y as usize * 466) + x as usize;
-                if display.pixels[idx] != Rgb565::BLACK {
-                    count += 1;
-                }
-            }
-        }
-        count
+        assert_eq!(tile_label(0, pins.get(0)).as_str(), "Pin 4711");
+        assert_eq!(tile_label(1, pins.get(1)).as_str(), "Empty 2");
     }
 
     #[test]
-    fn artist_text_lands_non_black_pixels_in_band() {
-        let layout = layout(SCREEN_BOUNDS);
-        let mut cache = RenderCache::new(&layout);
-        let mut state = State::new(0);
-        let mut status = HifiStatus::empty();
-        status.title.push_str("Caroline").unwrap();
-        status.artist.push_str("Jacob Banks").unwrap();
-        status.playback = PlaybackState::Playing;
-        state.apply_status(status, 100);
+    fn a_titled_pin_is_labelled_by_its_title() {
+        let pins = filled_pins();
+        assert_eq!(tile_label(0, pins.get(0)).as_str(), "Choice");
+    }
 
-        let mut display = TestDisplay::new(466, 466);
-        let mut scratch = std::vec![Rgb565::BLACK; crate::ui::RECOMMENDED_SCRATCH_PIXELS];
+    #[test]
+    fn tapping_an_empty_tile_does_nothing() {
+        let mut state = on_choices();
+        let ui_layout = layout(SCREEN_BOUNDS);
+        assert_eq!(
+            state.handle_touch(&ui_layout, ui_layout.choices.tiles[0].center(), 0),
+            None
+        );
+        assert_eq!(state.page(), HifiPage::Choices);
+    }
 
-        render(&mut state, &mut cache, &mut display, &mut scratch, &layout).unwrap();
-
-        let band = layout.status.artist_band;
-        let mut non_black = 0_u32;
-        for y in band.top_left.y..band.top_left.y + band.size.height as i32 {
-            for x in band.top_left.x..band.top_left.x + band.size.width as i32 {
-                let idx = (y as usize * 466) + x as usize;
-                if display.pixels[idx] != Rgb565::BLACK {
-                    non_black += 1;
-                }
-            }
+    #[test]
+    fn now_playing_ignores_touch_entirely() {
+        let mut state = state_with_track(10);
+        let ui_layout = layout(SCREEN_BOUNDS);
+        for point in [
+            ui_layout.now_playing.artwork.center(),
+            ui_layout.now_playing.title_band.center(),
+            ui_layout.now_playing.progress.center(),
+            Point::new(0, 0),
+        ] {
+            assert_eq!(state.handle_touch(&ui_layout, point, 0), None);
         }
+        assert_eq!(state.status.playback, PlaybackState::Playing);
+    }
+
+    // ---- helpers ----
+
+    #[test]
+    fn progress_fills_proportionally() {
+        assert_eq!(progress_filled_px(0, 100, 330), 0);
+        assert_eq!(progress_filled_px(50, 100, 330), 165);
+        assert_eq!(progress_filled_px(100, 100, 330), 330);
+        // Nothing to divide by is not a panic.
+        assert_eq!(progress_filled_px(10, 0, 330), 0);
+    }
+
+    #[test]
+    fn the_paused_badge_sits_inside_the_artwork_it_restores_from() {
+        // It is drawn over the artwork and erased by re-blitting that region,
+        // so a badge hanging outside the artwork would leave a hole.
+        let np = layout(SCREEN_BOUNDS).now_playing;
+        assert!(is_two_aligned(np.pause_badge));
         assert!(
-            non_black > 0,
-            "artist band should contain text pixels (got 0 non-black)"
+            np.pause_badge.top_left.x >= np.artwork.top_left.x
+                && np.pause_badge.top_left.y >= np.artwork.top_left.y
+                && np.pause_badge.top_left.x + np.pause_badge.size.width as i32
+                    <= np.artwork.top_left.x + np.artwork.size.width as i32
+                && np.pause_badge.top_left.y + np.pause_badge.size.height as i32
+                    <= np.artwork.top_left.y + np.artwork.size.height as i32
         );
     }
 
-    /// Vec-backed DrawTarget for tests that need to inspect the rendered
-    /// pixel buffer at full display resolution.
-    struct TestDisplay {
-        width: u32,
-        height: u32,
-        pixels: std::vec::Vec<Rgb565>,
-    }
-
-    impl TestDisplay {
-        fn new(width: u32, height: u32) -> Self {
-            Self {
-                width,
-                height,
-                pixels: std::vec![Rgb565::BLACK; (width * height) as usize],
-            }
-        }
-
-        fn pixel_at(&self, point: Point) -> Rgb565 {
-            self.pixels[(point.y as u32 * self.width + point.x as u32) as usize]
-        }
-    }
-
-    impl OriginDimensions for TestDisplay {
-        fn size(&self) -> Size {
-            Size::new(self.width, self.height)
-        }
-    }
-
-    impl DrawTarget for TestDisplay {
-        type Color = Rgb565;
-        type Error = core::convert::Infallible;
-
-        fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
-        where
-            I: IntoIterator<Item = Pixel<Self::Color>>,
-        {
-            for Pixel(point, color) in pixels {
-                if point.x < 0 || point.y < 0 {
-                    continue;
-                }
-                let x = point.x as u32;
-                let y = point.y as u32;
-                if x >= self.width || y >= self.height {
-                    continue;
-                }
-                let idx = (y * self.width + x) as usize;
-                self.pixels[idx] = color;
-            }
-            Ok(())
-        }
-    }
-
     #[test]
-    fn volume_arc_smart_skips_when_percent_unchanged() {
-        use core::cell::Cell;
-
-        struct Counting {
-            calls: Cell<u32>,
-        }
-
-        impl OriginDimensions for Counting {
-            fn size(&self) -> Size {
-                Size::new(466, 466)
-            }
-        }
-
-        impl DrawTarget for Counting {
-            type Color = Rgb565;
-            type Error = core::convert::Infallible;
-
-            fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
-            where
-                I: IntoIterator<Item = Pixel<Self::Color>>,
-            {
-                self.calls
-                    .set(self.calls.get() + pixels.into_iter().count() as u32);
-                Ok(())
-            }
-        }
-
-        let bar = VolumeBar {
-            bar: layout(SCREEN_BOUNDS).volume.bar,
-            track_color: VOLUME_TRACK,
-            active_color: VOLUME_ACTIVE,
-            percent: 50,
-            previous_percent: Some(50),
-        };
-        let mut t = Counting {
-            calls: Cell::new(0),
-        };
-        assert!(!bar.should_draw(), "volume bar should smart-skip");
-        bar.draw(&mut t).unwrap();
-        assert_eq!(t.calls.get(), 0, "volume bar should smart-skip");
-    }
-
-    #[test]
-    fn volume_bar_full_at_max_volume() {
-        let width = layout(SCREEN_BOUNDS).volume.bar.size.width;
-
-        // Volume at HIFI_VOLUME_MAX fills the bar completely.
-        assert_eq!(filled_width_for_volume(HIFI_VOLUME_MAX, width), width);
-        // And anything beyond max also caps at full.
-        assert_eq!(filled_width_for_volume(HIFI_VOLUME_MAX + 10, width), width);
-        // Zero volume leaves it empty.
-        assert_eq!(filled_width_for_volume(0, width), 0);
+    fn the_volume_readout_covers_the_paused_badge_completely() {
+        // Both are centred on the artwork. If the readout did not cover the
+        // badge, lapsing it would restore artwork over half a pause glyph.
+        let np = layout(SCREEN_BOUNDS).now_playing;
+        assert!(
+            np.overlay_panel.top_left.x <= np.pause_badge.top_left.x
+                && np.overlay_panel.top_left.y <= np.pause_badge.top_left.y
+                && np.overlay_panel.top_left.x + np.overlay_panel.size.width as i32
+                    >= np.pause_badge.top_left.x + np.pause_badge.size.width as i32
+                && np.overlay_panel.top_left.y + np.overlay_panel.size.height as i32
+                    >= np.pause_badge.top_left.y + np.pause_badge.size.height as i32
+        );
     }
 }

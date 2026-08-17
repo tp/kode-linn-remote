@@ -51,10 +51,12 @@ cargo run -p sim
 Controls:
 
 - Click inside the display area to send a tap to the shared app core.
-- Drive the on-screen directional pad, or use the **arrow keys**. The pad moves
-  a focus ring between the controls on the current screen.
-- **Select** (or Return) activates the focused control; **Back** (or Escape)
-  goes up one level.
+- Drive the on-screen directional pad, or use the **arrow keys**.
+- On the launcher and the music picker the pad moves a focus ring between
+  controls, and **Select** (or Return) activates the focused one.
+- On Now Playing the pad acts directly: up/down are volume, left/right are the
+  track, and **Select** is play/pause. **Back** (or Escape) goes up one level,
+  or switches between Now Playing and the picker.
 - Use the network dropdown to choose the mocked network status.
 - `Advance +1s` adds a manual tick; `Zoom 2x` enlarges the framebuffer without
   changing what the embedded renderer produces.
