@@ -1,0 +1,23 @@
+{
+  // Separate target dir for rust-analyzer so it doesn't fight cargo build/test for the lock.
+  "rust-analyzer.cargo.targetDir": true,
+
+  // Skip the `firmware` crate in rust-analyzer's check and build-script discovery.
+  // esp-hal's build.rs panics when invoked for the host target, which breaks
+  // rust-analyzer's project load. Cargo metadata (used for the project model)
+  // still includes firmware, so navigation across crates keeps working.
+  // When firmware grows past the stub, the real fix is splitting it into its
+  // own sub-workspace with `.cargo/config.toml` setting the riscv32 target.
+  "rust-analyzer.cargo.buildScripts.overrideCommand": [
+    "cargo", "check",
+    "--quiet", "--workspace", "--exclude", "firmware",
+    "--keep-going",
+    "--message-format=json"
+  ],
+  "rust-analyzer.check.overrideCommand": [
+    "cargo", "check",
+    "--quiet", "--workspace", "--exclude", "firmware",
+    "--keep-going",
+    "--message-format=json-diagnostic-rendered-ansi"
+  ]
+}

@@ -52,14 +52,14 @@ The first real board task should be display and touch bring-up for the CO5300 AM
 
 Each platform provides network primitives, not Linn behavior:
 
-- `TcpConnector::connect(endpoint) -> ByteStream`
-- `ByteStream::read`, `write_all`, and `flush`
+- `AsyncTcpConnector::connect(endpoint) -> embedded-io-async stream`
+- `embedded_io_async::Read`, `Write`, and `ErrorType`
 
-The host simulator implements those traits with `std::net::TcpStream`. Firmware should implement the same traits using `esp-wifi` and `embassy-net` sockets. Shared controllers then layer protocol behavior on top.
+The host simulator implements those traits with `std::net::TcpStream`. Firmware uses `esp-radio` and `embassy-net` sockets directly in its constrained event loop, while shared runtime code layers LPEC protocol behavior and artwork loading on embedded async I/O streams.
 
 Local, changing, or secret values should not be hard-coded in platform crates. Use `config/local.env` for development values such as `LINN_HOST`, `LINN_LPEC_PORT`, `WIFI_SSID`, and `WIFI_PASSWORD`. The simulator loads that file through `app-config`; firmware can later use the same parser with build-time generated input or non-volatile storage.
 
 For Linn control there are two protocol lanes:
 
-- LPEC: a small TCP line protocol. `app-runtime::lpec` owns the LPEC startup sync and CRLF line framing, and `linn-lpec` owns command formatting/parsing.
+- LPEC: a small TCP line protocol. `app-runtime::lpec` owns the async session state, CRLF line framing, shared artwork loading, and `linn-lpec` owns command formatting/parsing.
 - CI Gateway: JSON over WebSocket with HTTP setup/documentation. `linn-ci-gateway` owns the request envelope and V2 paths. Add a CI Gateway `HifiController` implementation rather than changing `app-core`. The likely firmware stack is `esp-wifi` + `embassy-net` + an embedded HTTP/WebSocket client, with fixed-size buffers.

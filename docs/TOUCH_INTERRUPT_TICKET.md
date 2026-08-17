@@ -1,0 +1,37 @@
+# Touch interrupt follow-up
+
+Status: deferred until remaining firmware hardware bring-up is complete
+
+Replace the current FT6146 polling bring-up path with interrupt-driven touch handling for lower idle power use. Polling currently works and is useful for validating I2C access, coordinates, and app-core touch events, but constant 50 ms polling should not be the final battery-oriented design.
+
+## Context
+
+The firmware currently polls the FT6146 over the shared I2C bus and emits `app-core` `TouchDown`/`TouchUp` events on state transitions. This keeps repeated button activation under control and has been verified on-device, but it wakes the CPU and uses the I2C bus continuously even when the user is not touching the screen.
+
+The FT6146 should expose an interrupt signal when touch state changes. We should use that signal once the rest of the board hardware is integrated enough that GPIO ownership and low-power behavior can be designed cleanly.
+
+## Proposed Design
+
+- Confirm the FT6146 interrupt pin from the Waveshare schematic or demo source.
+- Add the touch interrupt pin to board-support documentation/constants.
+- Configure the interrupt pin as an input with the correct pull mode and edge trigger.
+- Keep the current FT6146 I2C register reader and touch transition logic.
+- Use the interrupt to start an active-touch polling window.
+- Poll at a short interval only while touch is active, so movement/release can be detected.
+- Return to idle after release.
+- Keep a slow fallback poll only if the interrupt line proves unreliable on this board.
+
+## Acceptance Criteria
+
+- Idle firmware does not poll FT6146 every 50 ms.
+- Touching the screen wakes the touch path through the interrupt pin.
+- The app still receives exactly one `TouchDown` per press and one `TouchUp` per release.
+- Launcher navigation and screen controls still work on hardware.
+- Sporadic FT6146 I2C NACKs are handled as dropped samples, not fatal errors.
+- Verification passes with `cargo fmt --check`, `cargo check`, `cargo test -p app-core`, and `cargo check -p firmware --target riscv32imac-unknown-none-elf --release`.
+
+## Notes
+
+- Do not start this before the remaining hardware integrations clarify GPIO usage.
+- Avoid changing app-core semantics unless needed; this should mostly be firmware and board-support work.
+- Keep polling mode available behind a small fallback path or compile-time option until interrupt behavior is proven stable.

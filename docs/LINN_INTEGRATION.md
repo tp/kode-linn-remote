@@ -16,7 +16,7 @@ The first real use case is Qobuz playback status and track metadata. That makes 
 
 Treat LPEC as the low-level fallback protocol. LPEC is not an industry standard; it is Linn's custom Linn Products Event Control protocol. It is still useful because Linn documents it as a small TCP line protocol on port 23 that maps onto the same UPnP services used by DS/DSM products.
 
-The new `linn-lpec` crate keeps the LPEC command format, message parser, and synchronous client wrapper `no_std`. `app-runtime` wraps it as one `HifiController` implementation. Firmware can provide a TCP connector with the ESP networking stack; the simulator uses a host TCP connector for development.
+The `linn-lpec` crate keeps the LPEC command format and message parser `no_std`. `app-runtime` wraps that protocol as an async session-backed `HifiController`, plus shared HTTP/JPEG artwork loading through Zune. The simulator provides an async host TCP connector for development; firmware uses its `embassy-net` sockets directly in the constrained runtime loop while still reusing the shared LPEC and artwork code.
 
 The new `linn-ci-gateway` crate contains the CI Gateway WebSocket request paths and JSON request builders from the DSM-hosted Swagger schema. The page at `http://192.168.7.218:4100/res/api.html?socket=ws%3A%2F%2F192.168.7.218%3A8088%2Fws#!/API_V2/post_V2_transport_play` loads `/api/swagger.yaml` through the WebSocket-backed Swagger UI. The relevant V2 request envelope is a JSON object with `requestPath`, `session`, `room`, optional `tag`, and optional `update`.
 
