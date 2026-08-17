@@ -25,7 +25,7 @@
 //! [`UNIT`] units, so sample centres land on whole numbers and every inside
 //! test stays exact.
 
-use embedded_graphics::{pixelcolor::Rgb565, prelude::*, primitives::Rectangle};
+use embedded_graphics::{Pixel, pixelcolor::Rgb565, prelude::*, primitives::Rectangle};
 
 /// Sample points per axis. 4x4 gives 17 coverage levels.
 const SAMPLES: i32 = 4;
@@ -305,12 +305,17 @@ fn coverage(shape: &impl Shape, x: i32, y: i32) -> u32 {
     inside
 }
 
-/// Paints `bounds`, colouring each pixel by how much of it `shape` covers.
+/// Draws `shape` within `bounds`, touching only the pixels it actually covers.
 ///
-/// Emits whole rows through `fill_contiguous` so the pixel stream stays
-/// sequential, and never uses `fill_solid` — the panel snaps solid fills to an
-/// even-aligned window, which would smear the very edge pixels this is
-/// computing.
+/// Uncovered pixels are left alone rather than painted with `backdrop`. That
+/// matters whenever shapes overlap: the Wi-Fi icon is three concentric arcs,
+/// and filling each one's bounding box would let the smaller arcs punch
+/// rectangular bites out of the larger ones behind them. Partially covered
+/// pixels are still blended against `backdrop`, so this assumes the caller's
+/// declared backdrop is what lies underneath the shape's own edges.
+///
+/// Note this never uses `fill_solid`: the panel snaps solid fills to an
+/// even-aligned window, which would smear the very edge pixels being computed.
 fn draw_shape<D>(
     display: &mut D,
     bounds: Rectangle,
@@ -321,24 +326,14 @@ fn draw_shape<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    let width = bounds.size.width as usize;
-    if width == 0 {
-        return Ok(());
-    }
-
-    for row in 0..bounds.size.height as i32 {
-        let y = bounds.top_left.y + row;
-        let colors = (0..bounds.size.width as i32).map(|column| {
-            let x = bounds.top_left.x + column;
-            blend(foreground, backdrop, coverage(shape, x, y))
+    let pixels = bounds
+        .points()
+        .filter_map(|point| match coverage(shape, point.x, point.y) {
+            0 => None,
+            covered => Some(Pixel(point, blend(foreground, backdrop, covered))),
         });
-        display.fill_contiguous(
-            &Rectangle::new(Point::new(bounds.top_left.x, y), Size::new(width as u32, 1)),
-            colors,
-        )?;
-    }
 
-    Ok(())
+    display.draw_iter(pixels)
 }
 
 /// Filled rounded rectangle with an optional border, anti-aliased against

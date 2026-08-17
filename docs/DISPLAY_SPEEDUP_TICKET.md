@@ -12,7 +12,9 @@ The Kode Dot panel is a 2.13" AMOLED, 410x502 portrait. One full RGB565 frame is
 
 - **Transport.** The ESP32-S3 revision drove the panel through a CO5300 over QuadSPI. The ESP32-P4 has a MIPI-DSI host and may drive it differently, which would make the SPI/DMA work below moot.
 - **Memory budget.** Full double buffering was not realistic on the older internal-RAM budget. The Kode Dot has 32 MB of PSRAM, so two 402 KiB framebuffers are a rounding error against it. Much of the tile-based complexity below may simply be unnecessary — check that before porting any of it.
-- **Alignment.** The CO5300 required even-aligned write windows of at least two scanlines, and naive tile batching glitched text. `app-core`'s painter and the simulator's `Framebuffer::fill_solid` still enforce that rule. If the P4 revision uses a different controller, confirm whether the constraint still applies before relaxing it.
+- **Alignment — now a driver requirement, not just a caveat.** The CO5300 required even-aligned write windows of at least two scanlines, and the old driver had no framebuffer, so it satisfied that by widening each fill and painting the extra rows. That is lossy: a fill starting on an odd row grows upward over the row above it. The simulator reproduced this faithfully and it was silently eating the bottom row of glyphs whose ink ended on an even row, making bars and stems render about a pixel thin.
+
+  The Kode Dot's driver **must** therefore compose a full frame in PSRAM and blit it, aligning the blit window without disturbing its contents, rather than widening individual fills. With 32 MB available this costs nothing and removes the whole class of bug. The simulator now models that framebuffer behaviour; `app-core`'s painter still asserts 2-px alignment for scratch blits, which is a separate concern about where scratch buffers land.
 
 ### Proposed Design
 

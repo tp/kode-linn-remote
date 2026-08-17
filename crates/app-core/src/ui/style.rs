@@ -3,23 +3,70 @@ use embedded_graphics::{pixelcolor::Rgb565, prelude::RgbColor};
 pub(super) const CARD_RADIUS: u32 = 18;
 pub(super) const BUTTON_RADIUS: u32 = 18;
 
+/// Colours taken from the Kode Dot itself.
+///
+/// The device is a warm off-white shell with a black panel, one blue and one
+/// red button, and slate-grey UI chrome. Matching the hardware means the
+/// on-screen accents read as part of the same object rather than as a
+/// generic dark theme, and it gives the two control buttons an obvious
+/// on-screen counterpart.
+///
+/// Values are the sampled sRGB hex, quantised to Rgb565's 5/6/5 channels.
+/// Keep the hex in the comment: the quantised triples are unreadable, and
+/// re-deriving them by eye is how a palette drifts.
+pub(super) mod dot {
+    use embedded_graphics::pixelcolor::Rgb565;
+
+    /// `#2F7FC8` — the blue control button.
+    pub(in crate::ui) const BLUE: Rgb565 = Rgb565::new(6, 31, 24);
+    /// `#1E5A8F` — blue darkened for use as a large fill.
+    pub(in crate::ui) const BLUE_DEEP: Rgb565 = Rgb565::new(4, 22, 17);
+    /// `#E0523C` — the red control button.
+    pub(in crate::ui) const RED: Rgb565 = Rgb565::new(27, 20, 7);
+    /// `#8F2E1F` — red darkened for use as a large fill.
+    pub(in crate::ui) const RED_DEEP: Rgb565 = Rgb565::new(17, 11, 4);
+    /// `#F0EDE6` — the shell's warm off-white.
+    pub(in crate::ui) const SHELL: Rgb565 = Rgb565::new(29, 59, 28);
+    /// `#54697A` — the slate of the on-device UI chrome.
+    pub(in crate::ui) const SLATE: Rgb565 = Rgb565::new(10, 26, 15);
+    /// `#35434E` — slate dimmed, for borders.
+    pub(in crate::ui) const SLATE_DIM: Rgb565 = Rgb565::new(6, 17, 9);
+    /// `#141A1F` — slate at panel depth, barely lifted off black.
+    pub(in crate::ui) const SLATE_DEEP: Rgb565 = Rgb565::new(2, 6, 3);
+}
+
+/// True black, not a dark grey: unlit AMOLED pixels draw no power, so the
+/// background being genuinely off is a battery decision as much as a visual
+/// one. It also happens to match the panel's own bezel.
 pub(super) const OLED_BLACK: Rgb565 = Rgb565::BLACK;
-pub(super) const SURFACE: Rgb565 = Rgb565::new(1, 2, 3);
-pub(super) const SURFACE_BORDER: Rgb565 = Rgb565::new(5, 9, 11);
-pub(super) const TEXT_PRIMARY: Rgb565 = Rgb565::WHITE;
-pub(super) const TEXT_SECONDARY: Rgb565 = TEXT_PRIMARY;
-pub(super) const TEXT_DISABLED: Rgb565 = Rgb565::new(10, 18, 20);
-pub(super) const ACTION_START: Rgb565 = Rgb565::new(1, 30, 13);
-pub(super) const ACTION_START_BORDER: Rgb565 = Rgb565::new(7, 42, 20);
-pub(super) const ACTION_STOP: Rgb565 = Rgb565::new(24, 4, 6);
-pub(super) const ACTION_STOP_BORDER: Rgb565 = Rgb565::new(31, 13, 14);
-pub(super) const ACTION_INACTIVE: Rgb565 = Rgb565::new(3, 4, 6);
-pub(super) const ACTION_INACTIVE_BORDER: Rgb565 = Rgb565::new(7, 10, 13);
-pub(super) const VOLUME_TRACK: Rgb565 = Rgb565::new(9, 45, 31);
-pub(super) const VOLUME_ACTIVE: Rgb565 = Rgb565::new(0, 12, 27);
+
+pub(super) const SURFACE: Rgb565 = dot::SLATE_DEEP;
+pub(super) const SURFACE_BORDER: Rgb565 = dot::SLATE_DIM;
+
+/// Warm off-white rather than pure white, matching the shell. Pure white on
+/// true black is harsh at this pixel density.
+pub(super) const TEXT_PRIMARY: Rgb565 = dot::SHELL;
+pub(super) const TEXT_SECONDARY: Rgb565 = dot::SHELL;
+pub(super) const TEXT_DISABLED: Rgb565 = dot::SLATE;
+
+/// Primary action, carrying the blue button's colour.
+pub(super) const ACTION_START: Rgb565 = dot::BLUE_DEEP;
+pub(super) const ACTION_START_BORDER: Rgb565 = dot::BLUE;
+/// Destructive or stopping action, carrying the red button's colour.
+pub(super) const ACTION_STOP: Rgb565 = dot::RED_DEEP;
+pub(super) const ACTION_STOP_BORDER: Rgb565 = dot::RED;
+pub(super) const ACTION_INACTIVE: Rgb565 = dot::SLATE_DEEP;
+pub(super) const ACTION_INACTIVE_BORDER: Rgb565 = dot::SLATE_DIM;
+
+/// Volume bar. The track is the unfilled remainder and the active span is the
+/// current level, so the track must be the dimmer of the two — it was the
+/// brighter one while this was a ring on the round panel, which read as a
+/// full bar at zero volume.
+pub(super) const VOLUME_TRACK: Rgb565 = dot::SLATE_DIM;
+pub(super) const VOLUME_ACTIVE: Rgb565 = dot::BLUE;
 
 /// Ring drawn around the control the D-pad is currently on.
-pub(super) const FOCUS_RING: Rgb565 = Rgb565::new(20, 50, 28);
+pub(super) const FOCUS_RING: Rgb565 = dot::BLUE;
 /// Padding between a focused control's bounds and its ring.
 pub(super) const FOCUS_RING_INSET: i32 = 6;
 pub(super) const FOCUS_RING_STROKE: u32 = 3;

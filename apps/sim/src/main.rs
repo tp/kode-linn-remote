@@ -30,7 +30,7 @@ use embedded_graphics::{
     geometry::OriginDimensions,
     pixelcolor::{Rgb565, RgbColor},
     prelude::*,
-    primitives::{Circle, PrimitiveStyle, Rectangle},
+    primitives::{Circle, PrimitiveStyle},
 };
 use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
 use objc2::rc::Retained;
@@ -153,29 +153,21 @@ impl DrawTarget for Framebuffer {
         Ok(())
     }
 
-    /// Mirror the device's [`AmoledDisplay::fill_rect`] alignment: the
-    /// CO5300 panel only writes in even-X/even-Y windows of at least 2
-    /// scanlines, so a fill at, say, (5, 5, 10, 10) actually paints
-    /// (4, 4) through (15, 15) on hardware. Replicating the same expansion
-    /// here lets the sim catch widgets whose bounds drift off the 2-px
-    /// grid before they reach a real panel.
-    fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
-        let x_start = (area.top_left.x.max(0) as u32) & !1;
-        let y_start = (area.top_left.y.max(0) as u32) & !1;
-        let x_end_raw = (area.top_left.x as i64 + area.size.width as i64).max(0) as u32;
-        let y_end_raw = (area.top_left.y as i64 + area.size.height as i64).max(0) as u32;
-        let x_end = ((x_end_raw + 1) & !1).min(self.size.width);
-        let y_end = ((y_end_raw + 1) & !1).min(self.size.height);
-
-        for y in y_start..y_end {
-            for x in x_start..x_end {
-                let index = (y * self.size.width + x) as usize;
-                self.pixels[index] = color;
-            }
-        }
-        Ok(())
-    }
-
+    /// Fills are written exactly as asked.
+    ///
+    /// This used to snap fills out to an even-aligned window of at least two
+    /// scanlines, mirroring how the round board's driver drove its panel with
+    /// no framebuffer to compose in. That emulation actively destroyed
+    /// content: a glyph background fill starting on an odd row grows upward
+    /// and paints over the row above it, which silently ate the bottom row of
+    /// any glyph ending on an even row — visible as bars and stems rendering
+    /// about a pixel too thin.
+    ///
+    /// The Kode Dot has 32 MB of PSRAM, so its driver will compose a full
+    /// frame in memory and blit it, and can align the blit window without
+    /// disturbing what it contains. Modelling the old constraint here would
+    /// mean designing against a limitation this hardware does not have. See
+    /// docs/DISPLAY_SPEEDUP_TICKET.md.
     fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
         self.pixels.fill(color);
         Ok(())
