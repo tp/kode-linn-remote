@@ -1,0 +1,11 @@
+# Pin the toolchain so CI cannot go red on a commit nobody touched.
+#
+# Without this, the GitHub runner uses whatever Rust its image happens to ship,
+# and every stable release brings new Clippy lints that fail the build under
+# `-D warnings`. That is how this repo ended up with a permanently red pipeline
+# that never reached its own test step. New lints should arrive when someone
+# bumps this pin and fixes them, not at random.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+targets = ["riscv32imac-unknown-none-elf"]
