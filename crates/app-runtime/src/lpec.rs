@@ -870,13 +870,13 @@ where
         status.playback = playback;
     }
 
-    if let Ok(args) = client.action(linn_lpec::time()).map_err(map_client_error) {
-        if args.len() >= 3 {
-            status.duration_seconds = parse_u32(&args[1]).unwrap_or(0);
-            status.elapsed_seconds = parse_u32(&args[2])
-                .unwrap_or(0)
-                .min(status.duration_seconds);
-        }
+    if let Ok(args) = client.action(linn_lpec::time()).map_err(map_client_error)
+        && args.len() >= 3
+    {
+        status.duration_seconds = parse_u32(&args[1]).unwrap_or(0);
+        status.elapsed_seconds = parse_u32(&args[2])
+            .unwrap_or(0)
+            .min(status.duration_seconds);
     }
 
     if let Ok(args) = client
@@ -1414,10 +1414,7 @@ impl<'a> ArtworkRequest<'a> {
             .strip_prefix("http://")
             .or_else(|| uri.strip_prefix("https://"))
             .ok_or(Error::InvalidArtworkUri)?;
-        let (host_port, path) = rest
-            .split_once('/')
-            .map(|(host, path)| (host, path))
-            .unwrap_or((rest, ""));
+        let (host_port, path) = rest.split_once('/').unwrap_or((rest, ""));
         let (host, port) = host_port
             .rsplit_once(':')
             .and_then(|(host, port)| parse_u16(port).map(|port| (host, port)))

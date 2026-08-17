@@ -294,6 +294,11 @@ pub struct App {
     focus: Option<usize>,
 }
 
+// This enum *is* the app's screen storage: exactly one screen is live at a
+// time and its state lives inline here. Being as large as the largest screen is
+// the point, and boxing the big variant is not on offer in a `no_std` crate
+// without `alloc`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum ActiveScreen {
     Launcher(ui::screens::launcher::State),

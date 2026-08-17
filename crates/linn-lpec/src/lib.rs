@@ -51,10 +51,17 @@ pub const MAX_LINE_LEN: usize = 4096;
 pub const MAX_ARG_LEN: usize = 2048;
 pub const MAX_ARGS: usize = 8;
 pub const MAX_EVENTS: usize = 16;
+/// How much of a remote error's description is kept.
+///
+/// Deliberately far shorter than [`MAX_LINE_LEN`]. This string is stored inline
+/// in [`Error`], so it is also stored inline in the `Result` of every fallible
+/// function in the crate. Sizing it to a whole protocol line made those results
+/// kilobytes wide to carry text that is only ever logged.
+pub const MAX_REMOTE_DESCRIPTION_LEN: usize = 96;
 
 pub type Line = String<MAX_LINE_LEN>;
 pub type ResponseArg = String<MAX_ARG_LEN>;
-pub type RemoteDescription = String<MAX_LINE_LEN>;
+pub type RemoteDescription = String<MAX_REMOTE_DESCRIPTION_LEN>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Service {
@@ -267,6 +274,11 @@ pub struct EventedVariable<'a> {
     pub value: &'a str,
 }
 
+// Clippy wants the `Event` variant boxed. This crate is `no_std` without
+// `alloc`, so there is no box to reach for: the event list is a fixed
+// `MAX_EVENTS` buffer by design, and `Message` is a short-lived borrow of one
+// parsed line rather than something that is stored or queued.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Message<'a> {
     Response {
@@ -468,7 +480,7 @@ where
                     return copy_response_args(&args).map_err(Error::erase);
                 }
                 Message::Error { code, description } => {
-                    let description = copy_remote_description(description).map_err(Error::erase)?;
+                    let description = copy_remote_description(description);
                     return Err(Error::Remote { code, description });
                 }
                 Message::Alive { .. } | Message::ByeBye { .. } | Message::Event { .. } => {}
@@ -491,6 +503,9 @@ where
         self.action(stop()).map(|_| ())
     }
 
+    /// Skips to the next track. Named for the LPEC action and its `previous`
+    /// counterpart, not for `Iterator::next`, which a `Client` is not.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<(), Error<T::Error>> {
         self.action(next()).map(|_| ())
     }
@@ -571,12 +586,17 @@ impl Error {
     }
 }
 
-fn copy_remote_description(description: &str) -> Result<RemoteDescription, Error> {
+/// Keeps as much of a remote error's description as fits, truncating on a char
+/// boundary instead of failing. The code is the part callers act on, so losing
+/// it to an over-long message would be the worse trade.
+fn copy_remote_description(description: &str) -> RemoteDescription {
     let mut copied = RemoteDescription::new();
+    for ch in description.chars() {
+        if copied.push(ch).is_err() {
+            break;
+        }
+    }
     copied
-        .push_str(description)
-        .map_err(|_| Error::LineTooLong)?;
-    Ok(copied)
 }
 
 fn push_quoted_xml_arg(line: &mut Line, arg: &str) -> Result<(), Error> {
@@ -959,9 +979,32 @@ mod tests {
             client.stop(),
             Err(Error::Remote {
                 code: 103,
-                description: copy_remote_description("Service not found").unwrap()
+                description: copy_remote_description("Service not found")
             })
         );
+    }
+
+    #[test]
+    fn an_over_long_remote_description_is_truncated_not_rejected() {
+        // The description no longer gets a whole protocol line's worth of
+        // room, so it has to degrade by losing text rather than by losing the
+        // error code along with it.
+        let long = "x".repeat(MAX_REMOTE_DESCRIPTION_LEN * 2);
+        let copied = copy_remote_description(&long);
+
+        assert_eq!(copied.len(), MAX_REMOTE_DESCRIPTION_LEN);
+        assert!(long.starts_with(copied.as_str()));
+    }
+
+    #[test]
+    fn truncation_keeps_whole_characters() {
+        // Two bytes per char, so a cut measured in bytes could land mid-char.
+        let long = "é".repeat(MAX_REMOTE_DESCRIPTION_LEN);
+        let copied = copy_remote_description(&long);
+
+        assert!(copied.len() <= MAX_REMOTE_DESCRIPTION_LEN);
+        assert!(copied.len() >= MAX_REMOTE_DESCRIPTION_LEN - 1);
+        assert!(copied.chars().all(|ch| ch == 'é'));
     }
 
     struct ScriptedTransport {

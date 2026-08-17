@@ -588,12 +588,12 @@ fn pins_layout(body: &Rectangle, center_x: i32) -> PinsLayout {
     let start_x = center_x - total_width / 2;
     let start_y = body.top_left.y + PINS_GRID_TOP;
     let mut buttons = [Rectangle::new(Point::zero(), PINS_BUTTON_SIZE); HIFI_PIN_COUNT];
-    for slot in 0..HIFI_PIN_COUNT {
+    for (slot, button) in buttons.iter_mut().enumerate() {
         let row = (slot / cols as usize) as i32;
         let col = (slot % cols as usize) as i32;
         let x = start_x + col * (PINS_BUTTON_SIZE.width as i32 + PINS_GRID_GAP);
         let y = start_y + row * (PINS_BUTTON_SIZE.height as i32 + PINS_GRID_GAP);
-        buttons[slot] = Rectangle::new(Point::new(x, y), PINS_BUTTON_SIZE);
+        *button = Rectangle::new(Point::new(x, y), PINS_BUTTON_SIZE);
     }
     PinsLayout {
         body: vertical_page_body(body, start_y, start_y + total_height),
@@ -715,8 +715,6 @@ where
     };
     painter.draw(&volume).map_err(RenderError::Draw)?;
     cache.status_cache.volume_percent = Some(state.status.volume_percent);
-
-    drop(painter);
 
     match state.page {
         HifiPage::Status => render_status(state, cache, display, scratch, &ui_layout.status),

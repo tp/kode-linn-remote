@@ -154,11 +154,11 @@ where
 {
     draw_panel(display, track, 8, ACTION_INACTIVE, ACTION_INACTIVE_BORDER)?;
 
-    let filled_width = if total_seconds == 0 {
-        0
-    } else {
-        ((track.size.width as u64 * remaining_seconds) / total_seconds) as u32
-    };
+    // `checked_div` rather than a guard: a track with no total duration simply
+    // has nothing to fill.
+    let filled_width = (track.size.width as u64 * remaining_seconds)
+        .checked_div(total_seconds)
+        .unwrap_or(0) as u32;
     if filled_width == 0 {
         return Ok(());
     }
