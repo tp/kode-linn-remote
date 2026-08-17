@@ -261,9 +261,9 @@ where
         Some(metadata.album_art_uri.clone())
     }
 
-    fn status(&mut self) -> Result<HifiStatus, Self::Error> {
+    fn status(&mut self) -> Result<Option<HifiStatus>, Self::Error> {
         if let Some(status) = self.pending_status.take() {
-            return Ok(status);
+            return Ok(Some(status));
         }
 
         let now_ms = self.now_ms;
@@ -295,9 +295,13 @@ where
         }
 
         match result {
-            Ok(Some(status)) => Ok(status),
-            Ok(None) => self.session.live_status().ok_or(Error::StatusUnavailable),
-            Err(Error::Connect(error)) => self.session.live_status().ok_or(Error::Connect(error)),
+            Ok(Some(status)) => Ok(Some(status)),
+            // Subscribed, nothing reported yet. Ordinary, not a fault.
+            Ok(None) => Ok(self.session.live_status()),
+            Err(Error::Connect(error)) => match self.session.live_status() {
+                Some(status) => Ok(Some(status)),
+                None => Err(Error::Connect(error)),
+            },
             Err(error) => {
                 self.reset();
                 Err(error)
@@ -422,8 +426,8 @@ where
         }
     }
 
-    fn status(&mut self) -> Result<HifiStatus, Self::Error> {
-        read_status(&mut self.client()?)
+    fn status(&mut self) -> Result<Option<HifiStatus>, Self::Error> {
+        read_status(&mut self.client()?).map(Some)
     }
 
     fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error> {
@@ -1235,6 +1239,7 @@ fn pins_from_ids(ids: &heapless::Vec<u32, HIFI_PIN_COUNT>) -> HifiPins {
             HifiPin {
                 id,
                 title: heapless::String::new(),
+                artwork_uri: heapless::String::new(),
             },
         );
     }
@@ -1385,17 +1390,18 @@ where
             }
             let mut title_buf = heapless::String::<HIFI_PIN_TITLE_LEN>::new();
             if let Some(title) = entry.title {
-                for ch in title.chars() {
-                    if title_buf.push(ch).is_err() {
-                        break;
-                    }
-                }
+                copy_json_string(title, &mut title_buf);
+            }
+            let mut artwork_buf = heapless::String::<{ app_core::HIFI_URI_LEN }>::new();
+            if let Some(artwork_uri) = entry.artwork_uri {
+                copy_json_string(artwork_uri, &mut artwork_buf);
             }
             pins.set(
                 slot,
                 HifiPin {
                     id,
                     title: title_buf,
+                    artwork_uri: artwork_buf,
                 },
             );
             slot += 1;
@@ -1408,10 +1414,11 @@ where
 struct JsonPinEntry<'a> {
     id: Option<u32>,
     title: Option<&'a str>,
+    artwork_uri: Option<&'a str>,
 }
 
-/// Walk a JSON-ish payload one `{...}` object at a time, pulling out `Id`
-/// and `Title` per object. Tolerates whitespace, balanced braces, and any
+/// Walk a JSON-ish payload one `{...}` object at a time, pulling out `id`,
+/// `title` and `artworkUri` per object. Tolerates whitespace, balanced braces, and any
 /// other fields we don't care about.
 struct JsonPinEntries<'a> {
     src: &'a str,
@@ -1474,16 +1481,48 @@ impl<'a> Iterator for JsonPinEntries<'a> {
 
 fn parse_json_pin_object(object: &str) -> JsonPinEntry<'_> {
     JsonPinEntry {
-        id: find_json_string_field(object, "Id")
+        id: find_json_string_field(object, "id")
             .and_then(parse_u32)
-            .or_else(|| find_json_number_field(object, "Id")),
-        title: find_json_string_field(object, "Title"),
+            .or_else(|| find_json_number_field(object, "id")),
+        title: find_json_string_field(object, "title"),
+        artwork_uri: find_json_string_field(object, "artworkUri"),
     }
 }
 
 /// Find `"<key>"` followed by `:` and a quoted string value; return the
 /// (un-escaped enough for our needs) inner content. Doesn't handle every
 /// JSON escape — just the common ones we'd get back from Linn.
+/// Copies a JSON string value, undoing the escapes a DSM actually emits.
+///
+/// `artworkUri` arrives as `https:\/\/static.qobuz.com\/...` — legal JSON,
+/// and a URL that resolves to nothing if copied verbatim.
+fn copy_json_string<const N: usize>(value: &str, output: &mut heapless::String<N>) {
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            let decoded = match ch {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                'b' | 'f' => continue,
+                other => other,
+            };
+            if output.push(decoded).is_err() {
+                return;
+            }
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if output.push(ch).is_err() {
+            return;
+        }
+    }
+}
+
 fn find_json_string_field<'a>(object: &'a str, key: &str) -> Option<&'a str> {
     let bytes = object.as_bytes();
     let mut pos = 0;
@@ -1523,7 +1562,11 @@ fn find_json_string_field<'a>(object: &'a str, key: &str) -> Option<&'a str> {
             pos = k + 1;
             continue;
         }
-        if this_key != key {
+        // Case-insensitive: a Selekt DSM sends `id`, `title` and `artworkUri`,
+        // while the fixtures this was written against used `Id` and `Title`.
+        // The code and its tests agreed with each other and not with the
+        // device, so pins came back empty on real hardware.
+        if !this_key.eq_ignore_ascii_case(key) {
             pos = after + 1;
             continue;
         }
@@ -1559,13 +1602,29 @@ fn find_json_string_field<'a>(object: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+/// Case-insensitive substring search.
+///
+/// Same reason the key comparison above ignores case: the device spells its
+/// keys `id` and `title`, and this code was written expecting `Id` and
+/// `Title`.
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+}
+
 fn find_json_number_field(object: &str, key: &str) -> Option<u32> {
     // Fallback: locate `"<key>" :` and then parse digits.
     let mut needle = heapless::String::<40>::new();
     needle.push('"').ok()?;
     needle.push_str(key).ok()?;
     needle.push('"').ok()?;
-    let mut pos = object.find(needle.as_str())?;
+    let mut pos = find_ascii_case_insensitive(object, needle.as_str())?;
     pos += needle.len();
     let bytes = object.as_bytes();
     while pos < bytes.len() && (bytes[pos] as char).is_ascii_whitespace() {
@@ -2992,6 +3051,51 @@ mod tests {
         let args = ["[0,0]"];
         let ids = decode_pin_ids(args.iter().copied()).unwrap();
         assert!(ids.is_empty());
+    }
+
+    /// Captured from a Selekt DSM via `Ds/Pins:ReadList "[1]"` on 2026-08-17.
+    ///
+    /// The fixtures below it were written from the same assumption as the code
+    /// -- capitalised keys -- so they agreed with each other and not with the
+    /// device, and pins came back empty on real hardware while the suite
+    /// stayed green. This one is the device's own words.
+    const REAL_PIN_PAYLOAD: &str = concat!(
+        r#"[{"id":1,"mode":"qobuz","type":"album","#,
+        r#""uri":"qobuz:\/\/album?path=https%3A%2F%2Fwww.qobuz.com&version=1","#,
+        r#""title":"Village","description":"","#,
+        r#""artworkUri":"https:\/\/static.qobuz.com\/images\/covers\/mb\/x1\/brogg6xqdx1mb_600.jpg","#,
+        r#""shuffle":false}]"#
+    );
+
+    #[test]
+    fn reads_a_pin_exactly_as_the_device_sends_it() {
+        let pins = parse_pin_list_json(core::iter::once(REAL_PIN_PAYLOAD));
+
+        let pin = pins.get(0).expect("the device sent a pin");
+        assert_eq!(pin.id, 1);
+        assert_eq!(pin.title.as_str(), "Village");
+        // Escaped slashes have to come back out, or the URI resolves to nothing.
+        assert_eq!(
+            pin.artwork_uri.as_str(),
+            "https://static.qobuz.com/images/covers/mb/x1/brogg6xqdx1mb_600.jpg"
+        );
+    }
+
+    #[test]
+    fn a_pin_without_artwork_simply_has_none() {
+        let payload = r#"[{"id":4,"title":"Radio","description":""}]"#;
+        let pins = parse_pin_list_json(core::iter::once(payload));
+        let pin = pins.get(0).unwrap();
+        assert_eq!(pin.title.as_str(), "Radio");
+        assert!(pin.artwork_uri.is_empty());
+    }
+
+    #[test]
+    fn json_escapes_are_undone() {
+        let mut out = heapless::String::<64>::new();
+        // A JSON string containing an escaped slash, backslash and quote.
+        copy_json_string("a\\/b\\\\c\\\"d", &mut out);
+        assert_eq!(out.as_str(), "a/b\\c\"d");
     }
 
     #[test]

@@ -9,6 +9,10 @@
 //!     --test live_device -- --ignored --nocapture
 //! ```
 
+// The host TCP connector is std-only, so without that feature there is simply
+// no device to talk to and this file compiles to nothing.
+#![cfg(feature = "std")]
+
 use app_runtime::{
     host_tcp::HostTcpConnector, lpec::LpecSession, net::Endpoint, net::TcpConnector, playlist::Step,
 };
@@ -73,4 +77,37 @@ fn predicts_the_next_track_from_a_real_device() {
         !predicted.album_art_uri.is_empty()
     );
     assert!(!predicted.title.is_empty(), "prediction had no title");
+}
+
+#[test]
+#[ignore]
+fn reads_pins_from_a_real_device() {
+    let Some(endpoint) = endpoint_from_env() else {
+        eprintln!("set LINN_TEST_HOST to run this");
+        return;
+    };
+
+    let mut connector = HostTcpConnector::new();
+    let mut session = LpecSession::new();
+    let mut stream = connector.connect(endpoint).unwrap();
+    let pins = session.fetch_pins(&mut stream).unwrap();
+
+    let mut found = 0;
+    for slot in 0..app_core::HIFI_PIN_COUNT {
+        if let Some(pin) = pins.get(slot) {
+            found += 1;
+            println!(
+                "pin {} id={} title={:?} art={}",
+                slot,
+                pin.id,
+                pin.title.as_str(),
+                if pin.artwork_uri.is_empty() {
+                    "none"
+                } else {
+                    pin.artwork_uri.as_str()
+                }
+            );
+        }
+    }
+    assert!(found > 0, "the device reported no pins at all");
 }

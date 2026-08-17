@@ -19,9 +19,16 @@ pub type ArtworkPixel = Rgb565;
 /// agree on one number; change it in `board-kode-dot` and every layout reflows.
 pub use board_kode_dot::DISPLAY_SIZE;
 
+// `HifiStatus` and the artwork variants dwarf the input ones, which is what a
+// message type carrying both a keypress and a decoded cover looks like. Boxing
+// is not on offer on the `no_std` side, and the enum is passed by value on a
+// channel rather than stored, so the cost is one move per event.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
-    Tick { uptime_ms: u64 },
+    Tick {
+        uptime_ms: u64,
+    },
     TouchDown(TouchPoint),
     TouchUp,
     ButtonPressed(Button),
@@ -29,6 +36,13 @@ pub enum Event {
     HifiStatus(HifiStatus),
     HifiArtwork(HifiArtwork),
     HifiPins(HifiPins),
+    /// Cover for one pin tile. Separate from [`Event::HifiPins`] because the
+    /// list arrives long before six images can be fetched, and a tile should
+    /// appear as soon as it is named rather than waiting for its picture.
+    HifiPinArtwork {
+        slot: usize,
+        artwork: HifiArtwork,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +144,8 @@ pub const HIFI_VOLUME_MAX: u8 = 70;
 pub struct HifiPin {
     pub id: u32,
     pub title: String<HIFI_PIN_TITLE_LEN>,
+    /// Cover for whatever the pin plays. Empty when the DS offers none.
+    pub artwork_uri: String<HIFI_URI_LEN>,
 }
 
 impl HifiPin {
@@ -139,6 +155,7 @@ impl HifiPin {
         Self {
             id,
             title: string_from(title),
+            artwork_uri: String::new(),
         }
     }
 }
@@ -402,6 +419,10 @@ impl App {
                 ActiveScreen::HifiControl(state) => state.apply_pins(pins),
                 ActiveScreen::Launcher(_) | ActiveScreen::Stopwatch(_) => false,
             },
+            Event::HifiPinArtwork { slot, artwork } => match &mut self.active_screen {
+                ActiveScreen::HifiControl(state) => state.apply_pin_artwork(slot, artwork),
+                ActiveScreen::Launcher(_) | ActiveScreen::Stopwatch(_) => false,
+            },
         };
 
         UpdateOutcome {
@@ -650,6 +671,7 @@ mod tests {
         HifiPin {
             id,
             title: pin_title,
+            artwork_uri: String::new(),
         }
     }
 
