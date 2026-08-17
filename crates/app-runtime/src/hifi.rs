@@ -209,6 +209,11 @@ pub mod worker {
         TrackChanged,
     }
 
+    // `Event` carries a whole `HifiStatus`, so it dwarfs the other variants.
+    // Boxing it would move the allocation onto the channel's hot path to save
+    // stack this worker has plenty of, and `Event` has to stay usable from the
+    // `no_std` side of the crate.
+    #[allow(clippy::large_enum_variant)]
     #[derive(Debug)]
     pub enum Response<E> {
         Event(Event),
