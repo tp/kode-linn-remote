@@ -4,7 +4,7 @@ use core::time::Duration;
 use embedded_graphics::{
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{Circle, Line, PrimitiveStyle, Rectangle},
+    primitives::{Line, PrimitiveStyle, Rectangle},
     text::{Baseline, Text, TextStyleBuilder},
 };
 use mplusfonts::{mplus, style::BitmapFontStyleBuilder};
@@ -12,7 +12,7 @@ use mplusfonts::{mplus, style::BitmapFontStyleBuilder};
 use crate::{NetworkStatus, RenderError};
 
 use super::super::{
-    AppContext,
+    AppContext, aa,
     components::{ButtonTone, clear_rect, draw_button, draw_duration, draw_panel, ui_font},
     focus::FocusTargets,
     geometry::{Column, horizontal_pair},
@@ -359,10 +359,15 @@ fn draw_network_unavailable_icon<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    Circle::with_center(center, NETWORK_ICON_DIAMETER)
-        .into_styled(PrimitiveStyle::with_stroke(TEXT_SECONDARY, 2))
-        .draw(display)
-        .map_err(RenderError::Draw)?;
+    aa::circle_outline(
+        display,
+        center,
+        NETWORK_ICON_DIAMETER,
+        TEXT_SECONDARY,
+        2,
+        OLED_BLACK,
+    )
+    .map_err(RenderError::Draw)?;
 
     Line::new(center + Point::new(-8, 8), center + Point::new(8, -8))
         .into_styled(PrimitiveStyle::with_stroke(TEXT_SECONDARY, 2))

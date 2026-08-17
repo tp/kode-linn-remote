@@ -4,7 +4,7 @@ use embedded_graphics::{
     Pixel,
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle, Triangle},
+    primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
 use heapless::String;
@@ -16,6 +16,7 @@ use crate::{
 };
 
 use super::super::{
+    aa,
     components::{
         ButtonTone, DURATION_WIDTH, clear_rect, draw_button, draw_duration, draw_progress_bar,
         draw_spinner_dots, ui_font,
@@ -1277,13 +1278,14 @@ impl Widget<Action> for PlayTriangle {
             return Ok(());
         }
         let center = rect_visual_center(self.rect);
-        Triangle::new(
+        aa::triangle(
+            target,
             center + Point::new(-16, -30),
             center + Point::new(-16, 30),
             center + Point::new(34, 0),
+            TEXT_PRIMARY,
+            OLED_BLACK,
         )
-        .into_styled(PrimitiveStyle::with_fill(TEXT_PRIMARY))
-        .draw(target)
     }
 }
 

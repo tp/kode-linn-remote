@@ -3,14 +3,12 @@ use core::time::Duration;
 use embedded_graphics::{
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{
-        Arc, Circle, Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, RoundedRectangle,
-    },
+    primitives::{Line, PrimitiveStyle, Rectangle, RoundedRectangle},
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
 use mplusfonts::{mplus, style::BitmapFontStyleBuilder};
 
-use super::style::*;
+use super::{aa, style::*};
 use crate::RenderError;
 
 const BUTTON_LABEL_OFFSET: Point = Point::new(0, 1);
@@ -33,9 +31,9 @@ macro_rules! ui_font {
             2,
             $weight,
             line_height(40),
-            true,
+            false,
             4,
-            4,
+            8,
             kern(' '..='~', ["ff", "ffi", "ffl"]),
             ["Ä", "Ö", "Ü", "ä", "ö", "ü", "ß", "ẞ", "‘", "’", "‚", "“", "”", "„", "´"]
         )
@@ -110,17 +108,14 @@ where
         rect.size.height.saturating_add((inset * 2) as u32),
     );
 
-    RoundedRectangle::with_equal_corners(
+    aa::rounded_rect_outline(
+        display,
         Rectangle::new(top_left, size),
-        Size::new(FOCUS_RING_RADIUS, FOCUS_RING_RADIUS),
+        FOCUS_RING_RADIUS,
+        FOCUS_RING,
+        FOCUS_RING_STROKE,
+        OLED_BLACK,
     )
-    .into_styled(
-        PrimitiveStyleBuilder::new()
-            .stroke_color(FOCUS_RING)
-            .stroke_width(FOCUS_RING_STROKE)
-            .build(),
-    )
-    .draw(display)
     .map_err(RenderError::Draw)
 }
 
@@ -143,18 +138,9 @@ pub(super) fn draw_panel<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    clear_rect(display, rect)?;
-
-    RoundedRectangle::with_equal_corners(rect, Size::new(radius, radius))
-        .into_styled(
-            PrimitiveStyleBuilder::new()
-                .fill_color(fill)
-                .stroke_color(stroke)
-                .stroke_width(1)
-                .build(),
-        )
-        .draw(display)
-        .map_err(RenderError::Draw)
+    // Covers every pixel of `rect`, blending the corner arcs down to the OLED
+    // background, so no separate clear is needed first.
+    aa::rounded_rect(display, rect, radius, fill, stroke, 1, OLED_BLACK).map_err(RenderError::Draw)
 }
 
 pub(super) fn draw_progress_bar<D>(
@@ -275,9 +261,7 @@ where
     let phase = phase as usize % OFFSETS.len();
     for index in 0..OFFSETS.len() {
         let color = COLORS[(index + phase) % COLORS.len()];
-        Circle::with_center(center + OFFSETS[index], 18)
-            .into_styled(PrimitiveStyle::with_fill(color))
-            .draw(display)?;
+        aa::circle(display, center + OFFSETS[index], 18, color, OLED_BLACK)?;
     }
 
     Ok(())
@@ -304,23 +288,31 @@ pub(super) fn draw_wifi_icon<D>(display: &mut D, center: Point) -> Result<(), Re
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    let style = PrimitiveStyle::with_stroke(TEXT_PRIMARY, WIFI_ICON_STROKE);
-    Arc::with_center(center + Point::new(0, 19), 72, 215.0.deg(), 110.0.deg())
-        .into_styled(style)
-        .draw(display)
+    let origin = center + Point::new(0, 19);
+    for (diameter, start_deg, sweep_deg) in [(72, 215, 110), (48, 220, 100), (24, 228, 84)] {
+        aa::arc(
+            display,
+            aa::ArcSpec {
+                center: origin,
+                diameter,
+                stroke_width: WIFI_ICON_STROKE,
+                start_deg,
+                sweep_deg,
+            },
+            TEXT_PRIMARY,
+            OLED_BLACK,
+        )
         .map_err(RenderError::Draw)?;
-    Arc::with_center(center + Point::new(0, 19), 48, 220.0.deg(), 100.0.deg())
-        .into_styled(style)
-        .draw(display)
-        .map_err(RenderError::Draw)?;
-    Arc::with_center(center + Point::new(0, 19), 24, 228.0.deg(), 84.0.deg())
-        .into_styled(style)
-        .draw(display)
-        .map_err(RenderError::Draw)?;
-    Circle::with_center(center + Point::new(0, 31), 8)
-        .into_styled(PrimitiveStyle::with_fill(TEXT_PRIMARY))
-        .draw(display)
-        .map_err(RenderError::Draw)
+    }
+
+    aa::circle(
+        display,
+        center + Point::new(0, 31),
+        8,
+        TEXT_PRIMARY,
+        OLED_BLACK,
+    )
+    .map_err(RenderError::Draw)
 }
 
 pub(super) fn draw_network_blocked_icon<D>(
@@ -330,10 +322,15 @@ pub(super) fn draw_network_blocked_icon<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    Circle::with_center(center, NETWORK_BLOCKED_ICON_DIAMETER)
-        .into_styled(PrimitiveStyle::with_stroke(TEXT_SECONDARY, 2))
-        .draw(display)
-        .map_err(RenderError::Draw)?;
+    aa::circle_outline(
+        display,
+        center,
+        NETWORK_BLOCKED_ICON_DIAMETER,
+        TEXT_SECONDARY,
+        2,
+        OLED_BLACK,
+    )
+    .map_err(RenderError::Draw)?;
 
     Line::new(center + Point::new(-8, 8), center + Point::new(8, -8))
         .into_styled(PrimitiveStyle::with_stroke(TEXT_SECONDARY, 2))
