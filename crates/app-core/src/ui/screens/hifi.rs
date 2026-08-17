@@ -39,6 +39,7 @@ use super::super::{
     aa,
     components::{clear_rect, draw_panel, draw_spinner_dots, ui_font},
     focus::FocusTargets,
+    optimistic::Optimistic,
     painter::Painter,
     style::*,
     widget::{Slot, Widget},
@@ -103,6 +104,12 @@ const OVERLAY_TRACK_HEIGHT: u32 = 10;
 // line: the state belongs to the picture, and a word beside the artist reads
 // as part of the artist's name. It is centred on the same line as the volume
 // readout, which therefore covers it completely while volume is being changed.
+/// How long the previous track's cover may stand in for one still being
+/// fetched.
+///
+/// Long enough to cover a fetch and decode, short enough that a track with no
+/// artwork of its own does not keep wearing someone else's.
+const STALE_ARTWORK_GRACE_MS: u64 = 900;
 const PAUSE_BADGE_SIZE: u32 = 106;
 const PAUSE_BADGE_RADIUS: u32 = 22;
 
@@ -262,6 +269,17 @@ pub(crate) struct State {
     /// is not up. Cleared by `on_tick` when it lapses, so the frame that hides
     /// it gets requested rather than waiting for unrelated activity.
     volume_overlay_until_ms: Option<u64>,
+    /// Playback state we set on a press, held until the device agrees.
+    optimistic_playback: Option<Optimistic<PlaybackState>>,
+    /// Volume we set on a press, held until the device agrees.
+    ///
+    /// A held turn of the dial is why several presses in a row no longer jump
+    /// about: the device reports each intermediate level it passes through,
+    /// and without this the bar would chase them backwards.
+    optimistic_volume: Option<Optimistic<u8>>,
+    /// Uptime after which the cover on screen stops standing in for the one
+    /// still being fetched. `None` means the cover belongs to this track.
+    stale_artwork_until_ms: Option<u64>,
 }
 
 /// What a screen did with a raw pad press.
@@ -385,6 +403,9 @@ impl State {
             marquee: MarqueeState::default(),
             pins_dirty: false,
             volume_overlay_until_ms: None,
+            optimistic_playback: None,
+            optimistic_volume: None,
+            stale_artwork_until_ms: None,
         }
     }
 
@@ -470,8 +491,26 @@ impl State {
             _ => false,
         };
 
+        // A cover cannot stand in for its replacement indefinitely. When the
+        // window closes without one arriving, drop it here rather than in the
+        // renderer, so the frame that removes it gets requested.
+        let stale_lapsed = match self.stale_artwork_until_ms {
+            Some(until) if uptime_ms >= until => {
+                self.stale_artwork_until_ms = None;
+                if self
+                    .artwork
+                    .as_ref()
+                    .is_some_and(|artwork| artwork.source_uri != self.status.album_art_uri)
+                {
+                    self.artwork = None;
+                }
+                true
+            }
+            _ => false,
+        };
+
         let playback_changed = self.tick_playback(uptime_ms);
-        playback_changed || overlay_lapsed
+        playback_changed || overlay_lapsed || stale_lapsed
     }
 
     fn tick_playback(&mut self, uptime_ms: u64) -> bool {
@@ -517,15 +556,31 @@ impl State {
         true
     }
 
-    pub(crate) fn apply_status(&mut self, status: HifiStatus, uptime_ms: u64) -> bool {
+    pub(crate) fn apply_status(&mut self, mut status: HifiStatus, uptime_ms: u64) -> bool {
         let was_loading = self.loading;
+
+        // What the user just asked for outranks a reply composed before they
+        // asked, until the device agrees or the hold runs out.
+        status.playback =
+            Optimistic::reconcile(&mut self.optimistic_playback, status.playback, uptime_ms);
+        status.volume_percent = Optimistic::reconcile(
+            &mut self.optimistic_volume,
+            status.volume_percent,
+            uptime_ms,
+        );
+
         let has_live_content = has_live_content(&status);
+
+        // The cover for the new track has not been fetched yet, and an empty
+        // slot is a bigger visual event than a cover that is briefly one track
+        // behind. Keep showing it, and give it a deadline so a track with no
+        // artwork at all cannot inherit the previous one's.
         if self
             .artwork
             .as_ref()
             .is_some_and(|artwork| artwork.source_uri != status.album_art_uri)
         {
-            self.artwork = None;
+            self.stale_artwork_until_ms = Some(uptime_ms.saturating_add(STALE_ARTWORK_GRACE_MS));
         }
 
         if self.status == status && (!was_loading || !has_live_content) {
@@ -550,6 +605,9 @@ impl State {
         {
             return false;
         }
+
+        // The replacement arrived, so the cover on screen is current again.
+        self.stale_artwork_until_ms = None;
 
         // Compare by URI rather than by pixels. The old full-buffer equality
         // check was 9,216 comparisons; at this artwork size it would be
@@ -605,7 +663,7 @@ impl State {
                     self.last_second = current_second;
                     Some(Command::Restart)
                 } else {
-                    self.clear_current_track();
+                    self.begin_track_change(uptime_ms);
                     Some(Command::PreviousTrack)
                 }
             }
@@ -619,10 +677,14 @@ impl State {
                     self.last_second = current_second;
                     self.status.playback = PlaybackState::Playing;
                 }
+                // Defend the press. Without this the device's next report --
+                // composed before the command landed -- puts the old state
+                // back, and the icon appears, vanishes, and returns.
+                self.optimistic_playback = Some(Optimistic::hold(self.status.playback, uptime_ms));
                 Some(Command::TogglePlayback)
             }
             Action::NextTrack => {
-                self.clear_current_track();
+                self.begin_track_change(uptime_ms);
                 Some(Command::NextTrack)
             }
             Action::InvokePinSlot(slot) => {
@@ -631,7 +693,12 @@ impl State {
                 // straight back to it rather than leaving the user on a grid
                 // wondering whether the press landed.
                 self.page = HifiPage::NowPlaying;
-                self.clear_current_track();
+                // A pin is the one case we genuinely cannot predict: it starts
+                // an album or playlist whose first track nobody has told us.
+                // Holding the previous cover for the grace window still beats
+                // an empty slot, and the window bounds how long a stale cover
+                // can misrepresent what is playing.
+                self.begin_track_change(uptime_ms);
                 Some(Command::InvokePinId { id })
             }
             Action::VolumeDelta(delta) => {
@@ -645,20 +712,28 @@ impl State {
                     return None;
                 }
                 self.status.volume_percent = next;
+                self.optimistic_volume = Some(Optimistic::hold(next, uptime_ms));
                 Some(Command::SetVolume { volume: next })
             }
         }
     }
 
-    fn clear_current_track(&mut self) {
-        self.status.title.clear();
-        self.status.artist.clear();
-        self.status.album.clear();
-        self.status.album_art_uri.clear();
+    /// Marks the current track as on its way out without emptying the screen.
+    ///
+    /// This used to blank the title, drop the cover and force `Buffering`,
+    /// which manufactured three visible states out of one press: an empty
+    /// slot, then a spinner, then a play icon once a status arrived without
+    /// artwork — before the real cover finally landed. None of that came from
+    /// the device; the runtime knows what comes next and says so within a
+    /// frame.
+    ///
+    /// Only the position is reset, because that is the one field certain to be
+    /// wrong the moment a skip is requested.
+    fn begin_track_change(&mut self, uptime_ms: u64) {
         self.status.elapsed_seconds = 0;
-        self.status.duration_seconds = 0;
-        self.status.playback = PlaybackState::Buffering;
-        self.artwork = None;
+        if self.artwork.is_some() {
+            self.stale_artwork_until_ms = Some(uptime_ms.saturating_add(STALE_ARTWORK_GRACE_MS));
+        }
     }
 }
 
@@ -1230,11 +1305,13 @@ fn compute_art_kind(state: &State) -> u8 {
     match state.status.playback {
         PlaybackState::Buffering => ART_SLOT_BUFFERING,
         playback => {
-            if state
-                .artwork
-                .as_ref()
-                .is_some_and(|artwork| artwork.source_uri == state.status.album_art_uri)
-            {
+            // A cover one track behind still reads as "this is playing";
+            // dropping to an icon and back reads as a fault. The stale window
+            // is what stops that leniency becoming a lie.
+            if state.artwork.as_ref().is_some_and(|artwork| {
+                artwork.source_uri == state.status.album_art_uri
+                    || state.stale_artwork_until_ms.is_some()
+            }) {
                 // Artwork is the hero whether or not it is playing; the
                 // transport state reads off the artist line instead.
                 ART_SLOT_ARTWORK
@@ -1718,6 +1795,136 @@ mod tests {
         status.volume_percent = 30;
         state.apply_status(status, 0);
         state
+    }
+
+    /// A state with a cover on screen, which is what makes the transition
+    /// states visible in the first place.
+    fn state_with_artwork(uri: &str) -> State {
+        let mut state = state_with_track(20);
+        let mut status = state.status.clone();
+        status.album_art_uri.clear();
+        let _ = status.album_art_uri.push_str(uri);
+        state.apply_status(status, 0);
+
+        let mut artwork = HifiArtwork::new(uri).unwrap();
+        for _ in 0..crate::HIFI_ARTWORK_PIXELS {
+            artwork.push_pixel(Rgb565::CSS_REBECCAPURPLE);
+        }
+        state.apply_artwork(artwork);
+        state
+    }
+
+    #[test]
+    fn a_skip_does_not_empty_the_screen() {
+        let mut state = state_with_track(20);
+        state.handle(Action::NextTrack, 1_000);
+
+        // The old behaviour cleared all of this and forced Buffering, which is
+        // what produced a blank slot, then a spinner, then a play icon.
+        assert_eq!(state.status.title.as_str(), "Yellow Submarine");
+        assert_eq!(state.status.playback, PlaybackState::Playing);
+        // Only the position is certainly wrong the moment a skip is asked for.
+        assert_eq!(state.status.elapsed_seconds, 0);
+    }
+
+    #[test]
+    fn the_cover_stays_up_while_its_replacement_is_fetched() {
+        let mut state = state_with_artwork("http://art/one.jpg");
+        state.handle(Action::NextTrack, 1_000);
+
+        // The predicted track arrives with a different cover that has not been
+        // decoded yet.
+        let mut next = state.status.clone();
+        next.album_art_uri.clear();
+        let _ = next.album_art_uri.push_str("http://art/two.jpg");
+        state.apply_status(next, 1_000);
+
+        assert!(state.artwork.is_some(), "cover was dropped on the press");
+        assert_eq!(compute_art_kind(&state), ART_SLOT_ARTWORK);
+    }
+
+    #[test]
+    fn a_cover_that_never_arrives_is_eventually_given_up() {
+        let mut state = state_with_artwork("http://art/one.jpg");
+        state.handle(Action::NextTrack, 1_000);
+        let mut next = state.status.clone();
+        next.album_art_uri.clear();
+        let _ = next.album_art_uri.push_str("http://art/two.jpg");
+        state.apply_status(next, 1_000);
+
+        state.on_tick(1_000 + STALE_ARTWORK_GRACE_MS);
+
+        assert!(
+            state.artwork.is_none(),
+            "a stale cover must not outlive its window"
+        );
+    }
+
+    #[test]
+    fn pausing_is_not_undone_by_a_reply_composed_before_the_press() {
+        let mut state = state_with_track(20);
+        state.handle(Action::TogglePlayback, 1_000);
+        assert_eq!(state.status.playback, PlaybackState::Paused);
+
+        // The device answers with the state it had when the command arrived.
+        let mut stale = state.status.clone();
+        stale.playback = PlaybackState::Playing;
+        state.apply_status(stale, 1_100);
+
+        assert_eq!(
+            state.status.playback,
+            PlaybackState::Paused,
+            "the pause icon flickered"
+        );
+    }
+
+    #[test]
+    fn the_device_wins_once_a_pause_hold_expires() {
+        let mut state = state_with_track(20);
+        state.handle(Action::TogglePlayback, 1_000);
+
+        let mut stale = state.status.clone();
+        stale.playback = PlaybackState::Playing;
+        state.apply_status(stale, 1_000 + crate::ui::optimistic::OPTIMISTIC_TTL_MS);
+
+        assert_eq!(state.status.playback, PlaybackState::Playing);
+    }
+
+    #[test]
+    fn volume_does_not_chase_the_levels_it_passed_through() {
+        let mut state = state_with_track(20);
+        // Three nudges in quick succession.
+        state.handle(Action::VolumeDelta(VOLUME_STEP), 1_000);
+        state.handle(Action::VolumeDelta(VOLUME_STEP), 1_050);
+        state.handle(Action::VolumeDelta(VOLUME_STEP), 1_100);
+        let reached = state.status.volume_percent;
+
+        // The device reports an intermediate level it is only now catching up to.
+        let mut lagging = state.status.clone();
+        lagging.volume_percent = 30 + VOLUME_STEP as u8;
+        state.apply_status(lagging, 1_150);
+
+        assert_eq!(
+            state.status.volume_percent, reached,
+            "the volume bar jumped backwards"
+        );
+    }
+
+    #[test]
+    fn volume_settles_on_the_device_once_it_agrees() {
+        let mut state = state_with_track(20);
+        state.handle(Action::VolumeDelta(VOLUME_STEP), 1_000);
+        let reached = state.status.volume_percent;
+
+        let mut agreed = state.status.clone();
+        agreed.volume_percent = reached;
+        state.apply_status(agreed, 1_050);
+
+        // Hold resolved: a later, genuinely new level from elsewhere lands.
+        let mut elsewhere = state.status.clone();
+        elsewhere.volume_percent = 12;
+        state.apply_status(elsewhere, 1_100);
+        assert_eq!(state.status.volume_percent, 12);
     }
 
     fn filled_pins() -> HifiPins {
