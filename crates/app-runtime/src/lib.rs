@@ -9,6 +9,7 @@ pub mod hifi;
 pub mod host_tcp;
 pub mod lpec;
 pub mod net;
+pub mod playlist;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeError<E> {
@@ -23,6 +24,22 @@ pub trait HifiController {
     fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error>;
     fn pins(&mut self) -> Result<HifiPins, Self::Error>;
     fn mark_track_changed(&mut self) {}
+
+    /// Hands the controller the current uptime.
+    ///
+    /// Controllers that reason about time — expiring an optimistic skip, say —
+    /// have no clock of their own, and `app-runtime` is `no_std`, so the
+    /// platform's notion of now has to arrive from outside.
+    fn set_clock(&mut self, _now_ms: u64) {}
+
+    /// Moves to the neighbouring track without waiting for the device.
+    ///
+    /// Returns the status to show immediately, or `None` when the controller
+    /// cannot honestly say what comes next — which is the default, and leaves
+    /// callers with the behaviour they had before.
+    fn predict_skip(&mut self, _forward: bool, _now_ms: u64) -> Option<HifiStatus> {
+        None
+    }
 }
 
 #[derive(Debug)]
