@@ -20,7 +20,14 @@ pub trait HifiController {
     type Error;
 
     fn handle_command(&mut self, command: HifiCommand) -> Result<(), Self::Error>;
-    fn status(&mut self) -> Result<HifiStatus, Self::Error>;
+    /// The current status, or `None` when the controller has nothing to say
+    /// yet.
+    ///
+    /// A freshly-opened session has subscribed and not yet been told anything,
+    /// which is an ordinary moment in a connection's life rather than a
+    /// failure. Reporting it as one put `StatusUnavailable` in the log every
+    /// time the screen was opened, which is noise that hides real faults.
+    fn status(&mut self) -> Result<Option<HifiStatus>, Self::Error>;
     fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error>;
     fn pins(&mut self) -> Result<HifiPins, Self::Error>;
     fn mark_track_changed(&mut self) {}
@@ -82,7 +89,7 @@ where
         }
     }
 
-    pub fn hifi_status(&mut self) -> Result<HifiStatus, RuntimeError<Hifi::Error>> {
+    pub fn hifi_status(&mut self) -> Result<Option<HifiStatus>, RuntimeError<Hifi::Error>> {
         self.hifi.status().map_err(RuntimeError::Hifi)
     }
 
@@ -171,8 +178,8 @@ mod tests {
             Ok(())
         }
 
-        fn status(&mut self) -> Result<HifiStatus, Self::Error> {
-            Ok(HifiStatus::waiting())
+        fn status(&mut self) -> Result<Option<HifiStatus>, Self::Error> {
+            Ok(Some(HifiStatus::waiting()))
         }
 
         fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error> {

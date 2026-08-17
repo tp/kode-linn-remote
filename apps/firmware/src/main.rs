@@ -709,9 +709,9 @@ impl HifiController for FirmwareHifi<'_> {
         }
     }
 
-    fn status(&mut self) -> Result<HifiStatus, Self::Error> {
+    fn status(&mut self) -> Result<Option<HifiStatus>, Self::Error> {
         if let Some(status) = self.pending_status.take() {
-            return Ok(status);
+            return Ok(Some(status));
         }
 
         let result = {
@@ -726,11 +726,14 @@ impl HifiController for FirmwareHifi<'_> {
         };
 
         match result {
-            Ok(Some(status)) => Ok(status),
-            Ok(None) => self.session.live_status().ok_or(FirmwareHifiError::Idle),
+            Ok(Some(status)) => Ok(Some(status)),
+            // Subscribed and not yet told anything: no news, not a fault. The
+            // `Idle` dance below existed only to smuggle that through a
+            // signature that could not say it.
+            Ok(None) => Ok(self.session.live_status()),
             Err(LpecError::Connect(
                 FirmwareNetError::ConnectTimeout | FirmwareNetError::ReadTimeout,
-            )) => self.session.live_status().ok_or(FirmwareHifiError::Idle),
+            )) => Ok(self.session.live_status()),
             Err(error) => {
                 println!("linn: session poll failed: {:?}", error);
                 self.reset_lpec();
