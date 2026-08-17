@@ -7,7 +7,8 @@ use embassy_futures::{
 };
 use embassy_net::{
     Config as NetConfig, IpAddress, IpEndpoint, Ipv4Address, Runner, Stack, StackResources,
-    dns::DnsQueryType, tcp::TcpSocket,
+    dns::DnsQueryType,
+    tcp::{State as TcpState, TcpSocket},
 };
 use embassy_time::{Duration, Instant, Timer};
 use esp_radio::wifi::Interface;
@@ -195,7 +196,15 @@ impl FirmwareNetwork {
         endpoint: Endpoint,
         connect_timeout: Duration,
     ) -> Result<(), FirmwareNetError> {
-        if self.lpec_socket.may_send() || self.lpec_socket.may_recv() {
+        // Only reuse the existing socket if it's still fully Established.
+        // `may_send()`/`may_recv()` return true in half-closed and transient
+        // states too (FinWait*, CloseWait, …), and during a WiFi roam the
+        // socket can sit in Established from smoltcp's POV while the
+        // underlying link is gone — writes succeed into the TX buffer and
+        // then time out on the wire. Anything other than Established gets
+        // closed and reconnected so the next operation starts from a clean
+        // TCP handshake.
+        if self.lpec_socket.state() == TcpState::Established {
             return Ok(());
         }
 

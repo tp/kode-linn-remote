@@ -48,7 +48,7 @@ use esp_hal::{
 use esp_println::println;
 use esp_radio::wifi::{
     Config as WifiRadioConfig, ControllerConfig, DisconnectReason, Interfaces, WifiController,
-    WifiError, ap::AccessPointInfo, scan::ScanConfig, sta::StationConfig,
+    WifiError, ap::AccessPointInfo, event::EventInfo, scan::ScanConfig, sta::StationConfig,
 };
 use net::{
     ARTWORK_RX_BUFFER_BYTES, ARTWORK_TX_BUFFER_BYTES, FirmwareNetError, FirmwareNetwork,
@@ -222,6 +222,7 @@ async fn main(spawner: Spawner) -> ! {
         let _ = render_app(&mut app, &mut display, &mut scratch, render_requested);
         spawner.spawn(
             firmware_runtime_task(
+                spawner,
                 peripherals.WIFI,
                 app_config.wifi.clone(),
                 app_config.linn_lpec_endpoint,
@@ -462,14 +463,84 @@ async fn pwr_button_task(pin: GPIO2<'static>) {
     }
 }
 
+/// Listens for `StationDisconnected` and re-runs `connect_async`. Without this
+/// the application sees no signal when the AP drops the station (roaming
+/// hand-off, AP reboot, power-save renegotiation) and the network stack just
+/// sits on a dead link until every operation has timed out.
 #[embassy_executor::task]
-async fn firmware_runtime_task(wifi: WIFI<'static>, config: WifiConfig, endpoint: Endpoint) {
+async fn wifi_reconnect_task(mut controller: WifiController<'static>, config: WifiConfig) {
+    let (Some(ssid), Some(password)) = (&config.ssid, &config.password) else {
+        return;
+    };
+    let station_config = StationConfig::default()
+        .with_ssid(ssid.as_str())
+        .with_password(password.as_str().into());
+
+    loop {
+        // The subscriber borrows the controller immutably; its scope ends
+        // before we touch the controller mutably below.
+        wait_for_station_disconnect(&controller).await;
+        println!("wifi: link dropped — attempting reconnect");
+        // Small backoff so we don't hammer the controller if the AP just
+        // bounced.
+        Timer::after(EmbassyDuration::from_millis(500)).await;
+        if let Err(error) = controller.set_config(&WifiRadioConfig::Station(station_config.clone()))
+        {
+            println!("wifi: reconnect reconfigure failed: {:?}", error);
+            continue;
+        }
+        match controller.connect_async().await {
+            Ok(info) => println!(
+                "wifi: reconnected: channel={} auth={:?}",
+                info.channel, info.authmode
+            ),
+            Err(error) => println!("wifi: reconnect failed: {:?}", error),
+        }
+    }
+}
+
+async fn wait_for_station_disconnect(controller: &WifiController<'_>) {
+    let mut subscriber = match controller.subscribe() {
+        Ok(subscriber) => subscriber,
+        Err(error) => {
+            // If the event-channel subscriber slots are full we can't drive
+            // reconnects. Back off so this doesn't become a tight loop and
+            // let the caller retry the connect path periodically.
+            println!("wifi: reconnect subscribe failed: {:?}", error);
+            Timer::after(EmbassyDuration::from_secs(30)).await;
+            return;
+        }
+    };
+    loop {
+        if matches!(
+            subscriber.next_event_pure().await,
+            EventInfo::StationDisconnected { .. }
+        ) {
+            return;
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn firmware_runtime_task(
+    spawner: Spawner,
+    wifi: WIFI<'static>,
+    config: WifiConfig,
+    endpoint: Endpoint,
+) {
     match connect_wifi(wifi, &config).await {
         WifiConnection::Connected {
             controller,
             interfaces,
         } => {
-            let _controller = controller;
+            // Hand the controller to a dedicated reconnect task. Roaming
+            // (or any AP-initiated disassociation) emits StationDisconnected;
+            // without a listener nothing in app code notices and the next
+            // operation just times out into the void.
+            spawner.spawn(
+                wifi_reconnect_task(controller, config.clone())
+                    .expect("wifi reconnect task should allocate once"),
+            );
             // Statically reserve every long-lived buffer the network stack and
             // artwork loader need. `StaticCell::init` panics if called twice,
             // which is fine — `firmware_runtime_task` is spawned exactly once.
@@ -678,6 +749,12 @@ impl HifiController for FirmwareHifi<'_> {
             }
             Err(error) => {
                 println!("linn: pins fetch failed: {:?}", error);
+                // Same pattern as `status` and `handle_command`: a fetch that
+                // failed mid-exchange has likely left the LPEC stream
+                // mis-aligned with the device, so drop the socket and
+                // re-subscribe on the next call instead of writing into a
+                // desynced stream forever.
+                self.reset_lpec();
                 Err(FirmwareHifiError::Lpec(error))
             }
         }

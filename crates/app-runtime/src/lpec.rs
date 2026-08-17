@@ -2278,8 +2278,7 @@ mod tests {
         // happens to contain raw `\n` bytes between XML tags. The line reader
         // must absorb those into the value rather than treating each as
         // end-of-line.
-        let mut stream =
-            ScriptedByteStream::from_bytes(b"KEY \"value\nwith\nlines\"\r\nNEXT\r\n");
+        let mut stream = ScriptedByteStream::from_bytes(b"KEY \"value\nwith\nlines\"\r\nNEXT\r\n");
         let line = read_lpec_line(&mut stream).unwrap();
         assert_eq!(line.as_str(), "KEY \"value\nwith\nlines\"");
         let next = read_lpec_line(&mut stream).unwrap();
@@ -2291,9 +2290,8 @@ mod tests {
         // `\"` inside `"..."` must not toggle quote state, otherwise the
         // outer value closes prematurely and the rest of the line spills
         // into what the parser thinks is the next message.
-        let mut stream = ScriptedByteStream::from_bytes(
-            b"KEY \"contains \\\"escaped\\\" quotes\"\r\nNEXT\r\n",
-        );
+        let mut stream =
+            ScriptedByteStream::from_bytes(b"KEY \"contains \\\"escaped\\\" quotes\"\r\nNEXT\r\n");
         let line = read_lpec_line(&mut stream).unwrap();
         assert_eq!(line.as_str(), "KEY \"contains \\\"escaped\\\" quotes\"");
         let next = read_lpec_line(&mut stream).unwrap();
@@ -2323,10 +2321,8 @@ mod tests {
         // One malformed line from the device must not tear down the
         // session — a subsequent valid event must still apply.
         let mut session = LpecSession::new();
-        let mut stream = ScriptedByteStream::new(&[
-            "GARBAGE NOT A VALID LPEC LINE",
-            r#"EVENT 7 0 Volume "55""#,
-        ]);
+        let mut stream =
+            ScriptedByteStream::new(&["GARBAGE NOT A VALID LPEC LINE", r#"EVENT 7 0 Volume "55""#]);
 
         let status = session.poll(&mut stream).unwrap().unwrap();
         assert_eq!(status.volume_percent, 55);
