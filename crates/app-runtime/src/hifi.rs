@@ -21,6 +21,13 @@ pub struct HifiDriver<Hifi> {
     pins_fetched: bool,
     last_artwork_uri: String<HIFI_URI_LEN>,
     pending_artwork_uri: String<HIFI_URI_LEN>,
+    /// Most recent uptime seen on a tick.
+    ///
+    /// A skip arrives on the command channel, which carries no clock, but the
+    /// prediction it triggers needs one to know when to stop believing itself.
+    /// Ticks are frequent (50 ms in the simulator) against a multi-second
+    /// window, so the last one is close enough.
+    last_uptime_ms: u64,
 }
 
 impl<Hifi> HifiDriver<Hifi> {
@@ -34,6 +41,7 @@ impl<Hifi> HifiDriver<Hifi> {
             pins_fetched: false,
             last_artwork_uri: String::new(),
             pending_artwork_uri: String::new(),
+            last_uptime_ms: 0,
         }
     }
 
@@ -78,10 +86,34 @@ impl<Hifi> HifiDriver<Hifi>
 where
     Hifi: HifiController,
 {
-    pub fn mark_track_changed(&mut self) {
+    /// Moves to the next or previous track, showing it immediately when we can
+    /// say what it is.
+    ///
+    /// Returns the status to display now, or `None` when there is nothing to
+    /// predict from — in which case this falls back to what it always did:
+    /// clear the track and wait for the device.
+    pub fn mark_track_changed(&mut self, forward: bool) -> Option<Event> {
+        self.status_poll_requested = true;
+
+        if let Some(status) = self
+            .runtime
+            .hifi_mut()
+            .predict_skip(forward, self.last_uptime_ms)
+        {
+            // Queue the predicted artwork the way a real status would, so the
+            // picture follows the words rather than trailing a round trip
+            // behind them.
+            let artwork_uri = status.album_art_uri.clone();
+            if !artwork_uri.is_empty() && self.last_artwork_uri.as_str() != artwork_uri.as_str() {
+                self.pending_artwork_uri.clear();
+                let _ = self.pending_artwork_uri.push_str(artwork_uri.as_str());
+            }
+            return Some(Event::HifiStatus(status));
+        }
+
         self.forget_current_track_artwork();
         self.runtime.hifi_mut().mark_track_changed();
-        self.status_poll_requested = true;
+        None
     }
 
     pub fn handle_command(
@@ -98,8 +130,8 @@ where
             .handle_command(Command::Hifi(command))
             .map_err(DriverError::Command)?;
         if defer_status {
-            self.mark_track_changed();
-            return Ok(None);
+            let forward = matches!(command, HifiCommand::NextTrack);
+            return Ok(self.mark_track_changed(forward));
         }
         self.refresh_status()
     }
@@ -112,6 +144,7 @@ where
             return Ok(None);
         }
 
+        self.last_uptime_ms = uptime_ms;
         let due = self.status_poll_requested
             || uptime_ms.saturating_sub(self.last_status_poll_ms) >= self.poll_interval_ms;
         if !due {
@@ -120,6 +153,8 @@ where
 
         self.status_poll_requested = false;
         self.last_status_poll_ms = uptime_ms;
+        self.last_uptime_ms = uptime_ms;
+        self.runtime.hifi_mut().set_clock(uptime_ms);
         let result = self.refresh_status();
         if result.is_err() {
             self.status_poll_requested = true;
@@ -206,7 +241,7 @@ pub mod worker {
         SyncScreen { screen: Screen, uptime_ms: u64 },
         Tick { uptime_ms: u64 },
         RequestStatusPoll,
-        TrackChanged,
+        TrackChanged { forward: bool },
     }
 
     // `Event` carries a whole `HifiStatus`, so it dwarfs the other variants.
@@ -287,7 +322,8 @@ pub mod worker {
             match runtime.handle_command(Command::Hifi(command)) {
                 Ok(()) => {
                     if matches!(command, HifiCommand::PreviousTrack | HifiCommand::NextTrack) {
-                        let _ = background_requests.send(Request::TrackChanged);
+                        let forward = matches!(command, HifiCommand::NextTrack);
+                        let _ = background_requests.send(Request::TrackChanged { forward });
                     }
                     let _ = background_requests.send(Request::RequestStatusPoll);
                 }
@@ -319,8 +355,13 @@ pub mod worker {
                 Request::RequestStatusPoll => {
                     driver.request_status_poll();
                 }
-                Request::TrackChanged => {
-                    driver.mark_track_changed();
+                Request::TrackChanged { forward } => {
+                    // A prediction is an event in its own right: it is what
+                    // makes the screen change on the press rather than on the
+                    // reply.
+                    if let Some(event) = driver.mark_track_changed(forward) {
+                        let _ = responses.send(Response::Event(event));
+                    }
                 }
             }
         }
