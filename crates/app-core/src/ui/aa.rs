@@ -377,7 +377,25 @@ where
     Ok(())
 }
 
+/// The stroke band of a rounded rectangle: inside the outer edge, outside the
+/// inner one.
+struct RoundedRectRing {
+    outer: RoundedRect,
+    inner: RoundedRect,
+}
+
+impl Shape for RoundedRectRing {
+    fn contains(&self, x: i32, y: i32) -> bool {
+        self.outer.contains(x, y) && !self.inner.contains(x, y)
+    }
+}
+
 /// Outline of a rounded rectangle, anti-aliased against `backdrop`.
+///
+/// Draws **only** the stroke band. Delegating to [`rounded_rect`] with a
+/// backdrop-coloured fill would look identical on an empty background and
+/// quietly erase anything inside — which is exactly what happened when the
+/// focus ring painted over the control it was highlighting.
 pub(super) fn rounded_rect_outline<D>(
     display: &mut D,
     rect: Rectangle,
@@ -389,15 +407,12 @@ pub(super) fn rounded_rect_outline<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    rounded_rect(
-        display,
-        rect,
-        radius,
-        backdrop,
-        stroke,
-        stroke_width,
-        backdrop,
-    )
+    let outer = RoundedRect::new(rect, radius);
+    let ring = RoundedRectRing {
+        inner: outer.inset(stroke_width as i32),
+        outer,
+    };
+    draw_shape(display, rect, &ring, stroke, backdrop)
 }
 
 /// Filled circle, anti-aliased against `backdrop`.
@@ -539,6 +554,26 @@ mod tests {
         );
         assert_eq!(diagonal[0], 0, "outermost corner pixel is outside the arc");
         assert_eq!(diagonal[11], FULL, "innermost is fully covered");
+    }
+
+    #[test]
+    fn outline_leaves_its_interior_untouched() {
+        // Regression: the focus ring used to fill its interior with the
+        // backdrop, blacking out the control it was drawn around.
+        let rect = Rectangle::new(Point::new(0, 0), Size::new(60, 60));
+        let outer = RoundedRect::new(rect, 12);
+        let ring = RoundedRectRing {
+            inner: outer.inset(3),
+            outer,
+        };
+
+        assert_eq!(coverage(&ring, 30, 30), 0, "centre must not be painted");
+        assert_eq!(coverage(&ring, 30, 1), FULL, "top edge is the stroke");
+        assert_eq!(
+            coverage(&ring, 30, 10),
+            0,
+            "just inside the stroke is clear"
+        );
     }
 
     #[test]
