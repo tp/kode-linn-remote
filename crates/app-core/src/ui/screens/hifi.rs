@@ -197,7 +197,9 @@ const TILE_CAPTION_HEIGHT: u32 = 40;
 const TILE_HEIGHT: u32 = TILE_ART_HEIGHT + TILE_CAPTION_HEIGHT;
 const TILE_COL_GAP: i32 = 30;
 const TILE_ROW_GAP: i32 = 12;
-const TILE_RADIUS: u32 = 18;
+/// Same curve as every other surface, so the focus ring that wraps a tile is
+/// concentric with the cover inside it.
+const TILE_RADIUS: u32 = CARD_RADIUS;
 const CHOICES_COLS: usize = 2;
 
 /// Tiles on screen at once. The pin list may be longer; this is the viewport.

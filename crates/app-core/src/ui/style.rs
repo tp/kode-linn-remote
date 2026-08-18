@@ -1,7 +1,11 @@
 use embedded_graphics::{pixelcolor::Rgb565, prelude::RgbColor};
 
+/// Corner radius of every card-like surface: buttons, stopwatch cards, pin
+/// tiles. Deliberately one value rather than one per widget, because the focus
+/// ring's radius is derived from it — a surface that picked its own radius
+/// would end up inside a ring whose curve no longer matched it.
 pub(super) const CARD_RADIUS: u32 = 18;
-pub(super) const BUTTON_RADIUS: u32 = 18;
+pub(super) const BUTTON_RADIUS: u32 = CARD_RADIUS;
 
 /// Colours taken from the Kode Dot itself.
 ///
@@ -87,4 +91,12 @@ pub(super) const FOCUS_RING: Rgb565 = dot::BLUE;
 /// Padding between a focused control's bounds and its ring.
 pub(super) const FOCUS_RING_INSET: i32 = 6;
 pub(super) const FOCUS_RING_STROKE: u32 = 3;
-pub(super) const FOCUS_RING_RADIUS: u32 = 14;
+/// Concentric with the surface it surrounds, which is what makes the gap
+/// between the two look even.
+///
+/// An outer curve sitting `g` pixels outside an inner one has to use
+/// `r_inner + g`; then both arcs share a centre and the gap is `g` all the way
+/// round. Get it wrong and the gap breathes: at 14 this ring cleared a tile's
+/// cover by 3 px along the edges and 7 px across the diagonal, so a focused
+/// cover looked pinched at its corners.
+pub(super) const FOCUS_RING_RADIUS: u32 = CARD_RADIUS + FOCUS_RING_INSET as u32;
