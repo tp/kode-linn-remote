@@ -704,6 +704,49 @@ mod tests {
         assert_ne!(app.screen(), Screen::Launcher, "the pad never left home");
     }
 
+    #[test]
+    fn the_pad_can_start_a_pin() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        let mut pins = HifiPins::new();
+        pins.set(0, loaded_pin(4711, "Radio"));
+        pins.set(1, loaded_pin(8128, "Spotify"));
+        app.update(Event::HifiPins(pins));
+        hifi_to_choices(&mut app);
+
+        // Reveal the ring, then activate what it sits on.
+        let revealed = app.update(Event::ButtonPressed(Button::Select));
+        assert_eq!(
+            revealed.command, None,
+            "the first press should only show the ring"
+        );
+
+        let activated = app.update(Event::ButtonPressed(Button::Select));
+        assert_eq!(
+            activated.command,
+            Some(Command::Hifi(HifiCommand::InvokePinId { id: 4711 })),
+            "the pad could not start a pin the touch screen can"
+        );
+    }
+
+    #[test]
+    fn the_pad_can_start_a_pin_it_moved_to() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        let mut pins = HifiPins::new();
+        pins.set(0, loaded_pin(4711, "Radio"));
+        pins.set(1, loaded_pin(8128, "Spotify"));
+        app.update(Event::HifiPins(pins));
+        hifi_to_choices(&mut app);
+
+        app.update(Event::ButtonPressed(Button::Select));
+        app.update(Event::ButtonPressed(Button::Right));
+        let activated = app.update(Event::ButtonPressed(Button::Select));
+
+        assert_eq!(
+            activated.command,
+            Some(Command::Hifi(HifiCommand::InvokePinId { id: 8128 }))
+        );
+    }
+
     fn loaded_pin(id: u32, title: &str) -> HifiPin {
         let mut pin_title = String::<HIFI_PIN_TITLE_LEN>::new();
         pin_title.push_str(title).unwrap();

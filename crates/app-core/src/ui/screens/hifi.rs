@@ -1116,10 +1116,12 @@ where
     // Paused, and there is a picture to mark. Without artwork the slot above
     // already shows pause bars as its state glyph, so badging that too would
     // draw the same thing twice.
-    let paused = matches!(
-        state.status.playback,
-        PlaybackState::Paused | PlaybackState::Stopped
-    );
+    // Only when pause is what the streamer was *asked* for. `Stopped` shows up
+    // in passing while a track loads -- between tracks, and for a moment after
+    // a pin starts something new -- and badging that made the overlay blink on
+    // and off through every transition, saying "paused" about a player that was
+    // busy starting.
+    let paused = matches!(state.status.playback, PlaybackState::Paused);
     let badge_wanted = paused && art_kind == ART_SLOT_ARTWORK;
     if badge_wanted {
         // Redrawn after the volume readout lapses, because that panel is
@@ -2217,6 +2219,20 @@ mod tests {
         state.apply_status(insisting, 1_000 + crate::ui::optimistic::OPTIMISTIC_TTL_MS);
 
         assert_eq!(state.status.elapsed_seconds, 45);
+    }
+
+    #[test]
+    fn loading_a_track_does_not_claim_to_be_paused() {
+        let mut state = state_with_artwork("http://art/one.jpg");
+        for transient in [PlaybackState::Stopped, PlaybackState::Buffering] {
+            let mut status = state.status.clone();
+            status.playback = transient;
+            state.apply_status(status, 1_000);
+            assert!(
+                !matches!(state.status.playback, PlaybackState::Paused),
+                "{transient:?} was treated as a pause"
+            );
+        }
     }
 
     fn filled_pins() -> HifiPins {
