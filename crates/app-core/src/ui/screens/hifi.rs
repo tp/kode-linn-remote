@@ -289,6 +289,10 @@ pub(crate) struct State {
     stale_artwork_until_ms: Option<u64>,
     /// Cover per pin tile, filled in as each is fetched.
     pin_artwork: [Option<HifiArtwork>; CHOICES_VISIBLE],
+    /// What a pin is showing while the streamer works out what to play.
+    ///
+    /// `None` once the device has named a track, or once the window lapses.
+    pin_intro: Option<PinIntro>,
     /// Uptime until which a position ahead of our own is taken to describe the
     /// place we just left rather than where we are.
     ///
@@ -297,6 +301,18 @@ pub(crate) struct State {
     /// equality to wait for. What can be said is that immediately after a
     /// restart the position only goes down, so anything far ahead is stale.
     progress_guard_until_ms: Option<u64>,
+}
+
+/// A pin standing in for the track it is about to start.
+///
+/// A pin cannot predict a track -- it starts an album or playlist whose first
+/// song nobody has told us -- but it can say what was pressed, which is true
+/// however the device resolves it. `previous_title` is what tells a status that
+/// has not caught up yet from one that has.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PinIntro {
+    expires_at_ms: u64,
+    previous_title: String<HIFI_TEXT_LEN>,
 }
 
 /// What a screen did with a raw pad press.
@@ -427,6 +443,7 @@ impl State {
             optimistic_volume: None,
             stale_artwork_until_ms: None,
             pin_artwork: [const { None }; CHOICES_VISIBLE],
+            pin_intro: None,
             progress_guard_until_ms: None,
         }
     }
@@ -538,6 +555,14 @@ impl State {
             self.progress_guard_until_ms = None;
         }
 
+        if self
+            .pin_intro
+            .as_ref()
+            .is_some_and(|intro| uptime_ms >= intro.expires_at_ms)
+        {
+            self.pin_intro = None;
+        }
+
         let playback_changed = self.tick_playback(uptime_ms);
         playback_changed || overlay_lapsed || stale_lapsed
     }
@@ -622,6 +647,18 @@ impl State {
 
     pub(crate) fn apply_status(&mut self, mut status: HifiStatus, uptime_ms: u64) -> bool {
         let was_loading = self.loading;
+
+        // A pin is on screen and the device is still describing what it
+        // replaced. Keep the pin's own words; everything else -- volume,
+        // transport -- is about the player and still applies.
+        if self.pin_intro_holds(&status, uptime_ms) {
+            status.title = self.status.title.clone();
+            status.artist = self.status.artist.clone();
+            status.album = self.status.album.clone();
+            status.album_art_uri = self.status.album_art_uri.clone();
+            status.duration_seconds = self.status.duration_seconds;
+        }
+
         status.elapsed_seconds = self.accept_progress(status.elapsed_seconds, uptime_ms);
 
         // What the user just asked for outranks a reply composed before they
@@ -790,17 +827,16 @@ impl State {
                 Some(Command::NextTrack)
             }
             Action::InvokePinSlot(slot) => {
-                let id = self.pins.get(slot)?.id;
+                let pin = self.pins.get(slot)?;
+                let id = pin.id;
+                let title = pin.title.clone();
+                let artwork_uri = pin.artwork_uri.clone();
+
                 // Playing something is the point of this screen, so go
                 // straight back to it rather than leaving the user on a grid
                 // wondering whether the press landed.
                 self.page = HifiPage::NowPlaying;
-                // A pin is the one case we genuinely cannot predict: it starts
-                // an album or playlist whose first track nobody has told us.
-                // Holding the previous cover for the grace window still beats
-                // an empty slot, and the window bounds how long a stale cover
-                // can misrepresent what is playing.
-                self.begin_track_change(uptime_ms);
+                self.show_pin_while_it_starts(title, artwork_uri, slot, uptime_ms);
                 Some(Command::InvokePinId { id })
             }
             Action::VolumeDelta(delta) => {
@@ -818,6 +854,72 @@ impl State {
                 Some(Command::SetVolume { volume: next })
             }
         }
+    }
+
+    /// Puts the pin on screen while the streamer works out what to play.
+    ///
+    /// Returning to Now Playing after tapping a pin used to show the previous
+    /// track -- the one thing certainly not about to play. The pin's own name
+    /// and cover are a smaller claim and a true one: it is what was pressed,
+    /// whatever the device picks out of it.
+    ///
+    /// Artist and album are cleared rather than kept. Leaving the old artist
+    /// under a new title would read as a track that does not exist.
+    fn show_pin_while_it_starts(
+        &mut self,
+        title: String<{ crate::HIFI_PIN_TITLE_LEN }>,
+        artwork_uri: String<{ crate::HIFI_URI_LEN }>,
+        slot: usize,
+        uptime_ms: u64,
+    ) {
+        let previous_title = self.status.title.clone();
+
+        self.status.title.clear();
+        let _ = self.status.title.push_str(title.as_str());
+        self.status.artist.clear();
+        self.status.album.clear();
+        self.status.elapsed_seconds = 0;
+        self.status.duration_seconds = 0;
+
+        // The grid the user just came from has already fetched this cover, so
+        // it costs a clone rather than a round trip.
+        self.status.album_art_uri.clear();
+        let _ = self.status.album_art_uri.push_str(artwork_uri.as_str());
+        self.artwork = self
+            .pin_artwork
+            .get(slot)
+            .and_then(|artwork| artwork.clone())
+            .filter(|artwork| artwork.source_uri == self.status.album_art_uri);
+        self.stale_artwork_until_ms = None;
+
+        // A pin is a request to play, so say so rather than leaving a pause
+        // badge over something that is starting.
+        self.status.playback = PlaybackState::Playing;
+        self.optimistic_playback = Some(Optimistic::hold(PlaybackState::Playing, uptime_ms));
+
+        self.pin_intro = Some(PinIntro {
+            expires_at_ms: uptime_ms.saturating_add(OPTIMISTIC_TTL_MS),
+            previous_title,
+        });
+        self.guard_progress(uptime_ms);
+    }
+
+    /// Whether a status still describes the track the pin replaced.
+    fn pin_intro_holds(&mut self, incoming: &HifiStatus, uptime_ms: u64) -> bool {
+        let Some(intro) = self.pin_intro.as_ref() else {
+            return false;
+        };
+        if uptime_ms >= intro.expires_at_ms {
+            self.pin_intro = None;
+            return false;
+        }
+        // The device naming anything other than what we left means it has
+        // moved on, and it knows better than we do what it started.
+        if incoming.title != intro.previous_title {
+            self.pin_intro = None;
+            return false;
+        }
+        true
     }
 
     /// Marks the current track as on its way out without emptying the screen.
@@ -2233,6 +2335,96 @@ mod tests {
                 "{transient:?} was treated as a pause"
             );
         }
+    }
+
+    fn pins_with_cover() -> (HifiPins, HifiArtwork) {
+        let mut pins = HifiPins::new();
+        let mut pin = HifiPin::new(1, "Village");
+        let _ = pin.artwork_uri.push_str("http://art/village.jpg");
+        pins.set(0, pin);
+
+        let mut artwork = HifiArtwork::new("http://art/village.jpg").unwrap();
+        for _ in 0..crate::HIFI_ARTWORK_PIXELS {
+            artwork.push_pixel(Rgb565::CSS_REBECCAPURPLE);
+        }
+        (pins, artwork)
+    }
+
+    #[test]
+    fn tapping_a_pin_shows_the_pin_not_the_old_track() {
+        let mut state = state_with_artwork("http://art/old.jpg");
+        let (pins, cover) = pins_with_cover();
+        state.apply_pins(pins);
+        state.apply_pin_artwork(0, cover);
+
+        state.handle(Action::InvokePinSlot(0), 1_000);
+
+        assert_eq!(state.status.title.as_str(), "Village");
+        // The old artist under a new title would describe a track that does
+        // not exist.
+        assert!(state.status.artist.is_empty());
+        assert_eq!(
+            state.artwork.as_ref().map(|a| a.source_uri.as_str()),
+            Some("http://art/village.jpg"),
+            "the pin's own cover was already fetched for the grid"
+        );
+        assert_eq!(compute_art_kind(&state), ART_SLOT_ARTWORK);
+    }
+
+    #[test]
+    fn the_old_track_does_not_come_back_while_the_pin_starts() {
+        let mut state = state_with_artwork("http://art/old.jpg");
+        let old_title = state.status.title.clone();
+        let (pins, cover) = pins_with_cover();
+        state.apply_pins(pins);
+        state.apply_pin_artwork(0, cover);
+        state.handle(Action::InvokePinSlot(0), 1_000);
+
+        // The streamer has not started anything yet and still reports what it
+        // was playing.
+        let mut lagging = HifiStatus::empty();
+        lagging.title = old_title;
+        lagging.playback = PlaybackState::Playing;
+        lagging.volume_percent = 42;
+        state.apply_status(lagging, 1_100);
+
+        assert_eq!(state.status.title.as_str(), "Village");
+        // Volume is about the player, not the track, so it still lands.
+        assert_eq!(state.status.volume_percent, 42);
+    }
+
+    #[test]
+    fn the_track_the_pin_started_replaces_it() {
+        let mut state = state_with_artwork("http://art/old.jpg");
+        let (pins, cover) = pins_with_cover();
+        state.apply_pins(pins);
+        state.apply_pin_artwork(0, cover);
+        state.handle(Action::InvokePinSlot(0), 1_000);
+
+        let mut started = HifiStatus::empty();
+        let _ = started.title.push_str("Track One");
+        started.playback = PlaybackState::Playing;
+        state.apply_status(started, 1_100);
+
+        assert_eq!(state.status.title.as_str(), "Track One");
+        assert!(state.pin_intro.is_none());
+    }
+
+    #[test]
+    fn a_pin_that_never_starts_does_not_hold_the_screen() {
+        let mut state = state_with_artwork("http://art/old.jpg");
+        let old_title = state.status.title.clone();
+        let (pins, cover) = pins_with_cover();
+        state.apply_pins(pins);
+        state.apply_pin_artwork(0, cover);
+        state.handle(Action::InvokePinSlot(0), 1_000);
+
+        let mut lagging = HifiStatus::empty();
+        lagging.title = old_title.clone();
+        lagging.playback = PlaybackState::Playing;
+        state.apply_status(lagging, 1_000 + crate::ui::optimistic::OPTIMISTIC_TTL_MS);
+
+        assert_eq!(state.status.title.as_str(), old_title.as_str());
     }
 
     fn filled_pins() -> HifiPins {
