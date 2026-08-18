@@ -79,7 +79,7 @@ type SimHifiError = LpecError<std::io::Error>;
 fn start_runtime_worker() -> RuntimeWorker<SimHifiError> {
     let endpoint = AppConfig::load_local_or_default().linn_lpec_endpoint;
     let hifi = LpecSessionHifi::new(HostTcpConnector::new(), endpoint);
-    let command_hifi = LpecSessionHifi::new(HostTcpConnector::new(), endpoint);
+    let command_hifi = LpecSessionHifi::command_only(HostTcpConnector::new(), endpoint);
     runtime_worker::start(HifiDriver::new(hifi, HIFI_STATUS_POLL_MS), command_hifi)
 }
 

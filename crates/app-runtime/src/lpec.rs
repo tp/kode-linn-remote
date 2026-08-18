@@ -69,7 +69,14 @@ use crate::{
 /// a 330 px artwork slot needs as a source.
 const MAX_ARTWORK_BYTES: usize = 192 * 1024;
 const MAX_HTTP_HEADER_BYTES: usize = 8 * 1024;
-const SESSION_ACTION_LINE_BUDGET: usize = 16;
+/// Lines an action will read past while waiting for its own response.
+///
+/// Generous because a session that has just subscribed gets the device's whole
+/// initial-state burst first -- four services' worth, including a ~950-byte
+/// `ProtocolInfo` and a full DIDL-Lite blob -- and the response is behind all
+/// of it. At 16 this ran out mid-burst and reported `UnexpectedMessage`, which
+/// looked like a protocol fault and was really us hanging up too early.
+const SESSION_ACTION_LINE_BUDGET: usize = 96;
 /// Upper bound on event lines drained from a single `poll()`. Stops a misbehaving
 /// device from holding the worker thread indefinitely.
 const SESSION_POLL_LINE_BUDGET: usize = 32;
@@ -196,6 +203,23 @@ where
             connector,
             endpoint,
             session: LpecSession::new(),
+            pending_status: None,
+            now_ms: 0,
+        }
+    }
+
+    /// A controller for the command lane.
+    ///
+    /// The worker runs commands and status polling on separate connections so
+    /// a slow poll cannot delay a button press. Only the polling one wants the
+    /// event stream; this one would otherwise subscribe, receive the entire
+    /// initial-state burst, and have to read past it to find the response to
+    /// the command it just sent.
+    pub fn command_only(connector: C, endpoint: Endpoint) -> Self {
+        Self {
+            connector,
+            endpoint,
+            session: LpecSession::command_only(),
             pending_status: None,
             now_ms: 0,
         }
@@ -576,6 +600,13 @@ pub struct LpecSession {
     response_args: Box<heapless::Vec<linn_lpec::ResponseArg, { linn_lpec::MAX_ARGS }>>,
     /// The queue, so a skip can be shown before the device confirms it.
     playlist: PlaylistState,
+    /// Whether this session wants the device's event stream.
+    ///
+    /// A session that only sends commands does not: subscribing would earn it
+    /// the whole initial-state burst, which it then has to read past to reach
+    /// its own response, for events it never looks at. Commands already update
+    /// the cached status themselves.
+    subscribes: bool,
     /// Most recent uptime handed to [`LpecSession::poll`].
     ///
     /// Events also arrive while an action waits for its response, and those
@@ -593,7 +624,17 @@ impl LpecSession {
             status: HifiStatus::empty(),
             response_args: Box::new(heapless::Vec::new()),
             playlist: PlaylistState::new(),
+            subscribes: true,
             now_ms: 0,
+        }
+    }
+
+    /// A session for the command lane, which sends actions and reads their
+    /// responses and nothing else.
+    pub fn command_only() -> Self {
+        Self {
+            subscribes: false,
+            ..Self::new()
         }
     }
 
@@ -889,7 +930,7 @@ impl LpecSession {
     where
         S: ByteStream,
     {
-        if self.subscribed {
+        if self.subscribed || !self.subscribes {
             return Ok(false);
         }
 
