@@ -1656,10 +1656,31 @@ fn find_json_number_field(object: &str, key: &str) -> Option<u32> {
     parse_u32(&object[start..pos])
 }
 
+/// Every byte this crate sends to the DS goes through here, so this is the one
+/// place that can answer "what did we actually ask it to do".
+///
+/// Set `LINN_TRACE=1` on the host to print it. Worth having permanently: the
+/// difference between "the app told the streamer to do that" and "the streamer
+/// did that on its own" is otherwise unanswerable from the outside, and it is
+/// exactly the question that matters when something moves that nobody asked to
+/// move.
+#[cfg(feature = "std")]
+fn trace_lpec_line(line: &str) {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("LINN_TRACE").is_some()) {
+        eprintln!("lpec tx: {line}");
+    }
+}
+
+#[cfg(not(feature = "std"))]
+fn trace_lpec_line(_line: &str) {}
+
 fn write_lpec_line<S>(stream: &mut S, line: &str) -> Result<(), Error<S::Error>>
 where
     S: ByteStream,
 {
+    trace_lpec_line(line);
     stream.write_all(line.as_bytes()).map_err(Error::Connect)?;
     stream.write_all(b"\r\n").map_err(Error::Connect)?;
     stream.flush().map_err(Error::Connect)
@@ -2494,6 +2515,10 @@ where
     type Error = Error<S::Error>;
 
     fn write_line(&mut self, line: &str) -> Result<(), Self::Error> {
+        // The command controller writes here rather than through
+        // `write_lpec_line`, and commands are the half of the traffic worth
+        // tracing most.
+        trace_lpec_line(line);
         self.stream
             .write_all(line.as_bytes())
             .map_err(Error::Connect)?;
