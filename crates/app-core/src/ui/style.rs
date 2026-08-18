@@ -92,20 +92,27 @@ pub(super) const PROGRESS_FILL: Rgb565 = dot::SHELL;
 /// against what it outlines and both control buttons are themselves blue — a
 /// blue ring flush against a blue button is not a highlight.
 pub(super) const FOCUS_RING: Rgb565 = dot::SHELL;
-pub(super) const FOCUS_RING_STROKE: u32 = 3;
+/// Width of the ring's stroke band.
+///
+/// One pixel wider than the inset, so the band reaches a pixel *inside* the
+/// control's bounds. That pixel is not decoration. A rounded control has its
+/// own anti-aliased edge, blended against the background before the ring is
+/// drawn, and a ring that merely butts up against it leaves that half-dark
+/// thread showing between the two — the ring can be told what lies under it,
+/// but not undo what is already there. Painting over it is what makes the two
+/// read as touching.
+pub(super) const FOCUS_RING_STROKE: u32 = 4;
 /// How far the ring's outer edge sits beyond the control's bounds.
 ///
-/// Equal to the stroke, so the ring's *inner* edge lands exactly on those
-/// bounds and the two meet with nothing between them. Any more leaves a black
-/// channel, and around a bright cover that channel reads as a notch at the
-/// corners rather than as deliberate spacing.
-pub(super) const FOCUS_RING_INSET: i32 = FOCUS_RING_STROKE as i32;
+/// Small enough that the ring lies against the control rather than floating
+/// off it: any wider and a black channel opens up, which around a bright cover
+/// reads as a notch at the corners rather than as deliberate spacing.
+pub(super) const FOCUS_RING_INSET: i32 = 3;
 /// Concentric with the surface it surrounds.
 ///
 /// An outer curve sitting `g` pixels outside an inner one has to use
-/// `r_inner + g`; then both arcs share a centre. Since the inset equals the
-/// stroke, that also makes the ring's inner curve exactly the surface's own —
-/// the two follow one another instead of diverging at the corners. Get it
-/// wrong and the spacing breathes: at 14, six pixels out, this ring cleared a
-/// tile's cover by 3 px along the edges and 7 px across the diagonal.
+/// `r_inner + g`; then both arcs share a centre and follow one another instead
+/// of diverging at the corners. Get it wrong and the spacing breathes: at 14,
+/// six pixels out, this ring cleared a tile's cover by 3 px along the edges
+/// and 7 px across the diagonal.
 pub(super) const FOCUS_RING_RADIUS: u32 = CARD_RADIUS + FOCUS_RING_INSET as u32;
