@@ -1243,12 +1243,17 @@ where
         // Redrawn after the volume readout lapses, because that panel is
         // larger than the badge and covered it completely.
         if !cache.now_playing.pause_badge_visible || overlay_just_hidden {
-            draw_panel(
+            // The badge is only ever drawn over the cover -- see
+            // `badge_wanted` above -- so its corners blend into the picture.
+            let artwork = state.artwork.as_ref();
+            let art_rect = ui_layout.artwork;
+            draw_panel_over(
                 painter.display(),
                 ui_layout.pause_badge,
                 PAUSE_BADGE_RADIUS,
                 OLED_BLACK,
                 SURFACE_BORDER,
+                |point| artwork_pixel_at(artwork, art_rect, point),
             )?;
             let bars = PauseBars {
                 rect: ui_layout.pause_badge,
@@ -1445,7 +1450,12 @@ where
         // so it stays rather than becoming an empty rectangle.
         match state.pin_artwork[slot].as_ref() {
             Some(artwork) if active => {
-                draw_scaled_artwork(painter.display(), ui_layout.tile_art[slot], artwork)?;
+                draw_scaled_artwork(
+                    painter.display(),
+                    ui_layout.tile_art[slot],
+                    TILE_RADIUS,
+                    artwork,
+                )?;
             }
             _ => {
                 let (fill, stroke) = if active {
@@ -1493,6 +1503,7 @@ where
 fn draw_scaled_artwork<D>(
     display: &mut D,
     target: Rectangle,
+    radius: u32,
     artwork: &HifiArtwork,
 ) -> Result<(), RenderError<D::Error>>
 where
@@ -1504,24 +1515,22 @@ where
         return Ok(());
     }
 
-    let width = target.size.width as usize;
-    let height = target.size.height as usize;
+    let width = target.size.width as i32;
+    let height = target.size.height as i32;
     if width == 0 || height == 0 {
         return Ok(());
     }
 
-    display
-        .fill_contiguous(
-            &target,
-            (0..height).flat_map(|y| {
-                let source_y = y * source_size / height;
-                (0..width).map(move |x| {
-                    let source_x = x * source_size / width;
-                    pixels[source_y * source_size + source_x]
-                })
-            }),
-        )
-        .map_err(RenderError::Draw)
+    // Same corners as the tinted card it replaces. Blitting it square left a
+    // pin with a cover looking unlike a pin without one.
+    aa::rounded_image(display, target, radius, OLED_BLACK, |point| {
+        let x = (point.x - target.top_left.x).clamp(0, width - 1) as usize;
+        let y = (point.y - target.top_left.y).clamp(0, height - 1) as usize;
+        let source_x = x * source_size / width as usize;
+        let source_y = y * source_size / height as usize;
+        pixels[source_y * source_size + source_x]
+    })
+    .map_err(RenderError::Draw)
 }
 
 /// The artwork pixel showing at a point, or the OLED background where there is

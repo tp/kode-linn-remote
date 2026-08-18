@@ -1097,13 +1097,38 @@ fn demo_artwork() -> HifiArtwork {
     artwork
 }
 
+/// A pin cover: bright, so a tile's corners show plainly against the black
+/// background whether they are rounded or not.
+fn demo_pin_artwork() -> HifiArtwork {
+    let mut artwork = HifiArtwork::new("demo://pin-cover").expect("uri fits");
+    let size = HIFI_ARTWORK_SIZE as i32;
+    for y in 0..size {
+        for x in 0..size {
+            let color = Rgb565::new(
+                (24 - (y * 16 / size)) as u8,
+                (20 + (x * 40 / size)) as u8,
+                (12 + (y * 18 / size)) as u8,
+            );
+            artwork.push_pixel(color);
+        }
+    }
+    artwork
+}
+
 fn demo_pins() -> HifiPins {
     let mut pins = HifiPins::new();
     for (slot, title) in ["Favourites", "Dance!", "Sleepy", "Stories"]
         .into_iter()
         .enumerate()
     {
-        pins.set(slot, HifiPin::new(slot as u32 + 1, title));
+        let mut pin = HifiPin::new(slot as u32 + 1, title);
+        // Two of four carry a cover, so one snapshot shows both a tile that
+        // has one and a tile that does not -- which is where a difference in
+        // their corners would show up.
+        if slot % 2 == 0 {
+            let _ = pin.artwork_uri.push_str("demo://pin-cover");
+        }
+        pins.set(slot, pin);
     }
     pins
 }
@@ -1160,6 +1185,14 @@ fn write_snapshots(directory: &Path) -> std::io::Result<()> {
             let _ = app.update(Event::HifiStatus(demo_status()));
             let _ = app.update(Event::HifiArtwork(demo_artwork()));
             let _ = app.update(Event::HifiPins(demo_pins()));
+            // Pin covers reach the grid as their own events, so a snapshot
+            // without them never exercises a picture drawn into a tile.
+            for slot in [0, 2] {
+                let _ = app.update(Event::HifiPinArtwork {
+                    slot,
+                    artwork: demo_pin_artwork(),
+                });
+            }
         }
         for button in *presses {
             let _ = app.update(Event::ButtonPressed(*button));

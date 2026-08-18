@@ -406,6 +406,44 @@ where
     Ok(())
 }
 
+/// A rounded rectangle whose fill comes from an image rather than one colour.
+///
+/// Used to give a picture the same corners a panel would have. Coverage blends
+/// the sampled pixel into `backdrop` at the edges, so the rounding is
+/// anti-aliased rather than a hard staircase.
+pub(super) fn rounded_image<D, F>(
+    display: &mut D,
+    rect: Rectangle,
+    radius: u32,
+    backdrop: Rgb565,
+    pixel_at: F,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+    F: Fn(Point) -> Rgb565,
+{
+    let shape = RoundedRect::new(rect, radius);
+    let width = rect.size.width as usize;
+    if width == 0 {
+        return Ok(());
+    }
+
+    for row in 0..rect.size.height as i32 {
+        let y = rect.top_left.y + row;
+        let colors = (0..rect.size.width as i32).map(|column| {
+            let x = rect.top_left.x + column;
+            let point = Point::new(x, y);
+            blend(pixel_at(point), backdrop, coverage(&shape, x, y))
+        });
+        display.fill_contiguous(
+            &Rectangle::new(Point::new(rect.top_left.x, y), Size::new(width as u32, 1)),
+            colors,
+        )?;
+    }
+
+    Ok(())
+}
+
 /// The stroke band of a rounded rectangle: inside the outer edge, outside the
 /// inner one.
 struct RoundedRectRing {
