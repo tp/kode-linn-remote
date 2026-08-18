@@ -1302,7 +1302,19 @@ where
         has_rendered,
     )?;
 
-    let artist_text = non_empty_or(&state.status.artist, "Not playing");
+    // "Not playing" explains an empty screen at rest. Printing it under a title
+    // we have just said *is* playing contradicts the line above it -- which is
+    // what a pin does while the streamer works out what it started, and what a
+    // track with no credited artist does always. Silence is the honest answer
+    // there; the hint is only for when nothing is going on.
+    let artist_text = if matches!(
+        state.status.playback,
+        PlaybackState::Playing | PlaybackState::Buffering
+    ) {
+        state.status.artist.as_str()
+    } else {
+        non_empty_or(&state.status.artist, "Not playing")
+    };
     draw_marquee_band(
         &mut painter,
         MarqueeInput {
@@ -2335,6 +2347,44 @@ mod tests {
                 "{transient:?} was treated as a pause"
             );
         }
+    }
+
+    /// The caption under the title, as the renderer would choose it.
+    fn artist_caption(state: &State) -> &str {
+        if matches!(
+            state.status.playback,
+            PlaybackState::Playing | PlaybackState::Buffering
+        ) {
+            state.status.artist.as_str()
+        } else {
+            non_empty_or(&state.status.artist, "Not playing")
+        }
+    }
+
+    #[test]
+    fn a_starting_pin_is_not_captioned_not_playing() {
+        let mut state = state_with_artwork("http://art/old.jpg");
+        let (pins, cover) = pins_with_cover();
+        state.apply_pins(pins);
+        state.apply_pin_artwork(0, cover);
+        state.handle(Action::InvokePinSlot(0), 1_000);
+
+        assert_eq!(state.status.title.as_str(), "Village");
+        assert_eq!(
+            artist_caption(&state),
+            "",
+            "the caption contradicted the title above it"
+        );
+    }
+
+    #[test]
+    fn an_idle_screen_still_says_so() {
+        let mut state = State::new(0);
+        let mut idle = HifiStatus::empty();
+        idle.playback = PlaybackState::Stopped;
+        state.apply_status(idle, 0);
+
+        assert_eq!(artist_caption(&state), "Not playing");
     }
 
     fn pins_with_cover() -> (HifiPins, HifiArtwork) {
