@@ -276,6 +276,38 @@ pub fn pins_read_list_arg(ids: &str) -> Action<'_> {
     Action::one(Service::Pins, 1, "ReadList", ids)
 }
 
+/// Reads the queue as an array of track ids.
+///
+/// `Ds/Playlist` is an older service, so the getter is the bare property name
+/// (`IdArray`) rather than `GetIdArray` — the opposite of `Ds/Pins` above.
+pub fn playlist_id_array() -> Action<'static> {
+    Action::new(Service::Playlist, 1, "IdArray", &[])
+}
+
+/// Reads the id of the track the DS is playing now.
+pub fn playlist_id() -> Action<'static> {
+    Action::new(Service::Playlist, 1, "Id", &[])
+}
+
+/// Reads metadata for a space-separated list of track ids.
+pub fn playlist_read_list_arg(ids: &str) -> Action<'_> {
+    Action::one(Service::Playlist, 1, "ReadList", ids)
+}
+
+/// Jumps straight to a known track id.
+///
+/// Preferred over [`playlist_next`] once the queue is known: it says where to
+/// land rather than which way to step, so a prediction and the request that
+/// follows it cannot disagree.
+pub fn playlist_seek_id_arg(id: &str) -> Action<'_> {
+    Action::one(Service::Playlist, 1, "SeekId", id)
+}
+
+/// Jumps to a queue position, counted from zero.
+pub fn playlist_seek_index_arg(index: &str) -> Action<'_> {
+    Action::one(Service::Playlist, 1, "SeekIndex", index)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventedVariable<'a> {
     pub name: &'a str,

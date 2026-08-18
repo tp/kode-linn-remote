@@ -23,3 +23,6 @@ heapless.workspace = true
 linn-lpec.workspace = true
 zune-core.workspace = true
 zune-jpeg.workspace = true
+
+[dev-dependencies]
+app-core = { path = "../app-core" }

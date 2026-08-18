@@ -37,8 +37,9 @@ use crate::{
 
 use super::super::{
     aa,
-    components::{clear_rect, draw_panel, draw_spinner_dots, ui_font},
+    components::{clear_rect, draw_panel, draw_panel_over, draw_spinner_dots, ui_font},
     focus::FocusTargets,
+    optimistic::{OPTIMISTIC_TTL_MS, Optimistic},
     painter::Painter,
     style::*,
     widget::{Slot, Widget},
@@ -94,6 +95,14 @@ const OVERLAY_HEIGHT: u32 = 106;
 const OVERLAY_RADIUS: u32 = 22;
 const OVERLAY_VALUE_TOP: i32 = 158;
 const OVERLAY_VALUE_HEIGHT: u32 = 40;
+/// How far the readout band is held back from the panel's edge.
+///
+/// It is a scratch widget, so the painter clears it and blits the whole band --
+/// and at the panel's full width that blit lands on top of the border, cutting
+/// it away for the band's height on both sides. Four pixels clears the 1 px
+/// stroke and the anti-aliased fringe beside it. The number is centred, so
+/// narrowing the band does not move it.
+const OVERLAY_VALUE_INSET: i32 = 4;
 const OVERLAY_TRACK_LEFT: i32 = 110;
 const OVERLAY_TRACK_TOP: i32 = 214;
 const OVERLAY_TRACK_WIDTH: u32 = 190;
@@ -103,6 +112,12 @@ const OVERLAY_TRACK_HEIGHT: u32 = 10;
 // line: the state belongs to the picture, and a word beside the artist reads
 // as part of the artist's name. It is centred on the same line as the volume
 // readout, which therefore covers it completely while volume is being changed.
+/// How long the previous track's cover may stand in for one still being
+/// fetched.
+///
+/// Long enough to cover a fetch and decode, short enough that a track with no
+/// artwork of its own does not keep wearing someone else's.
+const STALE_ARTWORK_GRACE_MS: u64 = 900;
 const PAUSE_BADGE_SIZE: u32 = 106;
 const PAUSE_BADGE_RADIUS: u32 = 22;
 
@@ -120,6 +135,13 @@ const VOLUME_STEP: i16 = 2;
 /// press-twice-to-go-back behaviour is an emergent consequence, needing no
 /// extra state and no timing window.
 const RESTART_THRESHOLD_SECONDS: u32 = 3;
+/// How far ahead of our own clock an incoming position may be, while a restart
+/// or a track change is still settling, before it is treated as describing the
+/// position we just left.
+///
+/// Generous enough to absorb ordinary poll jitter, far tighter than the gap
+/// between "a few seconds in" and wherever the track had actually reached.
+const PROGRESS_GUARD_TOLERANCE_SECONDS: u32 = 3;
 
 const LOADING_TIMEOUT_MS: u64 = 5_000;
 
@@ -262,6 +284,43 @@ pub(crate) struct State {
     /// is not up. Cleared by `on_tick` when it lapses, so the frame that hides
     /// it gets requested rather than waiting for unrelated activity.
     volume_overlay_until_ms: Option<u64>,
+    /// Playback state we set on a press, held until the device agrees.
+    optimistic_playback: Option<Optimistic<PlaybackState>>,
+    /// Volume we set on a press, held until the device agrees.
+    ///
+    /// A held turn of the dial is why several presses in a row no longer jump
+    /// about: the device reports each intermediate level it passes through,
+    /// and without this the bar would chase them backwards.
+    optimistic_volume: Option<Optimistic<u8>>,
+    /// Uptime after which the cover on screen stops standing in for the one
+    /// still being fetched. `None` means the cover belongs to this track.
+    stale_artwork_until_ms: Option<u64>,
+    /// Cover per pin tile, filled in as each is fetched.
+    pin_artwork: [Option<HifiArtwork>; CHOICES_VISIBLE],
+    /// What a pin is showing while the streamer works out what to play.
+    ///
+    /// `None` once the device has named a track, or once the window lapses.
+    pin_intro: Option<PinIntro>,
+    /// Uptime until which a position ahead of our own is taken to describe the
+    /// place we just left rather than where we are.
+    ///
+    /// Unlike playback or volume, a position cannot be held until the device
+    /// reports the same value -- it changes every second, so there is no
+    /// equality to wait for. What can be said is that immediately after a
+    /// restart the position only goes down, so anything far ahead is stale.
+    progress_guard_until_ms: Option<u64>,
+}
+
+/// A pin standing in for the track it is about to start.
+///
+/// A pin cannot predict a track -- it starts an album or playlist whose first
+/// song nobody has told us -- but it can say what was pressed, which is true
+/// however the device resolves it. `previous_title` is what tells a status that
+/// has not caught up yet from one that has.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PinIntro {
+    expires_at_ms: u64,
+    previous_title: String<HIFI_TEXT_LEN>,
 }
 
 /// What a screen did with a raw pad press.
@@ -339,6 +398,9 @@ struct ChoicesCache {
     header_drawn: bool,
     drawn_titles: [String<HIFI_TEXT_LEN>; CHOICES_VISIBLE],
     drawn_active: [bool; CHOICES_VISIBLE],
+    /// Source URI of the cover already on each tile, so one landing repaints
+    /// just that tile.
+    drawn_art: [String<HIFI_URI_LEN>; CHOICES_VISIBLE],
     has_rendered: bool,
 }
 
@@ -385,6 +447,12 @@ impl State {
             marquee: MarqueeState::default(),
             pins_dirty: false,
             volume_overlay_until_ms: None,
+            optimistic_playback: None,
+            optimistic_volume: None,
+            stale_artwork_until_ms: None,
+            pin_artwork: [const { None }; CHOICES_VISIBLE],
+            pin_intro: None,
+            progress_guard_until_ms: None,
         }
     }
 
@@ -470,8 +538,41 @@ impl State {
             _ => false,
         };
 
+        // A cover cannot stand in for its replacement indefinitely. When the
+        // window closes without one arriving, drop it here rather than in the
+        // renderer, so the frame that removes it gets requested.
+        let stale_lapsed = match self.stale_artwork_until_ms {
+            Some(until) if uptime_ms >= until => {
+                self.stale_artwork_until_ms = None;
+                if self
+                    .artwork
+                    .as_ref()
+                    .is_some_and(|artwork| artwork.source_uri != self.status.album_art_uri)
+                {
+                    self.artwork = None;
+                }
+                true
+            }
+            _ => false,
+        };
+
+        if self
+            .progress_guard_until_ms
+            .is_some_and(|until| uptime_ms >= until)
+        {
+            self.progress_guard_until_ms = None;
+        }
+
+        if self
+            .pin_intro
+            .as_ref()
+            .is_some_and(|intro| uptime_ms >= intro.expires_at_ms)
+        {
+            self.pin_intro = None;
+        }
+
         let playback_changed = self.tick_playback(uptime_ms);
-        playback_changed || overlay_lapsed
+        playback_changed || overlay_lapsed || stale_lapsed
     }
 
     fn tick_playback(&mut self, uptime_ms: u64) -> bool {
@@ -517,15 +618,79 @@ impl State {
         true
     }
 
-    pub(crate) fn apply_status(&mut self, status: HifiStatus, uptime_ms: u64) -> bool {
+    /// Starts distrusting positions that run ahead of ours.
+    ///
+    /// The session that answers status polls is not the one that sends
+    /// commands, so it does not know a restart happened and keeps reporting
+    /// the old position until the device's next time event -- about a second.
+    /// Whether a poll lands inside that window is a race, which is why the
+    /// symptom comes and goes.
+    fn guard_progress(&mut self, uptime_ms: u64) {
+        self.progress_guard_until_ms = Some(uptime_ms.saturating_add(OPTIMISTIC_TTL_MS));
+    }
+
+    /// Decides whether an incoming position describes now or a moment ago.
+    fn accept_progress(&mut self, incoming: u32, uptime_ms: u64) -> u32 {
+        let Some(until) = self.progress_guard_until_ms else {
+            return incoming;
+        };
+        if uptime_ms >= until {
+            self.progress_guard_until_ms = None;
+            return incoming;
+        }
+        if incoming
+            > self
+                .status
+                .elapsed_seconds
+                .saturating_add(PROGRESS_GUARD_TOLERANCE_SECONDS)
+        {
+            // Still describing where we were.
+            return self.status.elapsed_seconds;
+        }
+        // The device has come back to somewhere plausible, so it has caught up
+        // and there is nothing left to guard against.
+        self.progress_guard_until_ms = None;
+        incoming
+    }
+
+    pub(crate) fn apply_status(&mut self, mut status: HifiStatus, uptime_ms: u64) -> bool {
         let was_loading = self.loading;
+
+        // A pin is on screen and the device is still describing what it
+        // replaced. Keep the pin's own words; everything else -- volume,
+        // transport -- is about the player and still applies.
+        if self.pin_intro_holds(&status, uptime_ms) {
+            status.title = self.status.title.clone();
+            status.artist = self.status.artist.clone();
+            status.album = self.status.album.clone();
+            status.album_art_uri = self.status.album_art_uri.clone();
+            status.duration_seconds = self.status.duration_seconds;
+        }
+
+        status.elapsed_seconds = self.accept_progress(status.elapsed_seconds, uptime_ms);
+
+        // What the user just asked for outranks a reply composed before they
+        // asked, until the device agrees or the hold runs out.
+        status.playback =
+            Optimistic::reconcile(&mut self.optimistic_playback, status.playback, uptime_ms);
+        status.volume_percent = Optimistic::reconcile(
+            &mut self.optimistic_volume,
+            status.volume_percent,
+            uptime_ms,
+        );
+
         let has_live_content = has_live_content(&status);
+
+        // The cover for the new track has not been fetched yet, and an empty
+        // slot is a bigger visual event than a cover that is briefly one track
+        // behind. Keep showing it, and give it a deadline so a track with no
+        // artwork at all cannot inherit the previous one's.
         if self
             .artwork
             .as_ref()
             .is_some_and(|artwork| artwork.source_uri != status.album_art_uri)
         {
-            self.artwork = None;
+            self.stale_artwork_until_ms = Some(uptime_ms.saturating_add(STALE_ARTWORK_GRACE_MS));
         }
 
         if self.status == status && (!was_loading || !has_live_content) {
@@ -551,6 +716,9 @@ impl State {
             return false;
         }
 
+        // The replacement arrived, so the cover on screen is current again.
+        self.stale_artwork_until_ms = None;
+
         // Compare by URI rather than by pixels. The old full-buffer equality
         // check was 9,216 comparisons; at this artwork size it would be
         // 108,900 of them per artwork event, on a core with no FPU and better
@@ -571,7 +739,43 @@ impl State {
         if self.pins == pins {
             return false;
         }
+        // A pin whose id changed is a different thing to play, so its cover is
+        // no longer its cover.
+        for slot in 0..CHOICES_VISIBLE {
+            let same = self
+                .pins
+                .get(slot)
+                .zip(pins.get(slot))
+                .is_some_and(|(before, after)| before.id == after.id);
+            if !same {
+                self.pin_artwork[slot] = None;
+            }
+        }
         self.pins = pins;
+        self.pins_dirty = true;
+        true
+    }
+
+    pub(crate) fn apply_pin_artwork(&mut self, slot: usize, artwork: HifiArtwork) -> bool {
+        if slot >= CHOICES_VISIBLE || !artwork.is_complete() {
+            return false;
+        }
+        // The pin has to still want this cover: the list can change while an
+        // image is in flight.
+        if self
+            .pins
+            .get(slot)
+            .is_none_or(|pin| pin.artwork_uri != artwork.source_uri)
+        {
+            return false;
+        }
+        if self.pin_artwork[slot]
+            .as_ref()
+            .is_some_and(|current| current.source_uri == artwork.source_uri)
+        {
+            return false;
+        }
+        self.pin_artwork[slot] = Some(artwork);
         self.pins_dirty = true;
         true
     }
@@ -603,9 +807,10 @@ impl State {
                     let current_second = uptime_ms / 1000;
                     self.current_second = current_second;
                     self.last_second = current_second;
+                    self.guard_progress(uptime_ms);
                     Some(Command::Restart)
                 } else {
-                    self.clear_current_track();
+                    self.begin_track_change(uptime_ms);
                     Some(Command::PreviousTrack)
                 }
             }
@@ -619,19 +824,27 @@ impl State {
                     self.last_second = current_second;
                     self.status.playback = PlaybackState::Playing;
                 }
+                // Defend the press. Without this the device's next report --
+                // composed before the command landed -- puts the old state
+                // back, and the icon appears, vanishes, and returns.
+                self.optimistic_playback = Some(Optimistic::hold(self.status.playback, uptime_ms));
                 Some(Command::TogglePlayback)
             }
             Action::NextTrack => {
-                self.clear_current_track();
+                self.begin_track_change(uptime_ms);
                 Some(Command::NextTrack)
             }
             Action::InvokePinSlot(slot) => {
-                let id = self.pins.get(slot)?.id;
+                let pin = self.pins.get(slot)?;
+                let id = pin.id;
+                let title = pin.title.clone();
+                let artwork_uri = pin.artwork_uri.clone();
+
                 // Playing something is the point of this screen, so go
                 // straight back to it rather than leaving the user on a grid
                 // wondering whether the press landed.
                 self.page = HifiPage::NowPlaying;
-                self.clear_current_track();
+                self.show_pin_while_it_starts(title, artwork_uri, slot, uptime_ms);
                 Some(Command::InvokePinId { id })
             }
             Action::VolumeDelta(delta) => {
@@ -645,20 +858,95 @@ impl State {
                     return None;
                 }
                 self.status.volume_percent = next;
+                self.optimistic_volume = Some(Optimistic::hold(next, uptime_ms));
                 Some(Command::SetVolume { volume: next })
             }
         }
     }
 
-    fn clear_current_track(&mut self) {
+    /// Puts the pin on screen while the streamer works out what to play.
+    ///
+    /// Returning to Now Playing after tapping a pin used to show the previous
+    /// track -- the one thing certainly not about to play. The pin's own name
+    /// and cover are a smaller claim and a true one: it is what was pressed,
+    /// whatever the device picks out of it.
+    ///
+    /// Artist and album are cleared rather than kept. Leaving the old artist
+    /// under a new title would read as a track that does not exist.
+    fn show_pin_while_it_starts(
+        &mut self,
+        title: String<{ crate::HIFI_PIN_TITLE_LEN }>,
+        artwork_uri: String<{ crate::HIFI_URI_LEN }>,
+        slot: usize,
+        uptime_ms: u64,
+    ) {
+        let previous_title = self.status.title.clone();
+
         self.status.title.clear();
+        let _ = self.status.title.push_str(title.as_str());
         self.status.artist.clear();
         self.status.album.clear();
-        self.status.album_art_uri.clear();
         self.status.elapsed_seconds = 0;
         self.status.duration_seconds = 0;
-        self.status.playback = PlaybackState::Buffering;
-        self.artwork = None;
+
+        // The grid the user just came from has already fetched this cover, so
+        // it costs a clone rather than a round trip.
+        self.status.album_art_uri.clear();
+        let _ = self.status.album_art_uri.push_str(artwork_uri.as_str());
+        self.artwork = self
+            .pin_artwork
+            .get(slot)
+            .and_then(|artwork| artwork.clone())
+            .filter(|artwork| artwork.source_uri == self.status.album_art_uri);
+        self.stale_artwork_until_ms = None;
+
+        // A pin is a request to play, so say so rather than leaving a pause
+        // badge over something that is starting.
+        self.status.playback = PlaybackState::Playing;
+        self.optimistic_playback = Some(Optimistic::hold(PlaybackState::Playing, uptime_ms));
+
+        self.pin_intro = Some(PinIntro {
+            expires_at_ms: uptime_ms.saturating_add(OPTIMISTIC_TTL_MS),
+            previous_title,
+        });
+        self.guard_progress(uptime_ms);
+    }
+
+    /// Whether a status still describes the track the pin replaced.
+    fn pin_intro_holds(&mut self, incoming: &HifiStatus, uptime_ms: u64) -> bool {
+        let Some(intro) = self.pin_intro.as_ref() else {
+            return false;
+        };
+        if uptime_ms >= intro.expires_at_ms {
+            self.pin_intro = None;
+            return false;
+        }
+        // The device naming anything other than what we left means it has
+        // moved on, and it knows better than we do what it started.
+        if incoming.title != intro.previous_title {
+            self.pin_intro = None;
+            return false;
+        }
+        true
+    }
+
+    /// Marks the current track as on its way out without emptying the screen.
+    ///
+    /// This used to blank the title, drop the cover and force `Buffering`,
+    /// which manufactured three visible states out of one press: an empty
+    /// slot, then a spinner, then a play icon once a status arrived without
+    /// artwork — before the real cover finally landed. None of that came from
+    /// the device; the runtime knows what comes next and says so within a
+    /// frame.
+    ///
+    /// Only the position is reset, because that is the one field certain to be
+    /// wrong the moment a skip is requested.
+    fn begin_track_change(&mut self, uptime_ms: u64) {
+        self.status.elapsed_seconds = 0;
+        self.guard_progress(uptime_ms);
+        if self.artwork.is_some() {
+            self.stale_artwork_until_ms = Some(uptime_ms.saturating_add(STALE_ARTWORK_GRACE_MS));
+        }
     }
 }
 
@@ -708,8 +996,14 @@ fn now_playing_layout(left: i32, top: i32, center_x: i32) -> NowPlayingLayout {
             Size::new(OVERLAY_WIDTH, OVERLAY_HEIGHT),
         ),
         overlay_value: Rectangle::new(
-            Point::new(left + OVERLAY_LEFT, top + OVERLAY_VALUE_TOP),
-            Size::new(OVERLAY_WIDTH, OVERLAY_VALUE_HEIGHT),
+            Point::new(
+                left + OVERLAY_LEFT + OVERLAY_VALUE_INSET,
+                top + OVERLAY_VALUE_TOP,
+            ),
+            Size::new(
+                OVERLAY_WIDTH - 2 * OVERLAY_VALUE_INSET as u32,
+                OVERLAY_VALUE_HEIGHT,
+            ),
         ),
         overlay_track: Rectangle::new(
             Point::new(left + OVERLAY_TRACK_LEFT, top + OVERLAY_TRACK_TOP),
@@ -938,21 +1232,28 @@ where
     // Paused, and there is a picture to mark. Without artwork the slot above
     // already shows pause bars as its state glyph, so badging that too would
     // draw the same thing twice.
-    let paused = matches!(
-        state.status.playback,
-        PlaybackState::Paused | PlaybackState::Stopped
-    );
+    // Only when pause is what the streamer was *asked* for. `Stopped` shows up
+    // in passing while a track loads -- between tracks, and for a moment after
+    // a pin starts something new -- and badging that made the overlay blink on
+    // and off through every transition, saying "paused" about a player that was
+    // busy starting.
+    let paused = matches!(state.status.playback, PlaybackState::Paused);
     let badge_wanted = paused && art_kind == ART_SLOT_ARTWORK;
     if badge_wanted {
         // Redrawn after the volume readout lapses, because that panel is
         // larger than the badge and covered it completely.
         if !cache.now_playing.pause_badge_visible || overlay_just_hidden {
-            draw_panel(
+            // The badge is only ever drawn over the cover -- see
+            // `badge_wanted` above -- so its corners blend into the picture.
+            let artwork = state.artwork.as_ref();
+            let art_rect = ui_layout.artwork;
+            draw_panel_over(
                 painter.display(),
                 ui_layout.pause_badge,
                 PAUSE_BADGE_RADIUS,
                 OLED_BLACK,
                 SURFACE_BORDER,
+                |point| artwork_pixel_at(artwork, art_rect, point),
             )?;
             let bars = PauseBars {
                 rect: ui_layout.pause_badge,
@@ -997,6 +1298,10 @@ where
         } else {
             cache.now_playing.progress_filled_px
         },
+        // Rounded like the volume bar: this panel is a friendly, round-cornered
+        // device and a square-ended bar is the odd one out on it.
+        radius: PROGRESS_HEIGHT / 2,
+        backdrop: OLED_BLACK,
     };
     painter.draw(&progress).map_err(RenderError::Draw)?;
     cache.now_playing.progress_filled_px = Some(new_filled_px);
@@ -1020,7 +1325,19 @@ where
         has_rendered,
     )?;
 
-    let artist_text = non_empty_or(&state.status.artist, "Not playing");
+    // "Not playing" explains an empty screen at rest. Printing it under a title
+    // we have just said *is* playing contradicts the line above it -- which is
+    // what a pin does while the streamer works out what it started, and what a
+    // track with no credited artist does always. Silence is the honest answer
+    // there; the hint is only for when nothing is going on.
+    let artist_text = if matches!(
+        state.status.playback,
+        PlaybackState::Playing | PlaybackState::Buffering
+    ) {
+        state.status.artist.as_str()
+    } else {
+        non_empty_or(&state.status.artist, "Not playing")
+    };
     draw_marquee_band(
         &mut painter,
         MarqueeInput {
@@ -1040,12 +1357,18 @@ where
     // Last, so it sits over the artwork rather than under it.
     if overlay_visible {
         if !cache.now_playing.overlay_visible {
-            draw_panel(
+            // The overlay sits on the artwork, so its rounded corners have to
+            // be blended against the picture. Told "black" they would be
+            // painted black, which squares off the very corners they round.
+            let artwork = state.artwork.as_ref();
+            let art_rect = ui_layout.artwork;
+            draw_panel_over(
                 painter.display(),
                 ui_layout.overlay_panel,
                 OVERLAY_RADIUS,
                 OLED_BLACK,
                 SURFACE_BORDER,
+                |point| artwork_pixel_at(artwork, art_rect, point),
             )?;
             cache.now_playing.overlay_value = None;
             cache.now_playing.overlay_percent = None;
@@ -1070,6 +1393,10 @@ where
                 .now_playing
                 .overlay_percent
                 .map(|percent| filled_width_for_volume(percent, width)),
+            // A pill: half the height, so both ends are fully round. Square
+            // ends read as unfinished inside a panel with a 22 px radius.
+            radius: OVERLAY_TRACK_HEIGHT / 2,
+            backdrop: OLED_BLACK,
         };
         painter.draw(&track).map_err(RenderError::Draw)?;
         cache.now_playing.overlay_percent = Some(value);
@@ -1109,22 +1436,42 @@ where
 
         let label_changed = cache.choices.drawn_titles[slot].as_str() != label.as_str();
         let active_changed = cache.choices.drawn_active[slot] != active;
-        if cache.choices.has_rendered && !label_changed && !active_changed {
+        let art_changed = cache.choices.drawn_art[slot]
+            != state.pin_artwork[slot]
+                .as_ref()
+                .map(|artwork| artwork.source_uri.clone())
+                .unwrap_or_default();
+        if cache.choices.has_rendered && !label_changed && !active_changed && !art_changed {
             continue;
         }
 
-        let (fill, stroke) = if active {
-            *tint
-        } else {
-            (ACTION_INACTIVE, ACTION_INACTIVE_BORDER)
-        };
-        draw_panel(
-            painter.display(),
-            ui_layout.tile_art[slot],
-            TILE_RADIUS,
-            fill,
-            stroke,
-        )?;
+        // A cover if the device gave us one, the tinted card otherwise. The
+        // tint is still what makes an artless pin findable without reading,
+        // so it stays rather than becoming an empty rectangle.
+        match state.pin_artwork[slot].as_ref() {
+            Some(artwork) if active => {
+                draw_scaled_artwork(
+                    painter.display(),
+                    ui_layout.tile_art[slot],
+                    TILE_RADIUS,
+                    artwork,
+                )?;
+            }
+            _ => {
+                let (fill, stroke) = if active {
+                    *tint
+                } else {
+                    (ACTION_INACTIVE, ACTION_INACTIVE_BORDER)
+                };
+                draw_panel(
+                    painter.display(),
+                    ui_layout.tile_art[slot],
+                    TILE_RADIUS,
+                    fill,
+                    stroke,
+                )?;
+            }
+        }
 
         let caption_band = ui_layout.tile_caption[slot];
         let caption = CenteredBand {
@@ -1137,9 +1484,73 @@ where
         cache.choices.drawn_titles[slot].clear();
         let _ = cache.choices.drawn_titles[slot].push_str(label.as_str());
         cache.choices.drawn_active[slot] = active;
+        cache.choices.drawn_art[slot] = state.pin_artwork[slot]
+            .as_ref()
+            .map(|artwork| artwork.source_uri.clone())
+            .unwrap_or_default();
     }
     cache.choices.has_rendered = true;
     Ok(())
+}
+
+/// Blits a cover into a rectangle smaller than itself.
+///
+/// Pin covers arrive at the same 330 px as the now-playing hero, because they
+/// come down the same fetch-and-decode path; reusing it costs a few hundred KB
+/// of PSRAM and saves a second image pipeline. Sampling is nearest-neighbour,
+/// which is what the decoder already does going from source to slot, and tiles
+/// repaint rarely enough that per-pixel sampling is not worth avoiding.
+fn draw_scaled_artwork<D>(
+    display: &mut D,
+    target: Rectangle,
+    radius: u32,
+    artwork: &HifiArtwork,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let pixels = artwork.pixels();
+    let source_size = crate::HIFI_ARTWORK_SIZE as usize;
+    if pixels.len() < source_size * source_size {
+        return Ok(());
+    }
+
+    let width = target.size.width as i32;
+    let height = target.size.height as i32;
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+
+    // Same corners as the tinted card it replaces. Blitting it square left a
+    // pin with a cover looking unlike a pin without one.
+    aa::rounded_image(display, target, radius, OLED_BLACK, |point| {
+        let x = (point.x - target.top_left.x).clamp(0, width - 1) as usize;
+        let y = (point.y - target.top_left.y).clamp(0, height - 1) as usize;
+        let source_x = x * source_size / width as usize;
+        let source_y = y * source_size / height as usize;
+        pixels[source_y * source_size + source_x]
+    })
+    .map_err(RenderError::Draw)
+}
+
+/// The artwork pixel showing at a point, or the OLED background where there is
+/// none.
+///
+/// The overlay is drawn over the picture, so anything of it that rounds away at
+/// the corners has to blend into what is actually there.
+fn artwork_pixel_at(artwork: Option<&HifiArtwork>, art_rect: Rectangle, point: Point) -> Rgb565 {
+    let Some(artwork) = artwork else {
+        return OLED_BLACK;
+    };
+    let x = point.x - art_rect.top_left.x;
+    let y = point.y - art_rect.top_left.y;
+    let size = HIFI_ARTWORK_SIZE as i32;
+    if x < 0 || y < 0 || x >= size || y >= size {
+        return OLED_BLACK;
+    }
+    let pixels = artwork.pixels();
+    let index = (y * size + x) as usize;
+    pixels.get(index).copied().unwrap_or(OLED_BLACK)
 }
 
 /// What to write under a tile.
@@ -1230,11 +1641,13 @@ fn compute_art_kind(state: &State) -> u8 {
     match state.status.playback {
         PlaybackState::Buffering => ART_SLOT_BUFFERING,
         playback => {
-            if state
-                .artwork
-                .as_ref()
-                .is_some_and(|artwork| artwork.source_uri == state.status.album_art_uri)
-            {
+            // A cover one track behind still reads as "this is playing";
+            // dropping to an icon and back reads as a fault. The stale window
+            // is what stops that leniency becoming a lie.
+            if state.artwork.as_ref().is_some_and(|artwork| {
+                artwork.source_uri == state.status.album_art_uri
+                    || state.stale_artwork_until_ms.is_some()
+            }) {
                 // Artwork is the hero whether or not it is playing; the
                 // transport state reads off the artist line instead.
                 ART_SLOT_ARTWORK
@@ -1313,6 +1726,11 @@ struct LevelBar {
     active_color: Rgb565,
     filled_px: u32,
     previous_filled_px: Option<u32>,
+    /// Corner radius. Zero keeps the square ends and the cheap incremental
+    /// repaint; anything else rounds both ends and repaints the whole bar.
+    radius: u32,
+    /// What a rounded end is blended against. Ignored when `radius` is zero.
+    backdrop: Rgb565,
 }
 
 impl LevelBar {
@@ -1335,6 +1753,51 @@ impl Widget<Action> for LevelBar {
     }
 
     fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
+    where
+        D: DrawTarget<Color = Rgb565>,
+    {
+        if self.radius == 0 {
+            return self.draw_square(target);
+        }
+
+        // Both ends are rounded, so the whole bar is repainted rather than the
+        // span that changed: growing the fill has to redraw the cap it used to
+        // end with, and shrinking it has to restore the track's. At 190 x 10
+        // that is under two thousand pixels, which is cheaper than the
+        // bookkeeping needed to avoid it.
+        aa::rounded_rect(
+            target,
+            self.bar,
+            self.radius,
+            self.track_color,
+            self.track_color,
+            0,
+            self.backdrop,
+        )?;
+
+        if self.filled_px == 0 {
+            return Ok(());
+        }
+        // A fill shorter than a full cap cannot be a pill; let the radius
+        // shrink with it so the end stays round instead of turning into a
+        // wedge.
+        let filled = self.segment(0, self.filled_px);
+        let fill_radius = self.radius.min(self.filled_px / 2);
+        aa::rounded_rect(
+            target,
+            filled,
+            fill_radius,
+            self.active_color,
+            self.active_color,
+            0,
+            self.track_color,
+        )
+    }
+}
+
+impl LevelBar {
+    /// Square ends, repainting only the span that changed.
+    fn draw_square<D>(&self, target: &mut D) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = Rgb565>,
     {
@@ -1720,6 +2183,407 @@ mod tests {
         state
     }
 
+    /// A state with a cover on screen, which is what makes the transition
+    /// states visible in the first place.
+    fn state_with_artwork(uri: &str) -> State {
+        let mut state = state_with_track(20);
+        let mut status = state.status.clone();
+        status.album_art_uri.clear();
+        let _ = status.album_art_uri.push_str(uri);
+        state.apply_status(status, 0);
+
+        let mut artwork = HifiArtwork::new(uri).unwrap();
+        for _ in 0..crate::HIFI_ARTWORK_PIXELS {
+            artwork.push_pixel(Rgb565::CSS_REBECCAPURPLE);
+        }
+        state.apply_artwork(artwork);
+        state
+    }
+
+    #[test]
+    fn a_skip_does_not_empty_the_screen() {
+        let mut state = state_with_track(20);
+        state.handle(Action::NextTrack, 1_000);
+
+        // The old behaviour cleared all of this and forced Buffering, which is
+        // what produced a blank slot, then a spinner, then a play icon.
+        assert_eq!(state.status.title.as_str(), "Yellow Submarine");
+        assert_eq!(state.status.playback, PlaybackState::Playing);
+        // Only the position is certainly wrong the moment a skip is asked for.
+        assert_eq!(state.status.elapsed_seconds, 0);
+    }
+
+    #[test]
+    fn the_cover_stays_up_while_its_replacement_is_fetched() {
+        let mut state = state_with_artwork("http://art/one.jpg");
+        state.handle(Action::NextTrack, 1_000);
+
+        // The predicted track arrives with a different cover that has not been
+        // decoded yet.
+        let mut next = state.status.clone();
+        next.album_art_uri.clear();
+        let _ = next.album_art_uri.push_str("http://art/two.jpg");
+        state.apply_status(next, 1_000);
+
+        assert!(state.artwork.is_some(), "cover was dropped on the press");
+        assert_eq!(compute_art_kind(&state), ART_SLOT_ARTWORK);
+    }
+
+    #[test]
+    fn a_cover_that_never_arrives_is_eventually_given_up() {
+        let mut state = state_with_artwork("http://art/one.jpg");
+        state.handle(Action::NextTrack, 1_000);
+        let mut next = state.status.clone();
+        next.album_art_uri.clear();
+        let _ = next.album_art_uri.push_str("http://art/two.jpg");
+        state.apply_status(next, 1_000);
+
+        state.on_tick(1_000 + STALE_ARTWORK_GRACE_MS);
+
+        assert!(
+            state.artwork.is_none(),
+            "a stale cover must not outlive its window"
+        );
+    }
+
+    #[test]
+    fn pausing_is_not_undone_by_a_reply_composed_before_the_press() {
+        let mut state = state_with_track(20);
+        state.handle(Action::TogglePlayback, 1_000);
+        assert_eq!(state.status.playback, PlaybackState::Paused);
+
+        // The device answers with the state it had when the command arrived.
+        let mut stale = state.status.clone();
+        stale.playback = PlaybackState::Playing;
+        state.apply_status(stale, 1_100);
+
+        assert_eq!(
+            state.status.playback,
+            PlaybackState::Paused,
+            "the pause icon flickered"
+        );
+    }
+
+    #[test]
+    fn the_device_wins_once_a_pause_hold_expires() {
+        let mut state = state_with_track(20);
+        state.handle(Action::TogglePlayback, 1_000);
+
+        let mut stale = state.status.clone();
+        stale.playback = PlaybackState::Playing;
+        state.apply_status(stale, 1_000 + crate::ui::optimistic::OPTIMISTIC_TTL_MS);
+
+        assert_eq!(state.status.playback, PlaybackState::Playing);
+    }
+
+    #[test]
+    fn volume_does_not_chase_the_levels_it_passed_through() {
+        let mut state = state_with_track(20);
+        // Three nudges in quick succession.
+        state.handle(Action::VolumeDelta(VOLUME_STEP), 1_000);
+        state.handle(Action::VolumeDelta(VOLUME_STEP), 1_050);
+        state.handle(Action::VolumeDelta(VOLUME_STEP), 1_100);
+        let reached = state.status.volume_percent;
+
+        // The device reports an intermediate level it is only now catching up to.
+        let mut lagging = state.status.clone();
+        lagging.volume_percent = 30 + VOLUME_STEP as u8;
+        state.apply_status(lagging, 1_150);
+
+        assert_eq!(
+            state.status.volume_percent, reached,
+            "the volume bar jumped backwards"
+        );
+    }
+
+    #[test]
+    fn volume_settles_on_the_device_once_it_agrees() {
+        let mut state = state_with_track(20);
+        state.handle(Action::VolumeDelta(VOLUME_STEP), 1_000);
+        let reached = state.status.volume_percent;
+
+        let mut agreed = state.status.clone();
+        agreed.volume_percent = reached;
+        state.apply_status(agreed, 1_050);
+
+        // Hold resolved: a later, genuinely new level from elsewhere lands.
+        let mut elsewhere = state.status.clone();
+        elsewhere.volume_percent = 12;
+        state.apply_status(elsewhere, 1_100);
+        assert_eq!(state.status.volume_percent, 12);
+    }
+
+    #[test]
+    fn a_pin_cover_is_kept_only_while_the_pin_still_wants_it() {
+        let mut state = State::new(0);
+        let mut pins = HifiPins::new();
+        let mut pin = HifiPin::new(1, "Village");
+        let _ = pin.artwork_uri.push_str("http://art/village.jpg");
+        pins.set(0, pin);
+        state.apply_pins(pins);
+
+        let mut artwork = HifiArtwork::new("http://art/village.jpg").unwrap();
+        for _ in 0..crate::HIFI_ARTWORK_PIXELS {
+            artwork.push_pixel(Rgb565::CSS_REBECCAPURPLE);
+        }
+        assert!(state.apply_pin_artwork(0, artwork.clone()));
+        assert!(state.pin_artwork[0].is_some());
+
+        // A cover for a URI the pin no longer names is not this pin's cover.
+        let mut other = HifiArtwork::new("http://art/stale.jpg").unwrap();
+        for _ in 0..crate::HIFI_ARTWORK_PIXELS {
+            other.push_pixel(Rgb565::CSS_REBECCAPURPLE);
+        }
+        assert!(!state.apply_pin_artwork(0, other));
+    }
+
+    #[test]
+    fn changing_what_a_pin_plays_drops_its_cover() {
+        let mut state = State::new(0);
+        let mut pins = HifiPins::new();
+        let mut pin = HifiPin::new(1, "Village");
+        let _ = pin.artwork_uri.push_str("http://art/village.jpg");
+        pins.set(0, pin);
+        state.apply_pins(pins);
+
+        let mut artwork = HifiArtwork::new("http://art/village.jpg").unwrap();
+        for _ in 0..crate::HIFI_ARTWORK_PIXELS {
+            artwork.push_pixel(Rgb565::CSS_REBECCAPURPLE);
+        }
+        state.apply_pin_artwork(0, artwork);
+
+        let mut replaced = HifiPins::new();
+        replaced.set(0, HifiPin::new(9, "Something else"));
+        state.apply_pins(replaced);
+
+        assert!(
+            state.pin_artwork[0].is_none(),
+            "slot 0 kept a cover for a pin it no longer holds"
+        );
+    }
+
+    #[test]
+    fn three_nudges_apply_three_steps() {
+        // The reported symptom: pressing down three times only moved one or
+        // two, because the level each press read had been dragged back to what
+        // the device last reported.
+        let mut state = state_with_track(20);
+        let start = state.status.volume_percent as i16;
+
+        let mut sent = Vec::new();
+        for press in 0..3 {
+            let at = 1_000 + press * 40;
+            if let Some(Command::SetVolume { volume }) =
+                state.handle(Action::VolumeDelta(-VOLUME_STEP), at)
+            {
+                sent.push(volume);
+            }
+            // Between presses the device answers with the level from before.
+            let mut lagging = state.status.clone();
+            lagging.volume_percent = start as u8;
+            state.apply_status(lagging, at + 10);
+        }
+
+        assert_eq!(sent.len(), 3, "a press produced no command");
+        let expected = (start - 3 * VOLUME_STEP).max(0) as u8;
+        assert_eq!(
+            state.status.volume_percent, expected,
+            "three presses did not move three steps"
+        );
+        assert_eq!(sent.last().copied(), Some(expected));
+    }
+
+    #[test]
+    fn restarting_ignores_the_position_it_was_rewound_from() {
+        let mut state = state_with_track(45);
+        let outcome = state.handle(Action::PreviousOrRestart, 1_000);
+        assert_eq!(outcome, Some(Command::Restart));
+        assert_eq!(state.status.elapsed_seconds, 0);
+
+        // The session answering the poll is not the one that sent the command,
+        // so it keeps reporting the old position until the device's next time
+        // event.
+        let mut stale = state.status.clone();
+        stale.elapsed_seconds = 45;
+        state.apply_status(stale, 1_100);
+
+        assert_eq!(
+            state.status.elapsed_seconds, 0,
+            "the progress bar jumped back to where the track was"
+        );
+    }
+
+    #[test]
+    fn a_plausible_position_ends_the_guard_immediately() {
+        let mut state = state_with_track(45);
+        state.handle(Action::PreviousOrRestart, 1_000);
+
+        let mut caught_up = state.status.clone();
+        caught_up.elapsed_seconds = 1;
+        state.apply_status(caught_up, 1_100);
+
+        assert_eq!(state.status.elapsed_seconds, 1);
+        assert!(
+            state.progress_guard_until_ms.is_none(),
+            "the guard outlived the disagreement it existed for"
+        );
+    }
+
+    #[test]
+    fn the_guard_does_not_freeze_progress_forever() {
+        let mut state = state_with_track(45);
+        state.handle(Action::PreviousOrRestart, 1_000);
+
+        // A device that insists is eventually believed, however odd it sounds.
+        let mut insisting = state.status.clone();
+        insisting.elapsed_seconds = 45;
+        state.apply_status(insisting, 1_000 + crate::ui::optimistic::OPTIMISTIC_TTL_MS);
+
+        assert_eq!(state.status.elapsed_seconds, 45);
+    }
+
+    #[test]
+    fn loading_a_track_does_not_claim_to_be_paused() {
+        let mut state = state_with_artwork("http://art/one.jpg");
+        for transient in [PlaybackState::Stopped, PlaybackState::Buffering] {
+            let mut status = state.status.clone();
+            status.playback = transient;
+            state.apply_status(status, 1_000);
+            assert!(
+                !matches!(state.status.playback, PlaybackState::Paused),
+                "{transient:?} was treated as a pause"
+            );
+        }
+    }
+
+    /// The caption under the title, as the renderer would choose it.
+    fn artist_caption(state: &State) -> &str {
+        if matches!(
+            state.status.playback,
+            PlaybackState::Playing | PlaybackState::Buffering
+        ) {
+            state.status.artist.as_str()
+        } else {
+            non_empty_or(&state.status.artist, "Not playing")
+        }
+    }
+
+    #[test]
+    fn a_starting_pin_is_not_captioned_not_playing() {
+        let mut state = state_with_artwork("http://art/old.jpg");
+        let (pins, cover) = pins_with_cover();
+        state.apply_pins(pins);
+        state.apply_pin_artwork(0, cover);
+        state.handle(Action::InvokePinSlot(0), 1_000);
+
+        assert_eq!(state.status.title.as_str(), "Village");
+        assert_eq!(
+            artist_caption(&state),
+            "",
+            "the caption contradicted the title above it"
+        );
+    }
+
+    #[test]
+    fn an_idle_screen_still_says_so() {
+        let mut state = State::new(0);
+        let mut idle = HifiStatus::empty();
+        idle.playback = PlaybackState::Stopped;
+        state.apply_status(idle, 0);
+
+        assert_eq!(artist_caption(&state), "Not playing");
+    }
+
+    fn pins_with_cover() -> (HifiPins, HifiArtwork) {
+        let mut pins = HifiPins::new();
+        let mut pin = HifiPin::new(1, "Village");
+        let _ = pin.artwork_uri.push_str("http://art/village.jpg");
+        pins.set(0, pin);
+
+        let mut artwork = HifiArtwork::new("http://art/village.jpg").unwrap();
+        for _ in 0..crate::HIFI_ARTWORK_PIXELS {
+            artwork.push_pixel(Rgb565::CSS_REBECCAPURPLE);
+        }
+        (pins, artwork)
+    }
+
+    #[test]
+    fn tapping_a_pin_shows_the_pin_not_the_old_track() {
+        let mut state = state_with_artwork("http://art/old.jpg");
+        let (pins, cover) = pins_with_cover();
+        state.apply_pins(pins);
+        state.apply_pin_artwork(0, cover);
+
+        state.handle(Action::InvokePinSlot(0), 1_000);
+
+        assert_eq!(state.status.title.as_str(), "Village");
+        // The old artist under a new title would describe a track that does
+        // not exist.
+        assert!(state.status.artist.is_empty());
+        assert_eq!(
+            state.artwork.as_ref().map(|a| a.source_uri.as_str()),
+            Some("http://art/village.jpg"),
+            "the pin's own cover was already fetched for the grid"
+        );
+        assert_eq!(compute_art_kind(&state), ART_SLOT_ARTWORK);
+    }
+
+    #[test]
+    fn the_old_track_does_not_come_back_while_the_pin_starts() {
+        let mut state = state_with_artwork("http://art/old.jpg");
+        let old_title = state.status.title.clone();
+        let (pins, cover) = pins_with_cover();
+        state.apply_pins(pins);
+        state.apply_pin_artwork(0, cover);
+        state.handle(Action::InvokePinSlot(0), 1_000);
+
+        // The streamer has not started anything yet and still reports what it
+        // was playing.
+        let mut lagging = HifiStatus::empty();
+        lagging.title = old_title;
+        lagging.playback = PlaybackState::Playing;
+        lagging.volume_percent = 42;
+        state.apply_status(lagging, 1_100);
+
+        assert_eq!(state.status.title.as_str(), "Village");
+        // Volume is about the player, not the track, so it still lands.
+        assert_eq!(state.status.volume_percent, 42);
+    }
+
+    #[test]
+    fn the_track_the_pin_started_replaces_it() {
+        let mut state = state_with_artwork("http://art/old.jpg");
+        let (pins, cover) = pins_with_cover();
+        state.apply_pins(pins);
+        state.apply_pin_artwork(0, cover);
+        state.handle(Action::InvokePinSlot(0), 1_000);
+
+        let mut started = HifiStatus::empty();
+        let _ = started.title.push_str("Track One");
+        started.playback = PlaybackState::Playing;
+        state.apply_status(started, 1_100);
+
+        assert_eq!(state.status.title.as_str(), "Track One");
+        assert!(state.pin_intro.is_none());
+    }
+
+    #[test]
+    fn a_pin_that_never_starts_does_not_hold_the_screen() {
+        let mut state = state_with_artwork("http://art/old.jpg");
+        let old_title = state.status.title.clone();
+        let (pins, cover) = pins_with_cover();
+        state.apply_pins(pins);
+        state.apply_pin_artwork(0, cover);
+        state.handle(Action::InvokePinSlot(0), 1_000);
+
+        let mut lagging = HifiStatus::empty();
+        lagging.title = old_title.clone();
+        lagging.playback = PlaybackState::Playing;
+        state.apply_status(lagging, 1_000 + crate::ui::optimistic::OPTIMISTIC_TTL_MS);
+
+        assert_eq!(state.status.title.as_str(), old_title.as_str());
+    }
+
     fn filled_pins() -> HifiPins {
         let mut pins = HifiPins::new();
         for slot in 0..CHOICES_VISIBLE {
@@ -1730,6 +2594,7 @@ mod tests {
                 HifiPin {
                     id: slot as u32 + 1,
                     title,
+                    artwork_uri: String::new(),
                 },
             );
         }
@@ -2015,6 +2880,7 @@ mod tests {
             HifiPin {
                 id: 4711,
                 title: String::new(),
+                artwork_uri: String::new(),
             },
         );
         assert_eq!(tile_label(0, pins.get(0)).as_str(), "Pin 4711");

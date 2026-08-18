@@ -9,6 +9,7 @@ pub mod hifi;
 pub mod host_tcp;
 pub mod lpec;
 pub mod net;
+pub mod playlist;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeError<E> {
@@ -19,10 +20,41 @@ pub trait HifiController {
     type Error;
 
     fn handle_command(&mut self, command: HifiCommand) -> Result<(), Self::Error>;
-    fn status(&mut self) -> Result<HifiStatus, Self::Error>;
+    /// The current status, or `None` when the controller has nothing to say
+    /// yet.
+    ///
+    /// A freshly-opened session has subscribed and not yet been told anything,
+    /// which is an ordinary moment in a connection's life rather than a
+    /// failure. Reporting it as one put `StatusUnavailable` in the log every
+    /// time the screen was opened, which is noise that hides real faults.
+    fn status(&mut self) -> Result<Option<HifiStatus>, Self::Error>;
     fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error>;
     fn pins(&mut self) -> Result<HifiPins, Self::Error>;
     fn mark_track_changed(&mut self) {}
+
+    /// Hands the controller the current uptime.
+    ///
+    /// Controllers that reason about time — expiring an optimistic skip, say —
+    /// have no clock of their own, and `app-runtime` is `no_std`, so the
+    /// platform's notion of now has to arrive from outside.
+    fn set_clock(&mut self, _now_ms: u64) {}
+
+    /// Moves to the neighbouring track without waiting for the device.
+    ///
+    /// Returns the status to show immediately, or `None` when the controller
+    /// cannot honestly say what comes next — which is the default, and leaves
+    /// callers with the behaviour they had before.
+    fn predict_skip(&mut self, _forward: bool, _now_ms: u64) -> Option<HifiStatus> {
+        None
+    }
+
+    /// The artwork URI a forward skip would land on, if it is already known.
+    ///
+    /// Lets the driver fetch and decode the next cover before it is asked for,
+    /// so a skip swaps words and picture together instead of twice.
+    fn next_artwork_uri(&self) -> Option<heapless::String<{ app_core::HIFI_URI_LEN }>> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -57,7 +89,7 @@ where
         }
     }
 
-    pub fn hifi_status(&mut self) -> Result<HifiStatus, RuntimeError<Hifi::Error>> {
+    pub fn hifi_status(&mut self) -> Result<Option<HifiStatus>, RuntimeError<Hifi::Error>> {
         self.hifi.status().map_err(RuntimeError::Hifi)
     }
 
@@ -146,8 +178,8 @@ mod tests {
             Ok(())
         }
 
-        fn status(&mut self) -> Result<HifiStatus, Self::Error> {
-            Ok(HifiStatus::waiting())
+        fn status(&mut self) -> Result<Option<HifiStatus>, Self::Error> {
+            Ok(Some(HifiStatus::waiting()))
         }
 
         fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error> {

@@ -1,4 +1,7 @@
-use app_core::{Command, Event, HIFI_URI_LEN, HifiCommand, PlaybackState, Screen};
+use app_core::{
+    Command, Event, HIFI_PIN_COUNT, HIFI_URI_LEN, HifiArtwork, HifiCommand, HifiPins,
+    PlaybackState, Screen,
+};
 use heapless::String;
 
 use crate::{AppRuntime, HifiController, RuntimeError};
@@ -21,7 +24,35 @@ pub struct HifiDriver<Hifi> {
     pins_fetched: bool,
     last_artwork_uri: String<HIFI_URI_LEN>,
     pending_artwork_uri: String<HIFI_URI_LEN>,
+    /// Most recent uptime seen on a tick.
+    ///
+    /// A skip arrives on the command channel, which carries no clock, but the
+    /// prediction it triggers needs one to know when to stop believing itself.
+    /// Ticks are frequent (50 ms in the simulator) against a multi-second
+    /// window, so the last one is close enough.
+    last_uptime_ms: u64,
+    /// The next track's cover, fetched and decoded before it is asked for.
+    ///
+    /// One extra 330 x 330 slot is 213 KB against 32 MB of PSRAM. Spending it
+    /// turns a skip from two visible changes -- words now, picture once it
+    /// arrives -- into one.
+    prefetched_artwork: Option<HifiArtwork>,
+    /// URI of whatever is in `prefetched_artwork`, or of the last attempt, so a
+    /// cover that fails to fetch is not retried on every tick.
+    prefetched_artwork_uri: String<HIFI_URI_LEN>,
+    /// Pins whose cover has been fetched, or attempted. Indexed by slot, so a
+    /// pin that changes underneath us is refetched and one that fails is not.
+    pin_artwork_uris: [String<HIFI_URI_LEN>; HIFI_PIN_COUNT],
+    /// The pin list, kept so covers can be fetched one slot per tick.
+    pins: HifiPins,
 }
+
+/// What a skip produces immediately: the new track, and its cover when that
+/// was already decoded.
+///
+/// Both are drained into the same frame, so the words and the picture change
+/// together rather than one after the other.
+pub type TrackChangeEvents = heapless::Vec<Event, 2>;
 
 impl<Hifi> HifiDriver<Hifi> {
     pub fn new(hifi: Hifi, poll_interval_ms: u64) -> Self {
@@ -34,6 +65,11 @@ impl<Hifi> HifiDriver<Hifi> {
             pins_fetched: false,
             last_artwork_uri: String::new(),
             pending_artwork_uri: String::new(),
+            last_uptime_ms: 0,
+            prefetched_artwork: None,
+            prefetched_artwork_uri: String::new(),
+            pin_artwork_uris: [const { String::new() }; HIFI_PIN_COUNT],
+            pins: HifiPins::new(),
         }
     }
 
@@ -78,18 +114,116 @@ impl<Hifi> HifiDriver<Hifi>
 where
     Hifi: HifiController,
 {
-    pub fn mark_track_changed(&mut self) {
+    /// Moves to the next or previous track, showing it immediately when we can
+    /// say what it is.
+    ///
+    /// Returns the status to display now, or `None` when there is nothing to
+    /// predict from — in which case this falls back to what it always did:
+    /// clear the track and wait for the device.
+    pub fn mark_track_changed(&mut self, forward: bool) -> TrackChangeEvents {
+        let mut events = TrackChangeEvents::new();
+        self.status_poll_requested = true;
+
+        let mut ready_artwork = None;
+        if let Some(status) = self
+            .runtime
+            .hifi_mut()
+            .predict_skip(forward, self.last_uptime_ms)
+        {
+            // Queue the predicted artwork the way a real status would, so the
+            // picture follows the words rather than trailing a round trip
+            // behind them.
+            let artwork_uri = status.album_art_uri.clone();
+            if !artwork_uri.is_empty() && self.last_artwork_uri.as_str() != artwork_uri.as_str() {
+                // Already decoded it while the previous track was playing: the
+                // cover can go out with the words rather than after them.
+                if self
+                    .prefetched_artwork
+                    .as_ref()
+                    .is_some_and(|artwork| artwork.source_uri == artwork_uri)
+                {
+                    self.pending_artwork_uri.clear();
+                    self.last_artwork_uri.clear();
+                    let _ = self.last_artwork_uri.push_str(artwork_uri.as_str());
+                    self.prefetched_artwork_uri.clear();
+                    ready_artwork = self.prefetched_artwork.take();
+                } else {
+                    self.pending_artwork_uri.clear();
+                    let _ = self.pending_artwork_uri.push_str(artwork_uri.as_str());
+                }
+            }
+            let _ = events.push(Event::HifiStatus(status));
+            if let Some(artwork) = ready_artwork {
+                let _ = events.push(Event::HifiArtwork(artwork));
+            }
+            return events;
+        }
+
         self.forget_current_track_artwork();
         self.runtime.hifi_mut().mark_track_changed();
-        self.status_poll_requested = true;
+        events
+    }
+
+    /// Fetches one pin cover, if any slot is still missing its own.
+    ///
+    /// One per call: six covers is six HTTP round trips, and doing them in a
+    /// burst would stall the tick that the now-playing screen depends on. The
+    /// grid fills in over a second or so instead, which is what the per-tile
+    /// repaint in `app-core` is for.
+    pub fn fetch_pin_artwork(&mut self) -> Option<Event> {
+        if !self.active {
+            return None;
+        }
+
+        for slot in 0..HIFI_PIN_COUNT {
+            let pin = self.pins.get(slot)?;
+            if pin.artwork_uri.is_empty()
+                || self.pin_artwork_uris[slot].as_str() == pin.artwork_uri.as_str()
+            {
+                continue;
+            }
+
+            // Record the attempt before making it, so a cover that cannot be
+            // loaded is tried once rather than on every tick.
+            let uri = pin.artwork_uri.clone();
+            self.pin_artwork_uris[slot].clear();
+            let _ = self.pin_artwork_uris[slot].push_str(uri.as_str());
+
+            let artwork = self.runtime.hifi_artwork(uri.as_str()).ok()?;
+            return Some(Event::HifiPinArtwork { slot, artwork });
+        }
+        None
+    }
+
+    /// Fetches and decodes the cover a forward skip would need.
+    ///
+    /// Runs on idle ticks so the work happens while the current track plays.
+    /// The attempted URI is recorded before the fetch, so a cover that cannot
+    /// be loaded is tried once rather than on every tick.
+    pub fn prefetch_next_artwork(&mut self) {
+        if !self.active {
+            return;
+        }
+        let Some(uri) = self.runtime.hifi_mut().next_artwork_uri() else {
+            return;
+        };
+        if uri.as_str() == self.prefetched_artwork_uri.as_str()
+            || uri.as_str() == self.last_artwork_uri.as_str()
+        {
+            return;
+        }
+
+        self.prefetched_artwork_uri.clear();
+        let _ = self.prefetched_artwork_uri.push_str(uri.as_str());
+        self.prefetched_artwork = self.runtime.hifi_artwork(uri.as_str()).ok();
     }
 
     pub fn handle_command(
         &mut self,
         command: HifiCommand,
-    ) -> Result<Option<Event>, DriverError<Hifi::Error>> {
+    ) -> Result<TrackChangeEvents, DriverError<Hifi::Error>> {
         if !self.active {
-            return Ok(None);
+            return Ok(TrackChangeEvents::new());
         }
 
         let defer_status = matches!(command, HifiCommand::PreviousTrack | HifiCommand::NextTrack);
@@ -98,10 +232,14 @@ where
             .handle_command(Command::Hifi(command))
             .map_err(DriverError::Command)?;
         if defer_status {
-            self.mark_track_changed();
-            return Ok(None);
+            let forward = matches!(command, HifiCommand::NextTrack);
+            return Ok(self.mark_track_changed(forward));
         }
-        self.refresh_status()
+        let mut events = TrackChangeEvents::new();
+        if let Some(event) = self.refresh_status()? {
+            let _ = events.push(event);
+        }
+        Ok(events)
     }
 
     pub fn poll_status_if_due(
@@ -112,6 +250,7 @@ where
             return Ok(None);
         }
 
+        self.last_uptime_ms = uptime_ms;
         let due = self.status_poll_requested
             || uptime_ms.saturating_sub(self.last_status_poll_ms) >= self.poll_interval_ms;
         if !due {
@@ -120,6 +259,8 @@ where
 
         self.status_poll_requested = false;
         self.last_status_poll_ms = uptime_ms;
+        self.last_uptime_ms = uptime_ms;
+        self.runtime.hifi_mut().set_clock(uptime_ms);
         let result = self.refresh_status();
         if result.is_err() {
             self.status_poll_requested = true;
@@ -134,6 +275,7 @@ where
 
         self.pins_fetched = true;
         let pins = self.runtime.hifi_pins().map_err(DriverError::Pins)?;
+        self.pins = pins.clone();
         Ok(Some(Event::HifiPins(pins)))
     }
 
@@ -157,7 +299,9 @@ where
     }
 
     fn refresh_status(&mut self) -> Result<Option<Event>, DriverError<Hifi::Error>> {
-        let status = self.runtime.hifi_status().map_err(DriverError::Status)?;
+        let Some(status) = self.runtime.hifi_status().map_err(DriverError::Status)? else {
+            return Ok(None);
+        };
         let artwork_uri = status.album_art_uri.clone();
         let should_load_artwork =
             status.playback == PlaybackState::Playing && !artwork_uri.as_str().is_empty();
@@ -206,7 +350,7 @@ pub mod worker {
         SyncScreen { screen: Screen, uptime_ms: u64 },
         Tick { uptime_ms: u64 },
         RequestStatusPoll,
-        TrackChanged,
+        TrackChanged { forward: bool },
     }
 
     // `Event` carries a whole `HifiStatus`, so it dwarfs the other variants.
@@ -284,11 +428,18 @@ pub mod worker {
         Hifi: HifiController,
     {
         while let Ok(command) = commands.recv() {
+            // Predict before sending, not after. `handle_command` is a network
+            // round trip, and waiting for it would put the whole point of the
+            // prediction — a screen that changes on the press — behind the
+            // latency it exists to hide. If the command then fails, the
+            // prediction's own expiry walks it back.
+            if matches!(command, HifiCommand::PreviousTrack | HifiCommand::NextTrack) {
+                let forward = matches!(command, HifiCommand::NextTrack);
+                let _ = background_requests.send(Request::TrackChanged { forward });
+            }
+
             match runtime.handle_command(Command::Hifi(command)) {
                 Ok(()) => {
-                    if matches!(command, HifiCommand::PreviousTrack | HifiCommand::NextTrack) {
-                        let _ = background_requests.send(Request::TrackChanged);
-                    }
                     let _ = background_requests.send(Request::RequestStatusPoll);
                 }
                 Err(error) => {
@@ -315,12 +466,24 @@ pub mod worker {
                     send_result(&responses, driver.poll_status_if_due(uptime_ms));
                     send_result(&responses, driver.load_pending_artwork());
                     send_result(&responses, driver.fetch_pins_if_needed());
+                    // Last, and only once everything the screen is waiting on
+                    // has been served: this is work for a press that has not
+                    // happened yet.
+                    if let Some(event) = driver.fetch_pin_artwork() {
+                        let _ = responses.send(Response::Event(event));
+                    }
+                    driver.prefetch_next_artwork();
                 }
                 Request::RequestStatusPoll => {
                     driver.request_status_poll();
                 }
-                Request::TrackChanged => {
-                    driver.mark_track_changed();
+                Request::TrackChanged { forward } => {
+                    // A prediction is an event in its own right: it is what
+                    // makes the screen change on the press rather than on the
+                    // reply.
+                    for event in driver.mark_track_changed(forward) {
+                        let _ = responses.send(Response::Event(event));
+                    }
                 }
             }
         }

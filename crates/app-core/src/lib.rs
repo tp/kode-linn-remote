@@ -19,9 +19,16 @@ pub type ArtworkPixel = Rgb565;
 /// agree on one number; change it in `board-kode-dot` and every layout reflows.
 pub use board_kode_dot::DISPLAY_SIZE;
 
+// `HifiStatus` and the artwork variants dwarf the input ones, which is what a
+// message type carrying both a keypress and a decoded cover looks like. Boxing
+// is not on offer on the `no_std` side, and the enum is passed by value on a
+// channel rather than stored, so the cost is one move per event.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
-    Tick { uptime_ms: u64 },
+    Tick {
+        uptime_ms: u64,
+    },
     TouchDown(TouchPoint),
     TouchUp,
     ButtonPressed(Button),
@@ -29,6 +36,13 @@ pub enum Event {
     HifiStatus(HifiStatus),
     HifiArtwork(HifiArtwork),
     HifiPins(HifiPins),
+    /// Cover for one pin tile. Separate from [`Event::HifiPins`] because the
+    /// list arrives long before six images can be fetched, and a tile should
+    /// appear as soon as it is named rather than waiting for its picture.
+    HifiPinArtwork {
+        slot: usize,
+        artwork: HifiArtwork,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +144,8 @@ pub const HIFI_VOLUME_MAX: u8 = 70;
 pub struct HifiPin {
     pub id: u32,
     pub title: String<HIFI_PIN_TITLE_LEN>,
+    /// Cover for whatever the pin plays. Empty when the DS offers none.
+    pub artwork_uri: String<HIFI_URI_LEN>,
 }
 
 impl HifiPin {
@@ -139,6 +155,7 @@ impl HifiPin {
         Self {
             id,
             title: string_from(title),
+            artwork_uri: String::new(),
         }
     }
 }
@@ -402,6 +419,10 @@ impl App {
                 ActiveScreen::HifiControl(state) => state.apply_pins(pins),
                 ActiveScreen::Launcher(_) | ActiveScreen::Stopwatch(_) => false,
             },
+            Event::HifiPinArtwork { slot, artwork } => match &mut self.active_screen {
+                ActiveScreen::HifiControl(state) => state.apply_pin_artwork(slot, artwork),
+                ActiveScreen::Launcher(_) | ActiveScreen::Stopwatch(_) => false,
+            },
         };
 
         UpdateOutcome {
@@ -644,12 +665,95 @@ mod tests {
         app.update(Event::ButtonPressed(Button::Back));
     }
 
+    #[test]
+    fn opening_the_hifi_screen_commands_nothing() {
+        // A remote that touches the streamer just by being looked at would be
+        // a bad remote. Opening the screen must read and never write.
+        let mut app = App::new_on_screen(Screen::HifiControl);
+
+        for event in [
+            Event::Tick { uptime_ms: 100 },
+            Event::HifiStatus(hifi_status(PlaybackState::Playing)),
+            Event::HifiPins(HifiPins::new()),
+            Event::Tick { uptime_ms: 1_100 },
+            Event::NetworkStatus(NetworkStatus::Online),
+        ] {
+            assert_eq!(
+                app.update(event).command,
+                None,
+                "opening HiFi produced a command"
+            );
+        }
+    }
+
+    #[test]
+    fn navigating_off_the_launcher_commands_nothing() {
+        let mut app = App::new();
+        app.update(Event::ButtonPressed(Button::Select));
+
+        for _ in 0..4 {
+            let outcome = app.update(Event::ButtonPressed(Button::Select));
+            assert_eq!(
+                outcome.command, None,
+                "activating a launcher card sent a command"
+            );
+            if app.screen() != Screen::Launcher {
+                break;
+            }
+        }
+        assert_ne!(app.screen(), Screen::Launcher, "the pad never left home");
+    }
+
+    #[test]
+    fn the_pad_can_start_a_pin() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        let mut pins = HifiPins::new();
+        pins.set(0, loaded_pin(4711, "Radio"));
+        pins.set(1, loaded_pin(8128, "Spotify"));
+        app.update(Event::HifiPins(pins));
+        hifi_to_choices(&mut app);
+
+        // Reveal the ring, then activate what it sits on.
+        let revealed = app.update(Event::ButtonPressed(Button::Select));
+        assert_eq!(
+            revealed.command, None,
+            "the first press should only show the ring"
+        );
+
+        let activated = app.update(Event::ButtonPressed(Button::Select));
+        assert_eq!(
+            activated.command,
+            Some(Command::Hifi(HifiCommand::InvokePinId { id: 4711 })),
+            "the pad could not start a pin the touch screen can"
+        );
+    }
+
+    #[test]
+    fn the_pad_can_start_a_pin_it_moved_to() {
+        let mut app = App::new_on_screen(Screen::HifiControl);
+        let mut pins = HifiPins::new();
+        pins.set(0, loaded_pin(4711, "Radio"));
+        pins.set(1, loaded_pin(8128, "Spotify"));
+        app.update(Event::HifiPins(pins));
+        hifi_to_choices(&mut app);
+
+        app.update(Event::ButtonPressed(Button::Select));
+        app.update(Event::ButtonPressed(Button::Right));
+        let activated = app.update(Event::ButtonPressed(Button::Select));
+
+        assert_eq!(
+            activated.command,
+            Some(Command::Hifi(HifiCommand::InvokePinId { id: 8128 }))
+        );
+    }
+
     fn loaded_pin(id: u32, title: &str) -> HifiPin {
         let mut pin_title = String::<HIFI_PIN_TITLE_LEN>::new();
         pin_title.push_str(title).unwrap();
         HifiPin {
             id,
             title: pin_title,
+            artwork_uri: String::new(),
         }
     }
 

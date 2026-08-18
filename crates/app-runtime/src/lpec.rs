@@ -62,13 +62,21 @@ use zune_jpeg::JpegDecoder;
 use crate::{
     HifiController,
     net::{ByteStream, Endpoint, TcpConnector},
+    playlist::{PlaylistState, Reconcile, Step, TrackMetadata, decode_id_array},
 };
 
 /// Largest compressed JPEG accepted. Sized for a ~600 px cover, which is what
 /// a 330 px artwork slot needs as a source.
 const MAX_ARTWORK_BYTES: usize = 192 * 1024;
 const MAX_HTTP_HEADER_BYTES: usize = 8 * 1024;
-const SESSION_ACTION_LINE_BUDGET: usize = 16;
+/// Lines an action will read past while waiting for its own response.
+///
+/// Generous because a session that has just subscribed gets the device's whole
+/// initial-state burst first -- four services' worth, including a ~950-byte
+/// `ProtocolInfo` and a full DIDL-Lite blob -- and the response is behind all
+/// of it. At 16 this ran out mid-burst and reported `UnexpectedMessage`, which
+/// looked like a protocol fault and was really us hanging up too early.
+const SESSION_ACTION_LINE_BUDGET: usize = 96;
 /// Upper bound on event lines drained from a single `poll()`. Stops a misbehaving
 /// device from holding the worker thread indefinitely.
 const SESSION_POLL_LINE_BUDGET: usize = 32;
@@ -183,6 +191,7 @@ where
     endpoint: Endpoint,
     session: LpecSession,
     pending_status: Option<HifiStatus>,
+    now_ms: u64,
 }
 
 impl<C> LpecSessionHifi<C>
@@ -195,6 +204,24 @@ where
             endpoint,
             session: LpecSession::new(),
             pending_status: None,
+            now_ms: 0,
+        }
+    }
+
+    /// A controller for the command lane.
+    ///
+    /// The worker runs commands and status polling on separate connections so
+    /// a slow poll cannot delay a button press. Only the polling one wants the
+    /// event stream; this one would otherwise subscribe, receive the entire
+    /// initial-state burst, and have to read past it to find the response to
+    /// the command it just sent.
+    pub fn command_only(connector: C, endpoint: Endpoint) -> Self {
+        Self {
+            connector,
+            endpoint,
+            session: LpecSession::command_only(),
+            pending_status: None,
+            now_ms: 0,
         }
     }
 
@@ -235,23 +262,70 @@ where
         }
     }
 
-    fn status(&mut self) -> Result<HifiStatus, Self::Error> {
+    fn set_clock(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn predict_skip(&mut self, forward: bool, now_ms: u64) -> Option<HifiStatus> {
+        self.now_ms = now_ms;
+        let step = if forward {
+            Step::Forward
+        } else {
+            Step::Backward
+        };
+        self.session.predict_skip(step, now_ms)
+    }
+
+    fn next_artwork_uri(&self) -> Option<heapless::String<{ app_core::HIFI_URI_LEN }>> {
+        let next = self.session.playlist().neighbour_id(Step::Forward)?;
+        let metadata = self.session.playlist().cached(next)?;
+        if metadata.album_art_uri.is_empty() {
+            return None;
+        }
+        Some(metadata.album_art_uri.clone())
+    }
+
+    fn status(&mut self) -> Result<Option<HifiStatus>, Self::Error> {
         if let Some(status) = self.pending_status.take() {
-            return Ok(status);
+            return Ok(Some(status));
         }
 
+        let now_ms = self.now_ms;
         let result = {
             let mut stream = self
                 .connector
                 .connect_events(self.endpoint)
                 .map_err(Error::Connect)?;
-            self.session.poll(&mut stream)
+            self.session.poll(&mut stream, now_ms)
         };
 
+        // Fetch what a skip would need, on the command connection rather than
+        // the event one: events are drained with a ~5 ms read timeout, which is
+        // fine for reading what has already arrived and far too short for an
+        // action that has to wait on the device. The command connection is
+        // pooled, so this costs nothing once the neighbours are known, and a
+        // failure costs only the prediction — never the status the screen is
+        // waiting on.
+        if !self.session.playlist().ids_needing_metadata().is_empty() {
+            let Self {
+                connector,
+                endpoint,
+                session,
+                ..
+            } = self;
+            if let Ok(mut stream) = connector.connect(*endpoint) {
+                let _ = session.prefetch_neighbours(&mut stream);
+            }
+        }
+
         match result {
-            Ok(Some(status)) => Ok(status),
-            Ok(None) => self.session.live_status().ok_or(Error::StatusUnavailable),
-            Err(Error::Connect(error)) => self.session.live_status().ok_or(Error::Connect(error)),
+            Ok(Some(status)) => Ok(Some(status)),
+            // Subscribed, nothing reported yet. Ordinary, not a fault.
+            Ok(None) => Ok(self.session.live_status()),
+            Err(Error::Connect(error)) => match self.session.live_status() {
+                Some(status) => Ok(Some(status)),
+                None => Err(Error::Connect(error)),
+            },
             Err(error) => {
                 self.reset();
                 Err(error)
@@ -376,8 +450,8 @@ where
         }
     }
 
-    fn status(&mut self) -> Result<HifiStatus, Self::Error> {
-        read_status(&mut self.client()?)
+    fn status(&mut self) -> Result<Option<HifiStatus>, Self::Error> {
+        read_status(&mut self.client()?).map(Some)
     }
 
     fn artwork(&mut self, uri: &str) -> Result<HifiArtwork, Self::Error> {
@@ -524,6 +598,23 @@ pub struct LpecSession {
     // stack-overflow fix while still letting `action()` return a borrowed view
     // instead of a 16 KB by-value `Vec`.
     response_args: Box<heapless::Vec<linn_lpec::ResponseArg, { linn_lpec::MAX_ARGS }>>,
+    /// The queue, so a skip can be shown before the device confirms it.
+    playlist: PlaylistState,
+    /// Whether this session wants the device's event stream.
+    ///
+    /// A session that only sends commands does not: subscribing would earn it
+    /// the whole initial-state burst, which it then has to read past to reach
+    /// its own response, for events it never looks at. Commands already update
+    /// the cached status themselves.
+    subscribes: bool,
+    /// Most recent uptime handed to [`LpecSession::poll`].
+    ///
+    /// Events also arrive while an action waits for its response, and those
+    /// paths have no clock of their own. Reading the time from the last poll
+    /// keeps one source of truth without threading `now_ms` through every
+    /// action in the crate; ticks are frequent enough that it stays fresh
+    /// against a multi-second prediction window.
+    now_ms: u64,
 }
 
 impl LpecSession {
@@ -532,6 +623,18 @@ impl LpecSession {
             subscribed: false,
             status: HifiStatus::empty(),
             response_args: Box::new(heapless::Vec::new()),
+            playlist: PlaylistState::new(),
+            subscribes: true,
+            now_ms: 0,
+        }
+    }
+
+    /// A session for the command lane, which sends actions and reads their
+    /// responses and nothing else.
+    pub fn command_only() -> Self {
+        Self {
+            subscribes: false,
+            ..Self::new()
         }
     }
 
@@ -553,6 +656,98 @@ impl LpecSession {
         self.status.duration_seconds = 0;
     }
 
+    pub fn playlist(&self) -> &PlaylistState {
+        &self.playlist
+    }
+
+    /// Shows the track a skip is heading for, before the device says so.
+    ///
+    /// Returns the status to display now, or `None` when we cannot honestly
+    /// predict — unknown queue, an end without repeat, shuffle, or a neighbour
+    /// whose metadata has not been fetched yet. Every one of those falls back
+    /// to the old behaviour rather than inventing a track.
+    pub fn predict_skip(&mut self, step: Step, now_ms: u64) -> Option<HifiStatus> {
+        self.now_ms = now_ms;
+        let metadata = self.playlist.predict(step, now_ms)?;
+        metadata.apply_to(&mut self.status);
+        Some(self.status.clone())
+    }
+
+    /// Routes the `Ds/Playlist` variables.
+    ///
+    /// `Some` means the variable was ours (with whether it changed anything);
+    /// `None` means it belongs to another service. Values were captured from a
+    /// Selekt DSM: `Id` decimal, `IdArray` bare base64, `Repeat`/`Shuffle` the
+    /// strings `"true"`/`"false"`.
+    fn apply_playlist_variable(&mut self, name: &str, value: &str) -> Option<bool> {
+        match name {
+            "Id" => {
+                let Some(id) = parse_u32(value) else {
+                    return Some(false);
+                };
+                match self.playlist.reconcile(id, self.now_ms) {
+                    // Still catching up. Keep showing what we predicted.
+                    Reconcile::Holding => Some(false),
+                    _ => Some(self.playlist.set_current_id(id)),
+                }
+            }
+            "IdArray" => {
+                let Some(ids) = decode_id_array(value) else {
+                    return Some(false);
+                };
+                Some(self.playlist.set_ids(&ids))
+            }
+            "Repeat" => {
+                self.playlist.set_repeat(value == "true");
+                Some(false)
+            }
+            "Shuffle" => {
+                self.playlist.set_shuffle(value == "true");
+                Some(false)
+            }
+            _ => None,
+        }
+    }
+
+    /// Fetches metadata for the neighbours of the current track.
+    ///
+    /// One id per call: a single `ReadList` entry is already ~1.9 KB of
+    /// double-escaped DIDL against a 4 KB `MAX_LINE_LEN`, so asking for two at
+    /// once would overflow the line.
+    pub fn prefetch_neighbours<S>(&mut self, stream: &mut S) -> Result<(), Error<S::Error>>
+    where
+        S: ByteStream,
+    {
+        let wanted = self.playlist.ids_needing_metadata();
+        for id in wanted {
+            let metadata = self.read_track_metadata(stream, id)?;
+            if let Some(metadata) = metadata {
+                self.playlist.cache_track(id, metadata);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads one track's metadata out of `Ds/Playlist:ReadList`.
+    fn read_track_metadata<S>(
+        &mut self,
+        stream: &mut S,
+        id: u32,
+    ) -> Result<Option<TrackMetadata>, Error<S::Error>>
+    where
+        S: ByteStream,
+    {
+        let mut id_arg = heapless::String::<16>::new();
+        if core::fmt::write(&mut id_arg, format_args!("{id}")).is_err() {
+            return Ok(None);
+        }
+        let response = self.action(stream, linn_lpec::playlist_read_list_arg(&id_arg))?;
+        let Some(track_list) = response.args.first() else {
+            return Ok(None);
+        };
+        Ok(parse_track_list_entry(track_list.as_str()))
+    }
+
     pub fn live_status(&self) -> Option<HifiStatus> {
         if status_has_live_content(&self.status) {
             Some(self.status.clone())
@@ -561,10 +756,15 @@ impl LpecSession {
         }
     }
 
-    pub fn poll<S>(&mut self, stream: &mut S) -> Result<Option<HifiStatus>, Error<S::Error>>
+    pub fn poll<S>(
+        &mut self,
+        stream: &mut S,
+        now_ms: u64,
+    ) -> Result<Option<HifiStatus>, Error<S::Error>>
     where
         S: ByteStream,
     {
+        self.now_ms = now_ms;
         let just_subscribed = self.ensure_subscribed(stream)?;
 
         let mut changed = false;
@@ -730,7 +930,7 @@ impl LpecSession {
     where
         S: ByteStream,
     {
-        if self.subscribed {
+        if self.subscribed || !self.subscribes {
             return Ok(false);
         }
 
@@ -815,6 +1015,20 @@ impl LpecSession {
             linn_lpec::Message::Event { variables, .. } => {
                 let mut changed = false;
                 for variable in variables {
+                    if let Some(playlist_changed) =
+                        self.apply_playlist_variable(variable.name, variable.value)
+                    {
+                        changed |= playlist_changed;
+                        continue;
+                    }
+                    // While a prediction is being held the device is still
+                    // describing the track we skipped away from, so letting
+                    // its track fields through would repaint the old track
+                    // over the new one. Volume and transport state are not
+                    // track-scoped and keep flowing.
+                    if self.playlist.has_prediction() && is_track_scoped(variable.name) {
+                        continue;
+                    }
                     changed |=
                         apply_event_variable(&mut self.status, variable.name, variable.value);
                 }
@@ -851,6 +1065,71 @@ struct SessionActionResponse<'a> {
     changed: bool,
 }
 
+/// Whether an event variable describes *this* track rather than the player.
+///
+/// While an optimistic skip is being held, the device is still reporting the
+/// track we moved away from. These are the fields that would visibly contradict
+/// the prediction; volume and transport state are about the player and keep
+/// flowing.
+fn is_track_scoped(name: &str) -> bool {
+    matches!(
+        name,
+        "Metatext"
+            | "Track"
+            | "Metadata"
+            | "Duration"
+            | "TrackDuration"
+            | "Seconds"
+            | "TrackSeconds"
+            | "Elapsed"
+            | "ElapsedSeconds"
+    )
+}
+
+/// Pulls one track's metadata out of a `Ds/Playlist:ReadList` response.
+///
+/// The response is `<TrackList><Entry><Id/><Uri/><Metadata/></Entry></TrackList>`,
+/// and by the time it reaches here LPEC has unescaped it once — which leaves
+/// the `<Metadata>` payload as singly-escaped DIDL-Lite, exactly the shape
+/// [`apply_metadata`] already reads.
+fn parse_track_list_entry(track_list: &str) -> Option<TrackMetadata> {
+    let (start, end) = find_tag_content(track_list, "Metadata")?;
+    let didl = &track_list[start..end];
+
+    let mut status = HifiStatus::empty();
+    apply_metadata(&mut status, didl);
+    let mut track = TrackMetadata::from_status(&status);
+    track.duration_seconds = parse_didl_duration(didl).unwrap_or(0);
+
+    if track.is_empty() { None } else { Some(track) }
+}
+
+/// Reads `duration="00:02:28"` out of a DIDL `<res>` element.
+///
+/// The attribute quotes may be literal or escaped as `&quot;` depending on how
+/// many unescape passes the value has been through, so the scan stops at the
+/// first character that cannot be part of a clock time rather than looking for
+/// a specific terminator.
+fn parse_didl_duration(didl: &str) -> Option<u32> {
+    let start = didl.find("duration=")? + "duration=".len();
+    let rest = &didl[start..];
+    let digits_start = rest.find(|c: char| c.is_ascii_digit())?;
+    let rest = &rest[digits_start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != ':')
+        .unwrap_or(rest.len());
+
+    let mut seconds = 0_u32;
+    let mut parts = 0_usize;
+    for part in rest[..end].split(':') {
+        let value = parse_u32(part)?;
+        seconds = seconds.checked_mul(60)?.checked_add(value)?;
+        parts += 1;
+    }
+    // Guard against a bare number being read as a duration.
+    if parts >= 2 { Some(seconds) } else { None }
+}
+
 pub fn apply_event_variable(status: &mut HifiStatus, name: &str, value: &str) -> bool {
     match name {
         "TransportState" => {
@@ -869,7 +1148,16 @@ pub fn apply_event_variable(status: &mut HifiStatus, name: &str, value: &str) ->
         "Seconds" | "TrackSeconds" | "Elapsed" | "ElapsedSeconds" => {
             if let Some(elapsed) = parse_u32(value) {
                 let previous = status.elapsed_seconds;
-                status.elapsed_seconds = elapsed.min(status.duration_seconds);
+                // Clamp only against a duration we actually know. `Ds/Time`
+                // sends `Duration` and `Seconds` together on subscribe but
+                // `Seconds` alone thereafter, so anything that zeroes the
+                // duration -- a track change, say -- would otherwise pin the
+                // position at 0 and make a playing track look restarted.
+                status.elapsed_seconds = if status.duration_seconds > 0 {
+                    elapsed.min(status.duration_seconds)
+                } else {
+                    elapsed
+                };
                 if status.elapsed_seconds != previous
                     && matches!(
                         status.playback,
@@ -1001,6 +1289,7 @@ fn pins_from_ids(ids: &heapless::Vec<u32, HIFI_PIN_COUNT>) -> HifiPins {
             HifiPin {
                 id,
                 title: heapless::String::new(),
+                artwork_uri: heapless::String::new(),
             },
         );
     }
@@ -1151,17 +1440,18 @@ where
             }
             let mut title_buf = heapless::String::<HIFI_PIN_TITLE_LEN>::new();
             if let Some(title) = entry.title {
-                for ch in title.chars() {
-                    if title_buf.push(ch).is_err() {
-                        break;
-                    }
-                }
+                copy_json_string(title, &mut title_buf);
+            }
+            let mut artwork_buf = heapless::String::<{ app_core::HIFI_URI_LEN }>::new();
+            if let Some(artwork_uri) = entry.artwork_uri {
+                copy_json_string(artwork_uri, &mut artwork_buf);
             }
             pins.set(
                 slot,
                 HifiPin {
                     id,
                     title: title_buf,
+                    artwork_uri: artwork_buf,
                 },
             );
             slot += 1;
@@ -1174,10 +1464,11 @@ where
 struct JsonPinEntry<'a> {
     id: Option<u32>,
     title: Option<&'a str>,
+    artwork_uri: Option<&'a str>,
 }
 
-/// Walk a JSON-ish payload one `{...}` object at a time, pulling out `Id`
-/// and `Title` per object. Tolerates whitespace, balanced braces, and any
+/// Walk a JSON-ish payload one `{...}` object at a time, pulling out `id`,
+/// `title` and `artworkUri` per object. Tolerates whitespace, balanced braces, and any
 /// other fields we don't care about.
 struct JsonPinEntries<'a> {
     src: &'a str,
@@ -1240,16 +1531,48 @@ impl<'a> Iterator for JsonPinEntries<'a> {
 
 fn parse_json_pin_object(object: &str) -> JsonPinEntry<'_> {
     JsonPinEntry {
-        id: find_json_string_field(object, "Id")
+        id: find_json_string_field(object, "id")
             .and_then(parse_u32)
-            .or_else(|| find_json_number_field(object, "Id")),
-        title: find_json_string_field(object, "Title"),
+            .or_else(|| find_json_number_field(object, "id")),
+        title: find_json_string_field(object, "title"),
+        artwork_uri: find_json_string_field(object, "artworkUri"),
     }
 }
 
 /// Find `"<key>"` followed by `:` and a quoted string value; return the
 /// (un-escaped enough for our needs) inner content. Doesn't handle every
 /// JSON escape — just the common ones we'd get back from Linn.
+/// Copies a JSON string value, undoing the escapes a DSM actually emits.
+///
+/// `artworkUri` arrives as `https:\/\/static.qobuz.com\/...` — legal JSON,
+/// and a URL that resolves to nothing if copied verbatim.
+fn copy_json_string<const N: usize>(value: &str, output: &mut heapless::String<N>) {
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            let decoded = match ch {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                'b' | 'f' => continue,
+                other => other,
+            };
+            if output.push(decoded).is_err() {
+                return;
+            }
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if output.push(ch).is_err() {
+            return;
+        }
+    }
+}
+
 fn find_json_string_field<'a>(object: &'a str, key: &str) -> Option<&'a str> {
     let bytes = object.as_bytes();
     let mut pos = 0;
@@ -1289,7 +1612,11 @@ fn find_json_string_field<'a>(object: &'a str, key: &str) -> Option<&'a str> {
             pos = k + 1;
             continue;
         }
-        if this_key != key {
+        // Case-insensitive: a Selekt DSM sends `id`, `title` and `artworkUri`,
+        // while the fixtures this was written against used `Id` and `Title`.
+        // The code and its tests agreed with each other and not with the
+        // device, so pins came back empty on real hardware.
+        if !this_key.eq_ignore_ascii_case(key) {
             pos = after + 1;
             continue;
         }
@@ -1325,13 +1652,29 @@ fn find_json_string_field<'a>(object: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+/// Case-insensitive substring search.
+///
+/// Same reason the key comparison above ignores case: the device spells its
+/// keys `id` and `title`, and this code was written expecting `Id` and
+/// `Title`.
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+}
+
 fn find_json_number_field(object: &str, key: &str) -> Option<u32> {
     // Fallback: locate `"<key>" :` and then parse digits.
     let mut needle = heapless::String::<40>::new();
     needle.push('"').ok()?;
     needle.push_str(key).ok()?;
     needle.push('"').ok()?;
-    let mut pos = object.find(needle.as_str())?;
+    let mut pos = find_ascii_case_insensitive(object, needle.as_str())?;
     pos += needle.len();
     let bytes = object.as_bytes();
     while pos < bytes.len() && (bytes[pos] as char).is_ascii_whitespace() {
@@ -1354,10 +1697,31 @@ fn find_json_number_field(object: &str, key: &str) -> Option<u32> {
     parse_u32(&object[start..pos])
 }
 
+/// Every byte this crate sends to the DS goes through here, so this is the one
+/// place that can answer "what did we actually ask it to do".
+///
+/// Set `LINN_TRACE=1` on the host to print it. Worth having permanently: the
+/// difference between "the app told the streamer to do that" and "the streamer
+/// did that on its own" is otherwise unanswerable from the outside, and it is
+/// exactly the question that matters when something moves that nobody asked to
+/// move.
+#[cfg(feature = "std")]
+fn trace_lpec_line(line: &str) {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("LINN_TRACE").is_some()) {
+        eprintln!("lpec tx: {line}");
+    }
+}
+
+#[cfg(not(feature = "std"))]
+fn trace_lpec_line(_line: &str) {}
+
 fn write_lpec_line<S>(stream: &mut S, line: &str) -> Result<(), Error<S::Error>>
 where
     S: ByteStream,
 {
+    trace_lpec_line(line);
     stream.write_all(line.as_bytes()).map_err(Error::Connect)?;
     stream.write_all(b"\r\n").map_err(Error::Connect)?;
     stream.flush().map_err(Error::Connect)
@@ -2192,6 +2556,10 @@ where
     type Error = Error<S::Error>;
 
     fn write_line(&mut self, line: &str) -> Result<(), Self::Error> {
+        // The command controller writes here rather than through
+        // `write_lpec_line`, and commands are the half of the traffic worth
+        // tracing most.
+        trace_lpec_line(line);
         self.stream
             .write_all(line.as_bytes())
             .map_err(Error::Connect)?;
@@ -2359,11 +2727,177 @@ mod tests {
             r#"EVENT 2 0 Metatext "&lt;DIDL-Lite&gt;&lt;item&gt;&lt;dc:title&gt;Chips n Queso&lt;/dc:title&gt;&lt;upnp:artist&gt;Lorde&lt;/upnp:artist&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;""#,
         ]);
 
-        let status = session.poll(&mut stream).unwrap().unwrap();
+        let status = session.poll(&mut stream, 0).unwrap().unwrap();
 
         assert_eq!(status.title.as_str(), "Chips n Queso");
         assert_eq!(status.artist.as_str(), "Lorde");
         assert!(stream.writes_as_str().contains("SUBSCRIBE Ds/Info"));
+    }
+
+    /// A `Ds/Playlist` event exactly as a Selekt DSM sends it. Values captured
+    /// on 2026-08-17; the id array decodes to 885, 887, 889, 891.
+    const PLAYLIST_EVENT: &str = concat!(
+        r#"EVENT 3 0 TransportState "Playing" Repeat "false" Shuffle "false" "#,
+        r#"Id "885" IdArray "AAADdQAAA3cAAAN5AAADew==" TracksMax "1000""#
+    );
+
+    #[test]
+    fn a_playlist_event_gives_us_the_queue_and_our_place_in_it() {
+        let mut session = LpecSession::new();
+        let mut stream = ScriptedByteStream::new(&[PLAYLIST_EVENT]);
+
+        session.poll(&mut stream, 0).unwrap();
+
+        assert_eq!(session.playlist().current_id(), Some(885));
+        assert_eq!(session.playlist().len(), 4);
+        assert_eq!(session.playlist().neighbour_id(Step::Forward), Some(887));
+        assert!(stream.writes_as_str().contains("SUBSCRIBE Ds/Playlist"));
+    }
+
+    #[test]
+    fn a_skip_shows_the_next_track_before_the_device_reports_it() {
+        let mut session = LpecSession::new();
+        let mut stream = ScriptedByteStream::new(&[PLAYLIST_EVENT]);
+        session.poll(&mut stream, 0).unwrap();
+        session
+            .playlist
+            .cache_track(887, track_named("Chips n Queso"));
+
+        let predicted = session.predict_skip(Step::Forward, 0).unwrap();
+
+        assert_eq!(predicted.title.as_str(), "Chips n Queso");
+        assert_eq!(session.playlist().current_id(), Some(887));
+    }
+
+    #[test]
+    fn the_old_track_does_not_repaint_over_a_prediction() {
+        let mut session = LpecSession::new();
+        let mut stream = ScriptedByteStream::new(&[PLAYLIST_EVENT]);
+        session.poll(&mut stream, 0).unwrap();
+        session
+            .playlist
+            .cache_track(887, track_named("Chips n Queso"));
+        session.predict_skip(Step::Forward, 0).unwrap();
+
+        // The device has not caught up: it still reports the old id, and Ds/Info
+        // is still describing the old track.
+        let mut lagging = ScriptedByteStream::new(&[
+            r#"EVENT 3 0 Id "885""#,
+            r#"EVENT 2 0 Metatext "&lt;DIDL-Lite&gt;&lt;item&gt;&lt;dc:title&gt;Old Track&lt;/dc:title&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;""#,
+        ]);
+        session.poll(&mut lagging, 100).unwrap();
+
+        assert_eq!(
+            session.live_status().unwrap().title.as_str(),
+            "Chips n Queso"
+        );
+    }
+
+    #[test]
+    fn the_device_wins_once_the_prediction_expires() {
+        let mut session = LpecSession::new();
+        let mut stream = ScriptedByteStream::new(&[PLAYLIST_EVENT]);
+        session.poll(&mut stream, 0).unwrap();
+        session.playlist.cache_track(887, track_named("Predicted"));
+        session.predict_skip(Step::Forward, 0).unwrap();
+
+        let mut contradicting = ScriptedByteStream::new(&[
+            r#"EVENT 3 0 Id "891""#,
+            r#"EVENT 2 0 Metatext "&lt;DIDL-Lite&gt;&lt;item&gt;&lt;dc:title&gt;Reality&lt;/dc:title&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;""#,
+        ]);
+        session
+            .poll(&mut contradicting, crate::playlist::PREDICTION_TTL_MS)
+            .unwrap();
+
+        assert_eq!(session.playlist().current_id(), Some(891));
+        assert_eq!(session.live_status().unwrap().title.as_str(), "Reality");
+    }
+
+    #[test]
+    fn volume_still_moves_while_a_prediction_is_held() {
+        let mut session = LpecSession::new();
+        let mut stream = ScriptedByteStream::new(&[PLAYLIST_EVENT]);
+        session.poll(&mut stream, 0).unwrap();
+        session.playlist.cache_track(887, track_named("Predicted"));
+        session.predict_skip(Step::Forward, 0).unwrap();
+
+        // Volume is not track-scoped, so holding a track prediction must not
+        // freeze it.
+        let mut volume = ScriptedByteStream::new(&[r#"EVENT 4 0 Id "885" Volume "42""#]);
+        session.poll(&mut volume, 100).unwrap();
+
+        assert_eq!(session.live_status().unwrap().volume_percent, 42);
+    }
+
+    #[test]
+    fn reads_one_track_from_a_real_read_list_response() {
+        // Captured from Ds/Playlist:ReadList "659" on a Selekt DSM, after the
+        // one unescaping pass LPEC applies to a quoted argument.
+        let track_list = concat!(
+            "<TrackList><Entry><Id>659</Id><Uri>qobuz://track?version=2&amp;trackId=1</Uri>",
+            "<Metadata>&lt;DIDL-Lite&gt;&lt;item&gt;",
+            "&lt;dc:title&gt;I Love You Bitch&lt;/dc:title&gt;",
+            "&lt;upnp:artist&gt;Lizzo&lt;/upnp:artist&gt;",
+            "&lt;upnp:album&gt;Special&lt;/upnp:album&gt;",
+            "&lt;res protocolInfo=&quot;http-get:*:*:*&quot; duration=&quot;00:02:28&quot;&gt;x&lt;/res&gt;",
+            "&lt;upnp:albumArtURI&gt;https://static.qobuz.com/a_600.jpg&lt;/upnp:albumArtURI&gt;",
+            "&lt;/item&gt;&lt;/DIDL-Lite&gt;</Metadata></Entry></TrackList>"
+        );
+
+        let track = parse_track_list_entry(track_list).unwrap();
+
+        assert_eq!(track.title.as_str(), "I Love You Bitch");
+        assert_eq!(track.artist.as_str(), "Lizzo");
+        assert_eq!(track.album.as_str(), "Special");
+        assert_eq!(track.duration_seconds, 148);
+        assert_eq!(
+            track.album_art_uri.as_str(),
+            "https://static.qobuz.com/a_600.jpg"
+        );
+    }
+
+    #[test]
+    fn a_track_list_without_usable_metadata_is_not_cached() {
+        assert!(parse_track_list_entry("<TrackList></TrackList>").is_none());
+    }
+
+    #[test]
+    fn didl_durations_are_read_as_clock_times() {
+        assert_eq!(parse_didl_duration(r#"duration="00:02:28""#), Some(148));
+        assert_eq!(
+            parse_didl_duration(r#"duration=&quot;1:00:00&quot;"#),
+            Some(3600)
+        );
+        // A bare number is not a duration we understand.
+        assert_eq!(parse_didl_duration(r#"duration="148""#), None);
+    }
+
+    fn track_named(title: &str) -> TrackMetadata {
+        let mut track = TrackMetadata::default();
+        let _ = track.title.push_str(title);
+        track
+    }
+
+    #[test]
+    fn a_position_survives_not_knowing_the_duration_yet() {
+        // `Ds/Time` sends Duration with Seconds on subscribe, then Seconds
+        // alone. If anything zeroes the duration in between, clamping against
+        // it would silently rewind a playing track to the start.
+        let mut status = HifiStatus::empty();
+        status.playback = PlaybackState::Playing;
+        status.duration_seconds = 0;
+
+        apply_event_variable(&mut status, "Seconds", "97");
+
+        assert_eq!(status.elapsed_seconds, 97);
+    }
+
+    #[test]
+    fn a_known_duration_still_bounds_the_position() {
+        let mut status = HifiStatus::empty();
+        status.duration_seconds = 60;
+        apply_event_variable(&mut status, "Seconds", "97");
+        assert_eq!(status.elapsed_seconds, 60);
     }
 
     #[test]
@@ -2405,7 +2939,7 @@ mod tests {
             &lt;/DIDL-Lite&gt;\"\r\n";
         let mut stream = ScriptedByteStream::from_bytes(bytes);
 
-        let status = session.poll(&mut stream).unwrap().unwrap();
+        let status = session.poll(&mut stream, 0).unwrap().unwrap();
         assert_eq!(status.title.as_str(), "Chips n Queso");
         assert_eq!(status.artist.as_str(), "Lorde");
     }
@@ -2418,7 +2952,7 @@ mod tests {
         let mut stream =
             ScriptedByteStream::new(&["GARBAGE NOT A VALID LPEC LINE", r#"EVENT 7 0 Volume "55""#]);
 
-        let status = session.poll(&mut stream).unwrap().unwrap();
+        let status = session.poll(&mut stream, 0).unwrap().unwrap();
         assert_eq!(status.volume_percent, 55);
     }
 
@@ -2427,7 +2961,7 @@ mod tests {
         let mut session = LpecSession::new();
         let mut stream = ScriptedByteStream::new(&[r#"EVENT 3 0 Volume "42""#]);
 
-        let status = session.poll(&mut stream).unwrap().unwrap();
+        let status = session.poll(&mut stream, 0).unwrap().unwrap();
 
         assert_eq!(status.volume_percent, 42);
         assert!(stream.writes_as_str().contains("SUBSCRIBE Ds/Volume"));
@@ -2439,7 +2973,7 @@ mod tests {
         let mut stream =
             ScriptedByteStream::new(&[r#"EVENT 1 0 Duration "180""#, r#"EVENT 1 1 Seconds "2""#]);
 
-        let status = session.poll(&mut stream).unwrap().unwrap();
+        let status = session.poll(&mut stream, 0).unwrap().unwrap();
 
         assert_eq!(status.elapsed_seconds, 2);
         assert_eq!(status.playback, PlaybackState::Playing);
@@ -2614,6 +3148,51 @@ mod tests {
         let args = ["[0,0]"];
         let ids = decode_pin_ids(args.iter().copied()).unwrap();
         assert!(ids.is_empty());
+    }
+
+    /// Captured from a Selekt DSM via `Ds/Pins:ReadList "[1]"` on 2026-08-17.
+    ///
+    /// The fixtures below it were written from the same assumption as the code
+    /// -- capitalised keys -- so they agreed with each other and not with the
+    /// device, and pins came back empty on real hardware while the suite
+    /// stayed green. This one is the device's own words.
+    const REAL_PIN_PAYLOAD: &str = concat!(
+        r#"[{"id":1,"mode":"qobuz","type":"album","#,
+        r#""uri":"qobuz:\/\/album?path=https%3A%2F%2Fwww.qobuz.com&version=1","#,
+        r#""title":"Village","description":"","#,
+        r#""artworkUri":"https:\/\/static.qobuz.com\/images\/covers\/mb\/x1\/brogg6xqdx1mb_600.jpg","#,
+        r#""shuffle":false}]"#
+    );
+
+    #[test]
+    fn reads_a_pin_exactly_as_the_device_sends_it() {
+        let pins = parse_pin_list_json(core::iter::once(REAL_PIN_PAYLOAD));
+
+        let pin = pins.get(0).expect("the device sent a pin");
+        assert_eq!(pin.id, 1);
+        assert_eq!(pin.title.as_str(), "Village");
+        // Escaped slashes have to come back out, or the URI resolves to nothing.
+        assert_eq!(
+            pin.artwork_uri.as_str(),
+            "https://static.qobuz.com/images/covers/mb/x1/brogg6xqdx1mb_600.jpg"
+        );
+    }
+
+    #[test]
+    fn a_pin_without_artwork_simply_has_none() {
+        let payload = r#"[{"id":4,"title":"Radio","description":""}]"#;
+        let pins = parse_pin_list_json(core::iter::once(payload));
+        let pin = pins.get(0).unwrap();
+        assert_eq!(pin.title.as_str(), "Radio");
+        assert!(pin.artwork_uri.is_empty());
+    }
+
+    #[test]
+    fn json_escapes_are_undone() {
+        let mut out = heapless::String::<64>::new();
+        // A JSON string containing an escaped slash, backslash and quote.
+        copy_json_string("a\\/b\\\\c\\\"d", &mut out);
+        assert_eq!(out.as_str(), "a/b\\c\"d");
     }
 
     #[test]

@@ -626,7 +626,7 @@ async fn hifi_runtime_loop(mut driver: HifiDriver<FirmwareHifi<'static>>) -> ! {
                     driver.set_active(active, EmbassyInstant::now().as_millis());
                 }
                 HifiRequest::Command(command) => {
-                    apply_hifi_driver_result(driver.handle_command(command)).await;
+                    apply_hifi_driver_events(driver.handle_command(command)).await;
                 }
             }
         }
@@ -709,9 +709,9 @@ impl HifiController for FirmwareHifi<'_> {
         }
     }
 
-    fn status(&mut self) -> Result<HifiStatus, Self::Error> {
+    fn status(&mut self) -> Result<Option<HifiStatus>, Self::Error> {
         if let Some(status) = self.pending_status.take() {
-            return Ok(status);
+            return Ok(Some(status));
         }
 
         let result = {
@@ -719,15 +719,21 @@ impl HifiController for FirmwareHifi<'_> {
                 .network
                 .connect_events(self.endpoint)
                 .map_err(FirmwareHifiError::Net)?;
-            self.session.poll(&mut stream)
+            // The session expires optimistic skips against this, so it wants
+            // wall-clock progress rather than anything app-relative.
+            self.session
+                .poll(&mut stream, EmbassyInstant::now().as_millis())
         };
 
         match result {
-            Ok(Some(status)) => Ok(status),
-            Ok(None) => self.session.live_status().ok_or(FirmwareHifiError::Idle),
+            Ok(Some(status)) => Ok(Some(status)),
+            // Subscribed and not yet told anything: no news, not a fault. The
+            // `Idle` dance below existed only to smuggle that through a
+            // signature that could not say it.
+            Ok(None) => Ok(self.session.live_status()),
             Err(LpecError::Connect(
                 FirmwareNetError::ConnectTimeout | FirmwareNetError::ReadTimeout,
-            )) => self.session.live_status().ok_or(FirmwareHifiError::Idle),
+            )) => Ok(self.session.live_status()),
             Err(error) => {
                 println!("linn: session poll failed: {:?}", error);
                 self.reset_lpec();
@@ -784,6 +790,23 @@ impl HifiController for FirmwareHifi<'_> {
     fn mark_track_changed(&mut self) {
         self.pending_status = None;
         self.session.clear_track_metadata();
+    }
+}
+
+/// Same as [`apply_hifi_driver_result`], for the command path, which can now
+/// produce a track and its already-decoded cover together.
+async fn apply_hifi_driver_events(
+    result: Result<app_runtime::hifi::TrackChangeEvents, HifiDriverError<FirmwareHifiError>>,
+) {
+    match result {
+        Ok(events) => {
+            for event in events {
+                send_app_event(event).await;
+            }
+        }
+        Err(HifiDriverError::Status(RuntimeError::Hifi(FirmwareHifiError::Idle)))
+        | Err(HifiDriverError::Pins(RuntimeError::Hifi(FirmwareHifiError::Idle))) => {}
+        Err(error) => log_hifi_driver_error(error),
     }
 }
 
