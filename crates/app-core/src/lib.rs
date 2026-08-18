@@ -665,6 +665,45 @@ mod tests {
         app.update(Event::ButtonPressed(Button::Back));
     }
 
+    #[test]
+    fn opening_the_hifi_screen_commands_nothing() {
+        // A remote that touches the streamer just by being looked at would be
+        // a bad remote. Opening the screen must read and never write.
+        let mut app = App::new_on_screen(Screen::HifiControl);
+
+        for event in [
+            Event::Tick { uptime_ms: 100 },
+            Event::HifiStatus(hifi_status(PlaybackState::Playing)),
+            Event::HifiPins(HifiPins::new()),
+            Event::Tick { uptime_ms: 1_100 },
+            Event::NetworkStatus(NetworkStatus::Online),
+        ] {
+            assert_eq!(
+                app.update(event).command,
+                None,
+                "opening HiFi produced a command"
+            );
+        }
+    }
+
+    #[test]
+    fn navigating_off_the_launcher_commands_nothing() {
+        let mut app = App::new();
+        app.update(Event::ButtonPressed(Button::Select));
+
+        for _ in 0..4 {
+            let outcome = app.update(Event::ButtonPressed(Button::Select));
+            assert_eq!(
+                outcome.command, None,
+                "activating a launcher card sent a command"
+            );
+            if app.screen() != Screen::Launcher {
+                break;
+            }
+        }
+        assert_ne!(app.screen(), Screen::Launcher, "the pad never left home");
+    }
+
     fn loaded_pin(id: u32, title: &str) -> HifiPin {
         let mut pin_title = String::<HIFI_PIN_TITLE_LEN>::new();
         pin_title.push_str(title).unwrap();

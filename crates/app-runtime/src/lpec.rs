@@ -1107,7 +1107,16 @@ pub fn apply_event_variable(status: &mut HifiStatus, name: &str, value: &str) ->
         "Seconds" | "TrackSeconds" | "Elapsed" | "ElapsedSeconds" => {
             if let Some(elapsed) = parse_u32(value) {
                 let previous = status.elapsed_seconds;
-                status.elapsed_seconds = elapsed.min(status.duration_seconds);
+                // Clamp only against a duration we actually know. `Ds/Time`
+                // sends `Duration` and `Seconds` together on subscribe but
+                // `Seconds` alone thereafter, so anything that zeroes the
+                // duration -- a track change, say -- would otherwise pin the
+                // position at 0 and make a playing track look restarted.
+                status.elapsed_seconds = if status.duration_seconds > 0 {
+                    elapsed.min(status.duration_seconds)
+                } else {
+                    elapsed
+                };
                 if status.elapsed_seconds != previous
                     && matches!(
                         status.playback,
@@ -2801,6 +2810,28 @@ mod tests {
         let mut track = TrackMetadata::default();
         let _ = track.title.push_str(title);
         track
+    }
+
+    #[test]
+    fn a_position_survives_not_knowing_the_duration_yet() {
+        // `Ds/Time` sends Duration with Seconds on subscribe, then Seconds
+        // alone. If anything zeroes the duration in between, clamping against
+        // it would silently rewind a playing track to the start.
+        let mut status = HifiStatus::empty();
+        status.playback = PlaybackState::Playing;
+        status.duration_seconds = 0;
+
+        apply_event_variable(&mut status, "Seconds", "97");
+
+        assert_eq!(status.elapsed_seconds, 97);
+    }
+
+    #[test]
+    fn a_known_duration_still_bounds_the_position() {
+        let mut status = HifiStatus::empty();
+        status.duration_seconds = 60;
+        apply_event_variable(&mut status, "Seconds", "97");
+        assert_eq!(status.elapsed_seconds, 60);
     }
 
     #[test]

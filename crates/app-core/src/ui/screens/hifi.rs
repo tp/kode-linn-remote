@@ -39,7 +39,7 @@ use super::super::{
     aa,
     components::{clear_rect, draw_panel, draw_spinner_dots, ui_font},
     focus::FocusTargets,
-    optimistic::Optimistic,
+    optimistic::{OPTIMISTIC_TTL_MS, Optimistic},
     painter::Painter,
     style::*,
     widget::{Slot, Widget},
@@ -127,6 +127,13 @@ const VOLUME_STEP: i16 = 2;
 /// press-twice-to-go-back behaviour is an emergent consequence, needing no
 /// extra state and no timing window.
 const RESTART_THRESHOLD_SECONDS: u32 = 3;
+/// How far ahead of our own clock an incoming position may be, while a restart
+/// or a track change is still settling, before it is treated as describing the
+/// position we just left.
+///
+/// Generous enough to absorb ordinary poll jitter, far tighter than the gap
+/// between "a few seconds in" and wherever the track had actually reached.
+const PROGRESS_GUARD_TOLERANCE_SECONDS: u32 = 3;
 
 const LOADING_TIMEOUT_MS: u64 = 5_000;
 
@@ -282,6 +289,14 @@ pub(crate) struct State {
     stale_artwork_until_ms: Option<u64>,
     /// Cover per pin tile, filled in as each is fetched.
     pin_artwork: [Option<HifiArtwork>; CHOICES_VISIBLE],
+    /// Uptime until which a position ahead of our own is taken to describe the
+    /// place we just left rather than where we are.
+    ///
+    /// Unlike playback or volume, a position cannot be held until the device
+    /// reports the same value -- it changes every second, so there is no
+    /// equality to wait for. What can be said is that immediately after a
+    /// restart the position only goes down, so anything far ahead is stale.
+    progress_guard_until_ms: Option<u64>,
 }
 
 /// What a screen did with a raw pad press.
@@ -412,6 +427,7 @@ impl State {
             optimistic_volume: None,
             stale_artwork_until_ms: None,
             pin_artwork: [const { None }; CHOICES_VISIBLE],
+            progress_guard_until_ms: None,
         }
     }
 
@@ -515,6 +531,13 @@ impl State {
             _ => false,
         };
 
+        if self
+            .progress_guard_until_ms
+            .is_some_and(|until| uptime_ms >= until)
+        {
+            self.progress_guard_until_ms = None;
+        }
+
         let playback_changed = self.tick_playback(uptime_ms);
         playback_changed || overlay_lapsed || stale_lapsed
     }
@@ -562,8 +585,44 @@ impl State {
         true
     }
 
+    /// Starts distrusting positions that run ahead of ours.
+    ///
+    /// The session that answers status polls is not the one that sends
+    /// commands, so it does not know a restart happened and keeps reporting
+    /// the old position until the device's next time event -- about a second.
+    /// Whether a poll lands inside that window is a race, which is why the
+    /// symptom comes and goes.
+    fn guard_progress(&mut self, uptime_ms: u64) {
+        self.progress_guard_until_ms = Some(uptime_ms.saturating_add(OPTIMISTIC_TTL_MS));
+    }
+
+    /// Decides whether an incoming position describes now or a moment ago.
+    fn accept_progress(&mut self, incoming: u32, uptime_ms: u64) -> u32 {
+        let Some(until) = self.progress_guard_until_ms else {
+            return incoming;
+        };
+        if uptime_ms >= until {
+            self.progress_guard_until_ms = None;
+            return incoming;
+        }
+        if incoming
+            > self
+                .status
+                .elapsed_seconds
+                .saturating_add(PROGRESS_GUARD_TOLERANCE_SECONDS)
+        {
+            // Still describing where we were.
+            return self.status.elapsed_seconds;
+        }
+        // The device has come back to somewhere plausible, so it has caught up
+        // and there is nothing left to guard against.
+        self.progress_guard_until_ms = None;
+        incoming
+    }
+
     pub(crate) fn apply_status(&mut self, mut status: HifiStatus, uptime_ms: u64) -> bool {
         let was_loading = self.loading;
+        status.elapsed_seconds = self.accept_progress(status.elapsed_seconds, uptime_ms);
 
         // What the user just asked for outranks a reply composed before they
         // asked, until the device agrees or the hold runs out.
@@ -703,6 +762,7 @@ impl State {
                     let current_second = uptime_ms / 1000;
                     self.current_second = current_second;
                     self.last_second = current_second;
+                    self.guard_progress(uptime_ms);
                     Some(Command::Restart)
                 } else {
                     self.begin_track_change(uptime_ms);
@@ -773,6 +833,7 @@ impl State {
     /// wrong the moment a skip is requested.
     fn begin_track_change(&mut self, uptime_ms: u64) {
         self.status.elapsed_seconds = 0;
+        self.guard_progress(uptime_ms);
         if self.artwork.is_some() {
             self.stale_artwork_until_ms = Some(uptime_ms.saturating_add(STALE_ARTWORK_GRACE_MS));
         }
@@ -2107,6 +2168,55 @@ mod tests {
             "three presses did not move three steps"
         );
         assert_eq!(sent.last().copied(), Some(expected));
+    }
+
+    #[test]
+    fn restarting_ignores_the_position_it_was_rewound_from() {
+        let mut state = state_with_track(45);
+        let outcome = state.handle(Action::PreviousOrRestart, 1_000);
+        assert_eq!(outcome, Some(Command::Restart));
+        assert_eq!(state.status.elapsed_seconds, 0);
+
+        // The session answering the poll is not the one that sent the command,
+        // so it keeps reporting the old position until the device's next time
+        // event.
+        let mut stale = state.status.clone();
+        stale.elapsed_seconds = 45;
+        state.apply_status(stale, 1_100);
+
+        assert_eq!(
+            state.status.elapsed_seconds, 0,
+            "the progress bar jumped back to where the track was"
+        );
+    }
+
+    #[test]
+    fn a_plausible_position_ends_the_guard_immediately() {
+        let mut state = state_with_track(45);
+        state.handle(Action::PreviousOrRestart, 1_000);
+
+        let mut caught_up = state.status.clone();
+        caught_up.elapsed_seconds = 1;
+        state.apply_status(caught_up, 1_100);
+
+        assert_eq!(state.status.elapsed_seconds, 1);
+        assert!(
+            state.progress_guard_until_ms.is_none(),
+            "the guard outlived the disagreement it existed for"
+        );
+    }
+
+    #[test]
+    fn the_guard_does_not_freeze_progress_forever() {
+        let mut state = state_with_track(45);
+        state.handle(Action::PreviousOrRestart, 1_000);
+
+        // A device that insists is eventually believed, however odd it sounds.
+        let mut insisting = state.status.clone();
+        insisting.elapsed_seconds = 45;
+        state.apply_status(insisting, 1_000 + crate::ui::optimistic::OPTIMISTIC_TTL_MS);
+
+        assert_eq!(state.status.elapsed_seconds, 45);
     }
 
     fn filled_pins() -> HifiPins {
