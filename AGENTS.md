@@ -8,7 +8,7 @@
 - The panel is 410 px wide, so its centre is at an odd x (205). A centred widget's left edge is `205 - width / 2`, and the painter's 2-px alignment assertion needs that to be even — so centred widths must satisfy `width % 4 == 2` (equivalently, an *odd* half-width). 330 and 190 are fine; 328 and 192 are not.
 - `apps/firmware` and `crates/board-waveshare-c6` are legacy: they target the retired round Waveshare board. `esp-hal` has no ESP32-P4 support yet, so there is no Kode Dot firmware.
 - The display driver must compose frames in PSRAM and blit them; never satisfy the panel's even-window rule by widening individual fills, which destroys the row above.
-- Text bands must be at least `line_height` tall. There is one UI font at `line_height(40)`, so a shorter band clips the text rather than shrinking it.
+- Text bands must be at least `line_height` tall. There is one UI font at `line_height(38)`, so a shorter band clips the text rather than shrinking it. The bands are 40 px: `line_height` *is* the glyph box, so a font sized to fill its band has its descenders flattened at the box's last row.
 - Prefer deterministic embedded rendering paths over host-only APIs in shared code.
 
 ## Verification

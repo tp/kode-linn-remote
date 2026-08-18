@@ -1,6 +1,10 @@
 use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
 
-use super::{RenderSession, components::draw_focus_ring, screens};
+use super::{
+    RenderSession,
+    components::{draw_focus_ring, draw_focus_ring_over},
+    screens,
+};
 use crate::{ActiveScreen, App, RenderError};
 
 impl App {
@@ -65,12 +69,23 @@ impl App {
             return Err(error);
         }
 
-        // Drawn last so it sits above the screen's own pixels.
-        if let Some(rect) = focused
-            && let Err(error) = draw_focus_ring(display, rect)
-        {
-            session.abandon_frame(screen);
-            return Err(error);
+        // Drawn last so it sits above the screen's own pixels -- which is why
+        // it has to be told what those pixels are. Only the HiFi tiles put
+        // anything but background under the ring.
+        if let Some(rect) = focused {
+            let outcome = match &self.active_screen {
+                ActiveScreen::HifiControl(state) => {
+                    let layout = self.ui_layouts.hifi();
+                    draw_focus_ring_over(display, rect, |point| {
+                        state.focus_backdrop_at(layout, point)
+                    })
+                }
+                _ => draw_focus_ring(display, rect),
+            };
+            if let Err(error) = outcome {
+                session.abandon_frame(screen);
+                return Err(error);
+            }
         }
 
         Ok(())

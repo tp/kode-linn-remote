@@ -1,7 +1,11 @@
 use embedded_graphics::{pixelcolor::Rgb565, prelude::RgbColor};
 
+/// Corner radius of every card-like surface: buttons, stopwatch cards, pin
+/// tiles. Deliberately one value rather than one per widget, because the focus
+/// ring's radius is derived from it — a surface that picked its own radius
+/// would end up inside a ring whose curve no longer matched it.
 pub(super) const CARD_RADIUS: u32 = 18;
-pub(super) const BUTTON_RADIUS: u32 = 18;
+pub(super) const BUTTON_RADIUS: u32 = CARD_RADIUS;
 
 /// Colours taken from the Kode Dot itself.
 ///
@@ -83,8 +87,32 @@ pub(super) const PROGRESS_TRACK: Rgb565 = dot::SLATE_DEEP;
 pub(super) const PROGRESS_FILL: Rgb565 = dot::SHELL;
 
 /// Ring drawn around the control the D-pad is currently on.
-pub(super) const FOCUS_RING: Rgb565 = dot::BLUE;
-/// Padding between a focused control's bounds and its ring.
-pub(super) const FOCUS_RING_INSET: i32 = 6;
-pub(super) const FOCUS_RING_STROKE: u32 = 3;
-pub(super) const FOCUS_RING_RADIUS: u32 = 14;
+///
+/// Off-white rather than the blue accent, because the ring now sits directly
+/// against what it outlines and both control buttons are themselves blue — a
+/// blue ring flush against a blue button is not a highlight.
+pub(super) const FOCUS_RING: Rgb565 = dot::SHELL;
+/// Width of the ring's stroke band.
+///
+/// One pixel wider than the inset, so the band reaches a pixel *inside* the
+/// control's bounds. That pixel is not decoration. A rounded control has its
+/// own anti-aliased edge, blended against the background before the ring is
+/// drawn, and a ring that merely butts up against it leaves that half-dark
+/// thread showing between the two — the ring can be told what lies under it,
+/// but not undo what is already there. Painting over it is what makes the two
+/// read as touching.
+pub(super) const FOCUS_RING_STROKE: u32 = 4;
+/// How far the ring's outer edge sits beyond the control's bounds.
+///
+/// Small enough that the ring lies against the control rather than floating
+/// off it: any wider and a black channel opens up, which around a bright cover
+/// reads as a notch at the corners rather than as deliberate spacing.
+pub(super) const FOCUS_RING_INSET: i32 = 3;
+/// Concentric with the surface it surrounds.
+///
+/// An outer curve sitting `g` pixels outside an inner one has to use
+/// `r_inner + g`; then both arcs share a centre and follow one another instead
+/// of diverging at the corners. Get it wrong and the spacing breathes: at 14,
+/// six pixels out, this ring cleared a tile's cover by 3 px along the edges
+/// and 7 px across the diagonal.
+pub(super) const FOCUS_RING_RADIUS: u32 = CARD_RADIUS + FOCUS_RING_INSET as u32;
