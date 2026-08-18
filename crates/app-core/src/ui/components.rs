@@ -30,7 +30,7 @@ macro_rules! ui_font {
         mplus!(
             2,
             $weight,
-            line_height(40),
+            line_height(38),
             false,
             4,
             8,
@@ -101,6 +101,24 @@ pub(super) fn draw_focus_ring<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    draw_focus_ring_over(display, rect, |_| OLED_BLACK)
+}
+
+/// As [`draw_focus_ring`], but told what the screen left underneath it.
+///
+/// The ring sits directly against the control it outlines, so on a screen
+/// where that control is a picture its anti-aliased corners have to blend into
+/// the picture. `backdrop_at` answers for any point in the ring's band; a
+/// screen that is all background can use [`draw_focus_ring`] instead.
+pub(super) fn draw_focus_ring_over<D, F>(
+    display: &mut D,
+    rect: Rectangle,
+    backdrop_at: F,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+    F: Fn(Point) -> Rgb565,
+{
     let inset = FOCUS_RING_INSET;
     let top_left = Point::new(rect.top_left.x - inset, rect.top_left.y - inset);
     let size = Size::new(
@@ -108,13 +126,13 @@ where
         rect.size.height.saturating_add((inset * 2) as u32),
     );
 
-    aa::rounded_rect_outline(
+    aa::rounded_rect_outline_over(
         display,
         Rectangle::new(top_left, size),
         FOCUS_RING_RADIUS,
         FOCUS_RING,
         FOCUS_RING_STROKE,
-        OLED_BLACK,
+        backdrop_at,
     )
     .map_err(RenderError::Draw)
 }

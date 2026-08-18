@@ -326,11 +326,26 @@ fn draw_shape<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    draw_shape_over(display, bounds, shape, foreground, |_| backdrop)
+}
+
+/// As [`draw_shape`], but asking what lies under each pixel.
+fn draw_shape_over<D, F>(
+    display: &mut D,
+    bounds: Rectangle,
+    shape: &impl Shape,
+    foreground: Rgb565,
+    backdrop_at: F,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+    F: Fn(Point) -> Rgb565,
+{
     let pixels = bounds
         .points()
         .filter_map(|point| match coverage(shape, point.x, point.y) {
             0 => None,
-            covered => Some(Pixel(point, blend(foreground, backdrop, covered))),
+            covered => Some(Pixel(point, blend(foreground, backdrop_at(point), covered))),
         });
 
     display.draw_iter(pixels)
@@ -457,29 +472,52 @@ impl Shape for RoundedRectRing {
     }
 }
 
-/// Outline of a rounded rectangle, anti-aliased against `backdrop`.
+/// Outline of a rounded rectangle, anti-aliased against whatever lies under
+/// each pixel.
 ///
 /// Draws **only** the stroke band. Delegating to [`rounded_rect`] with a
 /// backdrop-coloured fill would look identical on an empty background and
 /// quietly erase anything inside — which is exactly what happened when the
 /// focus ring painted over the control it was highlighting.
-pub(super) fn rounded_rect_outline<D>(
+///
+/// The backdrop is per-pixel rather than one colour because an outline drawn
+/// hard against a picture has to blend into the picture: claiming black there
+/// draws a dark seam between the two exactly where they are meant to meet.
+pub(super) fn rounded_rect_outline_over<D, F>(
     display: &mut D,
     rect: Rectangle,
     radius: u32,
     stroke: Rgb565,
     stroke_width: u32,
-    backdrop: Rgb565,
+    backdrop_at: F,
 ) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
+    F: Fn(Point) -> Rgb565,
 {
     let outer = RoundedRect::new(rect, radius);
     let ring = RoundedRectRing {
         inner: outer.inset(stroke_width as i32),
         outer,
     };
-    draw_shape(display, rect, &ring, stroke, backdrop)
+    draw_shape_over(display, rect, &ring, stroke, backdrop_at)
+}
+
+/// The colour a rounded shape of `fill` over `backdrop` leaves at `point`.
+///
+/// The panel cannot be read back, so anything drawn on top of an earlier shape
+/// has to recompute what that shape left behind rather than sample it. Corners
+/// are the only place it matters: along a straight edge the answer is simply
+/// `fill` or `backdrop`.
+pub(super) fn rounded_rect_pixel(
+    rect: Rectangle,
+    radius: u32,
+    fill: Rgb565,
+    backdrop: Rgb565,
+    point: Point,
+) -> Rgb565 {
+    let shape = RoundedRect::new(rect, radius);
+    blend(fill, backdrop, coverage(&shape, point.x, point.y))
 }
 
 /// Filled circle, anti-aliased against `backdrop`.

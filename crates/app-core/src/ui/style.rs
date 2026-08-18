@@ -87,16 +87,25 @@ pub(super) const PROGRESS_TRACK: Rgb565 = dot::SLATE_DEEP;
 pub(super) const PROGRESS_FILL: Rgb565 = dot::SHELL;
 
 /// Ring drawn around the control the D-pad is currently on.
-pub(super) const FOCUS_RING: Rgb565 = dot::BLUE;
-/// Padding between a focused control's bounds and its ring.
-pub(super) const FOCUS_RING_INSET: i32 = 6;
+///
+/// Off-white rather than the blue accent, because the ring now sits directly
+/// against what it outlines and both control buttons are themselves blue — a
+/// blue ring flush against a blue button is not a highlight.
+pub(super) const FOCUS_RING: Rgb565 = dot::SHELL;
 pub(super) const FOCUS_RING_STROKE: u32 = 3;
-/// Concentric with the surface it surrounds, which is what makes the gap
-/// between the two look even.
+/// How far the ring's outer edge sits beyond the control's bounds.
+///
+/// Equal to the stroke, so the ring's *inner* edge lands exactly on those
+/// bounds and the two meet with nothing between them. Any more leaves a black
+/// channel, and around a bright cover that channel reads as a notch at the
+/// corners rather than as deliberate spacing.
+pub(super) const FOCUS_RING_INSET: i32 = FOCUS_RING_STROKE as i32;
+/// Concentric with the surface it surrounds.
 ///
 /// An outer curve sitting `g` pixels outside an inner one has to use
-/// `r_inner + g`; then both arcs share a centre and the gap is `g` all the way
-/// round. Get it wrong and the gap breathes: at 14 this ring cleared a tile's
-/// cover by 3 px along the edges and 7 px across the diagonal, so a focused
-/// cover looked pinched at its corners.
+/// `r_inner + g`; then both arcs share a centre. Since the inset equals the
+/// stroke, that also makes the ring's inner curve exactly the surface's own —
+/// the two follow one another instead of diverging at the corners. Get it
+/// wrong and the spacing breathes: at 14, six pixels out, this ring cleared a
+/// tile's cover by 3 px along the edges and 7 px across the diagonal.
 pub(super) const FOCUS_RING_RADIUS: u32 = CARD_RADIUS + FOCUS_RING_INSET as u32;

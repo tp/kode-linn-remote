@@ -75,9 +75,10 @@ const ARTWORK_SIZE: u32 = HIFI_ARTWORK_SIZE;
 const TITLE_TOP: i32 = 372;
 const TITLE_HEIGHT: u32 = 40;
 const ARTIST_TOP: i32 = 414;
-/// One full line of the UI font, which is `line_height(40)`. Anything less
-/// clips the text rather than shrinking it — there is only one font size in
-/// this UI, so bands are sized to it rather than the other way round.
+/// One full line of the UI font, which is `line_height(38)`, plus the spare
+/// couple of pixels. Anything less than the line height clips the text rather
+/// than shrinking it — there is only one font size in this UI, so bands are
+/// sized to it rather than the other way round.
 const ARTIST_HEIGHT: u32 = 40;
 
 const PROGRESS_TOP: i32 = 470;
@@ -183,9 +184,10 @@ const TILE_WIDTH: u32 = 170;
 /// Square, because cover art is square and cropping it to fit loses the top
 /// and bottom of every picture.
 const TILE_ART_HEIGHT: u32 = TILE_WIDTH;
-/// One line of the UI font, which is `line_height(40)`. There is only one font
-/// size in this UI, so the band is sized to it rather than the other way
-/// round — a shorter band clips the text instead of shrinking it.
+/// One line of the UI font, plus the couple of pixels `line_height(38)` leaves
+/// spare. There is only one font size in this UI, so the band is sized to it
+/// rather than the other way round — a shorter band clips the text instead of
+/// shrinking it.
 ///
 /// The caption sits below the art rather than over it, which is what costs the
 /// tiles 16 px of width: 186 px art plus a 40 px caption makes a 226 px tile,
@@ -526,6 +528,38 @@ impl State {
             }
         }
         targets
+    }
+
+    /// What this screen left on the panel where the focus ring runs.
+    ///
+    /// The ring is drawn last, over pixels no one can read back, and it sits
+    /// hard against the tile it outlines -- so on a tile showing a cover, its
+    /// anti-aliased corners have to blend into that cover. Recomputing the
+    /// tile's own edge is the only way to know what is there; assuming black
+    /// draws a dark seam exactly where the two are meant to meet.
+    pub(crate) fn focus_backdrop_at(&self, layout: &Layout, point: Point) -> Rgb565 {
+        if !matches!(self.page, HifiPage::Choices) {
+            return OLED_BLACK;
+        }
+
+        for (slot, tint) in TILE_TINTS.iter().enumerate() {
+            let art = layout.choices.tile_art[slot];
+            if !art.contains(point) {
+                continue;
+            }
+
+            // A tile's outermost colour, which is all the ring can touch: its
+            // cover, or the tinted card's border. The card's fill sits further
+            // in, and the caption band below the art is background.
+            let surface = match (self.pins.get(slot), self.pin_artwork[slot].as_ref()) {
+                (Some(_), Some(artwork)) => scaled_artwork_pixel(artwork, art, point),
+                (Some(_), None) => tint.1,
+                (None, _) => ACTION_INACTIVE_BORDER,
+            };
+            return aa::rounded_rect_pixel(art, TILE_RADIUS, surface, OLED_BLACK, point);
+        }
+
+        OLED_BLACK
     }
 
     pub(crate) fn on_tick(&mut self, uptime_ms: u64) -> bool {
@@ -1511,28 +1545,42 @@ fn draw_scaled_artwork<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    let pixels = artwork.pixels();
     let source_size = crate::HIFI_ARTWORK_SIZE as usize;
-    if pixels.len() < source_size * source_size {
-        return Ok(());
-    }
-
-    let width = target.size.width as i32;
-    let height = target.size.height as i32;
-    if width == 0 || height == 0 {
+    if artwork.pixels().len() < source_size * source_size
+        || target.size.width == 0
+        || target.size.height == 0
+    {
         return Ok(());
     }
 
     // Same corners as the tinted card it replaces. Blitting it square left a
     // pin with a cover looking unlike a pin without one.
     aa::rounded_image(display, target, radius, OLED_BLACK, |point| {
-        let x = (point.x - target.top_left.x).clamp(0, width - 1) as usize;
-        let y = (point.y - target.top_left.y).clamp(0, height - 1) as usize;
-        let source_x = x * source_size / width as usize;
-        let source_y = y * source_size / height as usize;
-        pixels[source_y * source_size + source_x]
+        scaled_artwork_pixel(artwork, target, point)
     })
     .map_err(RenderError::Draw)
+}
+
+/// The cover pixel a tile shows at `point`, sampled exactly as
+/// [`draw_scaled_artwork`] blits it.
+///
+/// Shared so that anything drawn over a tile can ask what is under it. The
+/// panel is write-only, so the alternative is to assume, and assuming black
+/// over a picture is what puts dark wedges in rounded corners.
+fn scaled_artwork_pixel(artwork: &HifiArtwork, target: Rectangle, point: Point) -> Rgb565 {
+    let pixels = artwork.pixels();
+    let source_size = crate::HIFI_ARTWORK_SIZE as usize;
+    let width = target.size.width as i32;
+    let height = target.size.height as i32;
+    if width == 0 || height == 0 || pixels.len() < source_size * source_size {
+        return OLED_BLACK;
+    }
+
+    let x = (point.x - target.top_left.x).clamp(0, width - 1) as usize;
+    let y = (point.y - target.top_left.y).clamp(0, height - 1) as usize;
+    let source_x = x * source_size / width as usize;
+    let source_y = y * source_size / height as usize;
+    pixels[source_y * source_size + source_x]
 }
 
 /// The artwork pixel showing at a point, or the OLED background where there is
