@@ -95,6 +95,14 @@ const OVERLAY_HEIGHT: u32 = 106;
 const OVERLAY_RADIUS: u32 = 22;
 const OVERLAY_VALUE_TOP: i32 = 158;
 const OVERLAY_VALUE_HEIGHT: u32 = 40;
+/// How far the readout band is held back from the panel's edge.
+///
+/// It is a scratch widget, so the painter clears it and blits the whole band --
+/// and at the panel's full width that blit lands on top of the border, cutting
+/// it away for the band's height on both sides. Four pixels clears the 1 px
+/// stroke and the anti-aliased fringe beside it. The number is centred, so
+/// narrowing the band does not move it.
+const OVERLAY_VALUE_INSET: i32 = 4;
 const OVERLAY_TRACK_LEFT: i32 = 110;
 const OVERLAY_TRACK_TOP: i32 = 214;
 const OVERLAY_TRACK_WIDTH: u32 = 190;
@@ -988,8 +996,14 @@ fn now_playing_layout(left: i32, top: i32, center_x: i32) -> NowPlayingLayout {
             Size::new(OVERLAY_WIDTH, OVERLAY_HEIGHT),
         ),
         overlay_value: Rectangle::new(
-            Point::new(left + OVERLAY_LEFT, top + OVERLAY_VALUE_TOP),
-            Size::new(OVERLAY_WIDTH, OVERLAY_VALUE_HEIGHT),
+            Point::new(
+                left + OVERLAY_LEFT + OVERLAY_VALUE_INSET,
+                top + OVERLAY_VALUE_TOP,
+            ),
+            Size::new(
+                OVERLAY_WIDTH - 2 * OVERLAY_VALUE_INSET as u32,
+                OVERLAY_VALUE_HEIGHT,
+            ),
         ),
         overlay_track: Rectangle::new(
             Point::new(left + OVERLAY_TRACK_LEFT, top + OVERLAY_TRACK_TOP),
@@ -1279,9 +1293,9 @@ where
         } else {
             cache.now_playing.progress_filled_px
         },
-        // Left square. It spans the panel edge to edge, where round ends would
-        // read as a gap rather than a shape.
-        radius: 0,
+        // Rounded like the volume bar: this panel is a friendly, round-cornered
+        // device and a square-ended bar is the odd one out on it.
+        radius: PROGRESS_HEIGHT / 2,
         backdrop: OLED_BLACK,
     };
     painter.draw(&progress).map_err(RenderError::Draw)?;
