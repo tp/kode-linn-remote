@@ -354,6 +354,31 @@ pub(super) fn rounded_rect<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    rounded_rect_over(display, rect, radius, fill, border, border_width, |_| {
+        backdrop
+    })
+}
+
+/// As [`rounded_rect`], but asking what lies under each pixel.
+///
+/// Every pixel of the bounding box is written, corners included — that is what
+/// lets a panel be drawn without clearing first. It also means the corners are
+/// painted with whatever backdrop is claimed, so a single colour is only right
+/// when the panel really does sit on one. Over artwork it paints black wedges
+/// into the corners and undoes the rounding it just drew.
+pub(super) fn rounded_rect_over<D, F>(
+    display: &mut D,
+    rect: Rectangle,
+    radius: u32,
+    fill: Rgb565,
+    border: Rgb565,
+    border_width: u32,
+    backdrop_at: F,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+    F: Fn(Point) -> Rgb565,
+{
     let outer = RoundedRect::new(rect, radius);
     let inner = outer.inset(border_width as i32);
     let width = rect.size.width as usize;
@@ -365,7 +390,11 @@ where
         let y = rect.top_left.y + row;
         let colors = (0..rect.size.width as i32).map(|column| {
             let x = rect.top_left.x + column;
-            let edge = blend(border, backdrop, coverage(&outer, x, y));
+            let edge = blend(
+                border,
+                backdrop_at(Point::new(x, y)),
+                coverage(&outer, x, y),
+            );
             blend(fill, edge, coverage(&inner, x, y))
         });
         display.fill_contiguous(

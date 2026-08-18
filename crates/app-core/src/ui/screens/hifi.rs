@@ -37,7 +37,7 @@ use crate::{
 
 use super::super::{
     aa,
-    components::{clear_rect, draw_panel, draw_spinner_dots, ui_font},
+    components::{clear_rect, draw_panel, draw_panel_over, draw_spinner_dots, ui_font},
     focus::FocusTargets,
     optimistic::{OPTIMISTIC_TTL_MS, Optimistic},
     painter::Painter,
@@ -1338,12 +1338,18 @@ where
     // Last, so it sits over the artwork rather than under it.
     if overlay_visible {
         if !cache.now_playing.overlay_visible {
-            draw_panel(
+            // The overlay sits on the artwork, so its rounded corners have to
+            // be blended against the picture. Told "black" they would be
+            // painted black, which squares off the very corners they round.
+            let artwork = state.artwork.as_ref();
+            let art_rect = ui_layout.artwork;
+            draw_panel_over(
                 painter.display(),
                 ui_layout.overlay_panel,
                 OVERLAY_RADIUS,
                 OLED_BLACK,
                 SURFACE_BORDER,
+                |point| artwork_pixel_at(artwork, art_rect, point),
             )?;
             cache.now_playing.overlay_value = None;
             cache.now_playing.overlay_percent = None;
@@ -1502,6 +1508,26 @@ where
             }),
         )
         .map_err(RenderError::Draw)
+}
+
+/// The artwork pixel showing at a point, or the OLED background where there is
+/// none.
+///
+/// The overlay is drawn over the picture, so anything of it that rounds away at
+/// the corners has to blend into what is actually there.
+fn artwork_pixel_at(artwork: Option<&HifiArtwork>, art_rect: Rectangle, point: Point) -> Rgb565 {
+    let Some(artwork) = artwork else {
+        return OLED_BLACK;
+    };
+    let x = point.x - art_rect.top_left.x;
+    let y = point.y - art_rect.top_left.y;
+    let size = HIFI_ARTWORK_SIZE as i32;
+    if x < 0 || y < 0 || x >= size || y >= size {
+        return OLED_BLACK;
+    }
+    let pixels = artwork.pixels();
+    let index = (y * size + x) as usize;
+    pixels.get(index).copied().unwrap_or(OLED_BLACK)
 }
 
 /// What to write under a tile.

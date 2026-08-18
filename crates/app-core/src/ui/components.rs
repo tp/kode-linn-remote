@@ -139,8 +139,31 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     // Covers every pixel of `rect`, blending the corner arcs down to the OLED
-    // background, so no separate clear is needed first.
+    // background, so no separate clear is needed first. Only correct where the
+    // panel really does sit on the background -- see [`draw_panel_over`].
     aa::rounded_rect(display, rect, radius, fill, stroke, 1, OLED_BLACK).map_err(RenderError::Draw)
+}
+
+/// A panel over something other than the OLED background.
+///
+/// [`draw_panel`] writes every pixel of its bounding box, so the corners it
+/// rounds away are painted with the backdrop it was told about. Told "black"
+/// while sitting on artwork, it paints black wedges into the corners and undoes
+/// the rounding. `backdrop_at` supplies what is really underneath.
+pub(super) fn draw_panel_over<D, F>(
+    display: &mut D,
+    rect: Rectangle,
+    radius: u32,
+    fill: Rgb565,
+    stroke: Rgb565,
+    backdrop_at: F,
+) -> Result<(), RenderError<D::Error>>
+where
+    D: DrawTarget<Color = Rgb565>,
+    F: Fn(Point) -> Rgb565,
+{
+    aa::rounded_rect_over(display, rect, radius, fill, stroke, 1, backdrop_at)
+        .map_err(RenderError::Draw)
 }
 
 pub(super) fn draw_duration<D>(
