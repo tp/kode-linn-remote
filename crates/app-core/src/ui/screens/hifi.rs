@@ -1279,6 +1279,10 @@ where
         } else {
             cache.now_playing.progress_filled_px
         },
+        // Left square. It spans the panel edge to edge, where round ends would
+        // read as a gap rather than a shape.
+        radius: 0,
+        backdrop: OLED_BLACK,
     };
     painter.draw(&progress).map_err(RenderError::Draw)?;
     cache.now_playing.progress_filled_px = Some(new_filled_px);
@@ -1364,6 +1368,10 @@ where
                 .now_playing
                 .overlay_percent
                 .map(|percent| filled_width_for_volume(percent, width)),
+            // A pill: half the height, so both ends are fully round. Square
+            // ends read as unfinished inside a panel with a 22 px radius.
+            radius: OVERLAY_TRACK_HEIGHT / 2,
+            backdrop: OLED_BLACK,
         };
         painter.draw(&track).map_err(RenderError::Draw)?;
         cache.now_playing.overlay_percent = Some(value);
@@ -1669,6 +1677,11 @@ struct LevelBar {
     active_color: Rgb565,
     filled_px: u32,
     previous_filled_px: Option<u32>,
+    /// Corner radius. Zero keeps the square ends and the cheap incremental
+    /// repaint; anything else rounds both ends and repaints the whole bar.
+    radius: u32,
+    /// What a rounded end is blended against. Ignored when `radius` is zero.
+    backdrop: Rgb565,
 }
 
 impl LevelBar {
@@ -1691,6 +1704,51 @@ impl Widget<Action> for LevelBar {
     }
 
     fn draw<D>(&self, target: &mut D) -> Result<(), D::Error>
+    where
+        D: DrawTarget<Color = Rgb565>,
+    {
+        if self.radius == 0 {
+            return self.draw_square(target);
+        }
+
+        // Both ends are rounded, so the whole bar is repainted rather than the
+        // span that changed: growing the fill has to redraw the cap it used to
+        // end with, and shrinking it has to restore the track's. At 190 x 10
+        // that is under two thousand pixels, which is cheaper than the
+        // bookkeeping needed to avoid it.
+        aa::rounded_rect(
+            target,
+            self.bar,
+            self.radius,
+            self.track_color,
+            self.track_color,
+            0,
+            self.backdrop,
+        )?;
+
+        if self.filled_px == 0 {
+            return Ok(());
+        }
+        // A fill shorter than a full cap cannot be a pill; let the radius
+        // shrink with it so the end stays round instead of turning into a
+        // wedge.
+        let filled = self.segment(0, self.filled_px);
+        let fill_radius = self.radius.min(self.filled_px / 2);
+        aa::rounded_rect(
+            target,
+            filled,
+            fill_radius,
+            self.active_color,
+            self.active_color,
+            0,
+            self.track_color,
+        )
+    }
+}
+
+impl LevelBar {
+    /// Square ends, repainting only the span that changed.
+    fn draw_square<D>(&self, target: &mut D) -> Result<(), D::Error>
     where
         D: DrawTarget<Color = Rgb565>,
     {
